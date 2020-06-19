@@ -3,13 +3,20 @@
 # Basic Makefile to aid automation of document building
 #
 
-.PHONY: all
+.PHONY: all local
 all:
 	./makeall.sh
 
-.PHONY: html
+local-all:
+	./makeall.sh local
+
+.PHONY: html local-html
+
 html:
 	./makehtml.sh
+
+local-html:
+	./makehtml.sh local
 
 .PHONY: clean
 clean:
