@@ -108,12 +108,17 @@ virtio-msg groups messages into two categories:
       \item Handling device status and notifications (\msgref{SET_DEVICE_STATUS},
         \msgref{EVENT_USED}, etc.).
     \end{itemize}
-    A bus implementation MUST relay these messages to the device number
-    identified in the header, regardless of how it discovered or enumerated
-    that device. Apart from enforcing generic transport limits (for example,
-    maximum message size), a bus SHOULD treat transport messages as opaque and
-    avoid modifying them.
 \end{description}
+
+\busnormative{\paragraph}{Transport Message Forwarding}{Virtio Transport Options / Virtio Over Messages / Basic Concepts / Relationship between bus and transport / Transport Message Forwarding}
+\begin{itemize}
+  \item A bus implementation MUST relay each transport message to the device
+        number identified in the message header, regardless of how it
+        discovered or enumerated that device.
+  \item A bus implementation SHOULD treat transport messages as opaque apart
+        from enforcing generic transport limits, such as the advertised maximum
+        message size, and SHOULD NOT modify the transport payload.
+\end{itemize}
 
 This separation lets a bus remain minimal if it obtains device information from
 firmware tables, while still supporting fully message-based enumeration and
@@ -1400,4 +1405,3 @@ Implementations that do not follow these mandatory rules MUST NOT declare
 themselves conformant. Features or messages labeled as "optional" (MAY)
 do not invalidate compliance if omitted, provided all required behaviors are
 still correctly implemented.
-
