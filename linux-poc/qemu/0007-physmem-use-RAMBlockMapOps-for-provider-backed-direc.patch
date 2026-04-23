@@ -1,0 +1,204 @@
+From 2004cd06937d0825b69b1bd3374fc9d0177ec054 Mon Sep 17 00:00:00 2001
+Message-ID: <2004cd06937d0825b69b1bd3374fc9d0177ec054.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Wed, 8 Apr 2026 17:10:00 +0200
+Subject: [RFC PATCH 07/28] physmem: use RAMBlockMapOps for provider-backed
+ direct mappings
+
+Add RAMBlockMapKind and RAMBlockMapOps so provider-backed RAMBlocks can
+provide lazy mappings for direct and cache access paths.
+
+Teach qemu_ram_ptr_length() and its direct-access callers to use the
+provider map callback when a RAMBlock has no permanent host mapping.
+Update address_space_map() and address_space_unmap() to map through the
+provider, release mappings with put(), and handle map failures without
+leaking region references.
+
+Keep qemu_ram_block_from_host() and the cache rollout in follow-up
+patches.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ include/system/ramblock.h | 15 ++++++++++
+ system/physmem.c          | 60 +++++++++++++++++++++++++++++++++------
+ 2 files changed, 67 insertions(+), 8 deletions(-)
+
+diff --git a/include/system/ramblock.h b/include/system/ramblock.h
+index e9f58ac04571..00ceaad418e2 100644
+--- a/include/system/ramblock.h
++++ b/include/system/ramblock.h
+@@ -103,6 +103,21 @@ struct RamBlockAttributes {
+     QLIST_HEAD(, RamDiscardListener) rdl_list;
+ };
+ 
++typedef enum RAMBlockMapKind {
++    RAM_BLOCK_MAP_KIND_DIRECT,
++    RAM_BLOCK_MAP_KIND_CACHE,
++} RAMBlockMapKind;
++
++typedef struct RAMBlockMapOps {
++    void *(*map)(void *opaque, RAMBlock *block, ram_addr_t offset,
++                 hwaddr *len, bool is_write, RAMBlockMapKind kind);
++    bool (*from_host)(void *opaque, RAMBlock *block, void *host,
++                      ram_addr_t *offset);
++    void (*put)(void *opaque, RAMBlock *block, void *host,
++                ram_addr_t offset, hwaddr len, bool is_write,
++                RAMBlockMapKind kind);
++} RAMBlockMapOps;
++
+ /* @offset: the offset within the RAMBlock */
+ int ram_block_discard_range(RAMBlock *rb, uint64_t offset, size_t length);
+ /* @offset: the offset within the RAMBlock */
+diff --git a/system/physmem.c b/system/physmem.c
+index e5ff26acecd2..b2492ef64096 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -2166,7 +2166,12 @@ static void ram_block_add(RAMBlock *new_block, Error **errp)
+     new_block->offset = find_ram_offset(new_block->max_length);
+ 
+     if (!new_block->host) {
+-        if (xen_enabled()) {
++        if (new_block->mr->ram_map_ops) {
++            /*
++             * Provider-backed RAMBlocks are mapped lazily through
++             * ram_map_ops.
++             */
++        } else if (xen_enabled()) {
+             xen_ram_alloc(new_block->offset, new_block->max_length,
+                           new_block->mr, &err);
+             if (err) {
+@@ -2719,7 +2724,8 @@ void qemu_ram_remap(ram_addr_t addr)
+  */
+ static void *qemu_ram_ptr_length(RAMBlock *block, ram_addr_t addr,
+                                  hwaddr *size, bool lock,
+-                                 bool is_write)
++                                 bool is_write,
++                                 RAMBlockMapKind kind)
+ {
+     hwaddr len = 0;
+ 
+@@ -2736,6 +2742,16 @@ static void *qemu_ram_ptr_length(RAMBlock *block, ram_addr_t addr,
+         len = *size;
+     }
+ 
++    if (block->mr->ram_map_ops && block->host == NULL) {
++        const RAMBlockMapOps *ops = block->mr->ram_map_ops;
++
++        if (!ops->map) {
++            return NULL;
++        }
++        return ops->map(block->mr->ram_map_opaque, block, addr, size,
++                        is_write, kind);
++    }
++
+     if (xen_enabled() && block->host == NULL) {
+         /* We need to check if the requested address is in the RAM
+          * because we don't want to map the entire memory in QEMU.
+@@ -2766,7 +2782,8 @@ static void *qemu_ram_ptr_length(RAMBlock *block, ram_addr_t addr,
+  */
+ void *qemu_map_ram_ptr(RAMBlock *ram_block, ram_addr_t addr)
+ {
+-    return qemu_ram_ptr_length(ram_block, addr, NULL, false, true);
++    return qemu_ram_ptr_length(ram_block, addr, NULL, false, true,
++                               RAM_BLOCK_MAP_KIND_DIRECT);
+ }
+ 
+ /* Return the offset of a hostpointer within a ramblock */
+@@ -3276,7 +3293,8 @@ static MemTxResult flatview_write_continue_step(MemTxAttrs attrs,
+     } else {
+         /* RAM case */
+         uint8_t *ram_ptr = qemu_ram_ptr_length(mr->ram_block, mr_addr, l,
+-                                               false, true);
++                                               false, true,
++                                               RAM_BLOCK_MAP_KIND_DIRECT);
+ 
+         memmove(ram_ptr, buf, *l);
+         invalidate_and_set_dirty(mr, mr_addr, *l);
+@@ -3369,7 +3387,8 @@ static MemTxResult flatview_read_continue_step(MemTxAttrs attrs, uint8_t *buf,
+     } else {
+         /* RAM case */
+         uint8_t *ram_ptr = qemu_ram_ptr_length(mr->ram_block, mr_addr, l,
+-                                               false, false);
++                                               false, false,
++                                               RAM_BLOCK_MAP_KIND_DIRECT);
+ 
+         memcpy(buf, ram_ptr, *l);
+ 
+@@ -3718,6 +3737,7 @@ void *address_space_map(AddressSpace *as,
+     hwaddr l, xlat;
+     MemoryRegion *mr;
+     FlatView *fv;
++    void *ptr;
+ 
+     trace_address_space_map(as, addr, len, is_write, *(uint32_t *) &attrs);
+ 
+@@ -3726,7 +3746,12 @@ void *address_space_map(AddressSpace *as,
+     }
+ 
+     l = len;
+-    RCU_READ_LOCK_GUARD();
++    /*
++     * Keep explicit lock/unlock instead of RCU_READ_LOCK_GUARD(): the
++     * provider-backed and bounce-buffer paths below have multiple early
++     * returns that must drop the RCU read lock first.
++     */
++    rcu_read_lock();
+     fv = address_space_to_flatview(as);
+     mr = flatview_translate(fv, addr, &xlat, &l, is_write, attrs);
+ 
+@@ -3745,6 +3770,7 @@ void *address_space_map(AddressSpace *as,
+         }
+ 
+         if (l == 0) {
++            rcu_read_unlock();
+             *plen = 0;
+             return NULL;
+         }
+@@ -3760,6 +3786,7 @@ void *address_space_map(AddressSpace *as,
+             flatview_read(fv, addr, attrs,
+                           bounce->buffer, l);
+         }
++        rcu_read_unlock();
+ 
+         *plen = l;
+         return bounce->buffer;
+@@ -3769,7 +3796,16 @@ void *address_space_map(AddressSpace *as,
+     *plen = flatview_extend_translation(fv, addr, len, mr, xlat,
+                                         l, is_write, attrs);
+     fuzz_dma_read_cb(addr, *plen, mr);
+-    return qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
++    ptr = qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write,
++                              RAM_BLOCK_MAP_KIND_DIRECT);
++    rcu_read_unlock();
++    if (!ptr || *plen == 0) {
++        memory_region_unref(mr);
++        *plen = 0;
++        return NULL;
++    }
++
++    return ptr;
+ }
+ 
+ /* Unmaps a memory region previously mapped by address_space_map().
+@@ -3787,7 +3823,15 @@ void address_space_unmap(AddressSpace *as, void *buffer, hwaddr len,
+         if (is_write) {
+             invalidate_and_set_dirty(mr, addr1, access_len);
+         }
+-        if (xen_enabled()) {
++        if (mr->ram_map_ops && mr->ram_block && mr->ram_block->host == NULL) {
++            /*
++             * from_host()/memory_region_from_host() gives the RAMBlock
++             * relative offset expected by the provider on put().
++             */
++            mr->ram_map_ops->put(mr->ram_map_opaque, mr->ram_block, buffer,
++                                 addr1, len, is_write,
++                                 RAM_BLOCK_MAP_KIND_DIRECT);
++        } else if (xen_enabled()) {
+             xen_invalidate_map_cache_entry(buffer);
+         }
+         memory_region_unref(mr);
+-- 
+2.53.0
+

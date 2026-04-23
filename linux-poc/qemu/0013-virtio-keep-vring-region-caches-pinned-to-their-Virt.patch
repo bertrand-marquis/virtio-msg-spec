@@ -1,0 +1,67 @@
+From 071af4b0778ad452b15016177e88c38b9bb5425d Mon Sep 17 00:00:00 2001
+Message-ID: <071af4b0778ad452b15016177e88c38b9bb5425d.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:46 +0200
+Subject: [RFC PATCH 13/28] virtio: keep vring region caches pinned to their
+ VirtIODevice
+
+Keep a VirtIODevice reference in VRingMemoryRegionCaches so queue
+region caches stay pinned to the device that owns them.
+
+Release the reference on teardown and on init error paths.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/virtio.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 00d387ba05a0..d30bf80bee8c 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -99,6 +99,7 @@ typedef struct VRingUsed
+ 
+ typedef struct VRingMemoryRegionCaches {
+     struct rcu_head rcu;
++    VirtIODevice *vdev;
+     MemoryRegionCache desc;
+     MemoryRegionCache avail;
+     MemoryRegionCache used;
+@@ -246,6 +247,7 @@ static void virtio_free_region_cache(VRingMemoryRegionCaches *caches)
+     address_space_cache_destroy(&caches->desc);
+     address_space_cache_destroy(&caches->avail);
+     address_space_cache_destroy(&caches->used);
++    object_unref(OBJECT(caches->vdev));
+     g_free(caches);
+ }
+ 
+@@ -269,12 +271,14 @@ void virtio_init_region_cache(VirtIODevice *vdev, int n)
+     int64_t len;
+     bool packed;
+ 
+-
+     addr = vq->vring.desc;
+     if (!addr) {
+         goto out_no_cache;
+     }
+     new = g_new0(VRingMemoryRegionCaches, 1);
++    new->vdev = vdev;
++    object_ref(OBJECT(vdev));
++
+     size = virtio_queue_get_desc_size(vdev, n);
+     packed = virtio_vdev_has_feature(vq->vdev, VIRTIO_F_RING_PACKED) ?
+                                    true : false;
+@@ -322,6 +326,8 @@ err_used:
+     address_space_cache_destroy(&new->used);
+ err_desc:
+     address_space_cache_destroy(&new->desc);
++    object_unref(OBJECT(new->vdev));
++    new->vdev = NULL;
+ out_no_cache:
+     g_free(new);
+     virtio_virtqueue_reset_region_cache(vq);
+-- 
+2.53.0
+

@@ -1,0 +1,368 @@
+From 9b92a3673856ba996f2e1e62901a29ec2b6d202c Mon Sep 17 00:00:00 2001
+Message-ID: <9b92a3673856ba996f2e1e62901a29ec2b6d202c.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:47 +0200
+Subject: [RFC PATCH 26/28] docs/devel: document virtio-msg linux bridge
+ internals
+
+Add maintainer-facing documentation for the bridge internals.
+
+Keep the patch as pure devel documentation after the system docs step.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ docs/devel/index-internals.rst         |   1 +
+ docs/devel/virtio-msg-linux-bridge.rst | 328 +++++++++++++++++++++++++
+ 2 files changed, 329 insertions(+)
+ create mode 100644 docs/devel/virtio-msg-linux-bridge.rst
+
+diff --git a/docs/devel/index-internals.rst b/docs/devel/index-internals.rst
+index 7a0678cbdd3a..0a8ab597baaf 100644
+--- a/docs/devel/index-internals.rst
++++ b/docs/devel/index-internals.rst
+@@ -24,5 +24,6 @@ Details about QEMU's various subsystems including how to add features to them.
+    vfio-iommufd
+    writing-monitor-commands
+    virtio-backends
++   virtio-msg-linux-bridge
+    crypto
+    multiple-iothreads
+diff --git a/docs/devel/virtio-msg-linux-bridge.rst b/docs/devel/virtio-msg-linux-bridge.rst
+new file mode 100644
+index 000000000000..07b441f76fee
+--- /dev/null
++++ b/docs/devel/virtio-msg-linux-bridge.rst
+@@ -0,0 +1,328 @@
++.. SPDX-License-Identifier: GPL-2.0-or-later
++
++Virtio-msg Linux Bridge Internals
++=================================
++
++This document describes implementation details of the QEMU
++``virtio-msg-linux-bridge`` backend.
++
++For user-facing command-line usage, see:
++
++- :doc:`../system/devices/virtio/virtio-msg-linux-bridge`
++
++Scope
++-----
++
++The Linux bridge backend connects the ``virtio-msg`` transport core to the
++host kernel bridge UAPI (``/dev/virtio-msg-bridge``) using:
++
++- control ioctls for endpoint lifecycle and topology
++- shared TX/RX rings for message traffic
++- eventfds for kick/call notifications
++
++QOM Model
++---------
++
++The backend supports two compositions:
++
++- ``virtio-msg-linux-bridge-transport`` (recommended for CLI use)
++  A plain ``TYPE_DEVICE`` container that creates an outer bus, a
++  ``virtio-msg`` proxy, and an internal ``virtio-msg-linux-bridge``
++  backend. The transport parent fixes default ring geometry to
++  256 entries with 128-byte slots (the aligned ``VIRTIO_MSG_MAX_SIZE``
++  default) and passes that value as ``vmm-max-msg-size``.
++- ``virtio-msg-linux-bridge`` (standalone backend)
++  Attaches to an already existing ``virtio-msg`` object. Ring entry-size
++  validation is keyed to the backend's stored ``vmm-max-msg-size`` property.
++
++The backend itself derives from ``TYPE_VIRTIO_MSG_BUS_DEVICE`` and provides
++transport callbacks used by ``virtio-msg`` core.
++
++Realize and Attach Lifecycle
++----------------------------
++
++At realize time, the backend:
++
++1. Validates endpoint and ring geometry properties.
++2. Opens the bridge device node.
++3. Resolves endpoint string to a bridge endpoint handle
++   (``RESOLVE_F_CREATE`` only when ``create-endpoint=on``).
++4. Allocates shared ring backing and eventfds.
++5. Issues ``ATTACH`` with ring/eventfd descriptors plus the attach-epoch
++   ``vmm_max_msg_size`` input.
++6. Latches the attach snapshot (revision and feature bitmaps) and seeds
++   endpoint-scoped max-message state when the attach snapshot is online.
++7. Registers fd handlers for data-path and control-path processing.
++8. Installs a migration blocker.
++
++Unrealize performs the reverse sequence: unregister handlers, detach,
++release endpoint, unmap mapped areas, close fds, and remove the migration
++blocker.
++
++Endpoint State Model
++--------------------
++
++Endpoint availability is driven by an explicit attach-session state machine:
++
++- ``DETACHED``: no active bridge attach
++- ``ATTACHED_OFFLINE``: attach succeeded, but endpoint-scoped topology, map,
++  RX, and TX work is quiesced for the current epoch
++- ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``: the endpoint is online for the current
++  attach epoch, but transport traffic stays blocked until ``SET_DEVICES``
++  succeeds
++- ``ATTACHED_ONLINE_ACTIVE``: topology has been published successfully for the
++  current online epoch, so RX, TX, map receive, map ACK, and pending-TX flush
++  are allowed
++- ``ATTACHED_FAILED``: reserved for terminal attach failure handling in later
++  steps
++
++State transitions for this step are:
++
++- ``ATTACH`` snapshot online -> ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- ``ATTACH`` snapshot offline -> ``ATTACHED_OFFLINE``
++- successful ``SET_DEVICES`` -> ``ATTACHED_ONLINE_ACTIVE``
++- ``ENDPOINT_ONLINE`` -> ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- ``ENDPOINT_OFFLINE`` -> ``ATTACHED_OFFLINE``
++
++``ENDPOINT_ONLINE`` is a lifecycle refresh for the current attach epoch: it
++updates endpoint-scoped fields (``bus_name`` and ``endpoint_max_msg_size``)
++and requests topology republish, but it is not a second attach-capability
++negotiation step.
++
++``CONTROL_RECV`` remains active in ``ATTACHED_OFFLINE`` and
++``ATTACHED_ONLINE_NEEDS_TOPOLOGY`` so later lifecycle notifications can move
++the session forward again. Data and map traffic do not resume until the
++session reaches ``ATTACHED_ONLINE_ACTIVE``.
++
++Control Path Contract
++---------------------
++
++Control traffic is processed from ``dev_fd`` using a non-blocking drain loop:
++
++- dequeue control message via ``CONTROL_RECV``
++- validate payload size and endpoint id
++- dispatch ``ENDPOINT_ONLINE`` and ``ENDPOINT_OFFLINE`` by type
++
++``ENDPOINT_ONLINE`` carries only endpoint lifecycle refresh data for the
++current attach epoch, including endpoint ``bus_name`` and endpoint
++``max_msg_size``.
++
++``EAGAIN``/``EWOULDBLOCK`` terminates the drain loop for the current wakeup.
++
++The simplified bridge UAPI has no ``CONTROL_ACK`` ioctl and no peer-state
++event family, so control-path ordering is limited to the delivered endpoint
++state transitions themselves.
++
++Data Path Contract
++------------------
++
++Data traffic uses shared TX/RX ring headers with monotonic ``u32`` cursors:
++
++- slot index: ``cursor % entries``
++- occupancy: ``prod - cons`` (unsigned arithmetic)
++- valid occupancy range: ``0..entries``
++
++Producer/consumer ordering follows acquire/release semantics:
++
++- producer publishes entry contents before advancing ``prod``
++- consumer reads ``prod`` with acquire semantics before reading payload
++- consumer advances ``cons`` only after processing is complete
++
++Occupancy above ``entries`` is treated as ring corruption and rejected.
++
++Copy-path behavior:
++
++- RX copies only the message header first, validates ``msg_size``, then copies
++  only validated payload bytes
++- TX copies only ``msg_size`` bytes to the ring slot (no full-slot clear)
++
++Ring Geometry and Validation
++----------------------------
++
++Bridge-backed ring policy is split between transport defaults and backend
++validation:
++
++- transport parent defaults are fixed to 256 entries and 128-byte slots for
++  both TX and RX
++- backend validation requires exactly 256 entries on both rings and slot size
++  ``== ALIGN(vmm_max_msg_size, 128)``
++- realize-time ring validation uses the backend's stored
++  ``vmm-max-msg-size`` property for both TX and RX
++- for the current v1 bridge UAPI this means transport-mode geometry is
++  effectively fixed to 256x128 rather than a generic runtime sizing knob
++- endpoint ``max_msg_size`` is learned per attach epoch from ``ATTACH`` and
++  later ``ENDPOINT_ONLINE`` lifecycle refresh payloads
++
++Required Delivery Contract
++--------------------------
++
++Required traffic uses ``send_must_deliver`` semantics:
++
++- synchronous responses and used/config notifications are queued when transient
++  backpressure occurs
++- queued traffic is retried via a bounded timer-backed backoff only while the
++  session is in ``ATTACHED_ONLINE_ACTIVE``
++- existing bridge progress points also attempt to flush queued traffic when the
++  session returns to ``ATTACHED_ONLINE_ACTIVE``
++- retry is canceled when the queue drains or the session leaves the active
++  online state
++- ``ENDPOINT_OFFLINE`` clears queued pending-TX entries for the old epoch
++- no busy-loop retry path is used
++
++Queue Address Preparation
++-------------------------
++
++``SET_VQUEUE`` configures queue size, vector, and ring addresses.
++
++Descriptor payload mappings, indirect descriptor caches, and vring caches use
++the bridge ``dma_as`` backed by map-event-installed RAM subregions.
++
++Bridge-driven cache lifecycle:
++
++- queue region caches are invalidated after successful map add/del, endpoint
++  offline, and bridge teardown/reset paths
++- ``EVENT_AVAIL`` rebuilds queue caches only when invalid
++- coverage misses while offline fail fast without polling control/map progress
++
++DMA Mapping Model (Map Events + RAMBlock providers)
++---------------------------------------------------
++
++The backend map table is populated by the bridge map-event queue on ``dev_fd``:
++
++The final DMA-sharing path is entirely bridge-managed: map events publish and
++revoke generic DMA windows, and the transport does not use a ``GET_SHM``
++message to publish them.
++
++1. ``MAP_EVENT_RECV`` dequeues one event from ``dev_fd``.
++2. ``ADD`` validates the event, accepts ``mmap_length >= length``, maps
++   ``mmap_length`` bytes at ``mmap_offset`` from ``dev_fd``, and installs a
++   provider-backed RAM subregion into the bridge ``dma_mr`` at ``bus_addr``
++   for exactly ``length`` bytes.
++3. RAMBlock provider callbacks return direct host pointers from the bridge
++   entry, reverse-lookup host pointers back to the owning entry, and release
++   per-entry refs from ``address_space_unmap()`` and cache teardown.
++4. ``DEL_REQ`` revokes the DMA-visible subregion immediately, returns
++   ``MAP_ACK_RETRY`` while bridge-local references remain, and returns
++   ``MAP_ACK_OK`` only on a later retry after ``munmap()`` finalization
++   completes.
++5. ``MAP_EVENT_ACK`` is issued per dequeued event, with transient failures
++   retried on later ``dev_fd`` wakeups.
++
++Map entry identity and references are owned by bridge-local mapcache state:
++
++- host-pointer reverse lookup is local to the bridge backend provider callbacks
++- active direct-map and cache refs are tracked per map entry and block final
++  teardown
++- map add/del contracts require page-aligned exact spans and non-zero lengths
++  (zero bus addresses are accepted)
++
++Lookup optimization:
++
++- a single-entry covering-map cache is checked before QTAILQ scan
++- each hit/install updates ``last_use_seq`` through
++  ``virtio_msg_linux_bridge_map_touch_locked()``
++- cache is invalidated on entry removal, full unmap, and lifecycle resets
++
++Lifetime rules:
++
++- no opportunistic eviction is performed for cache pressure
++- map lifetime ends only on ``DEL_REQ``, endpoint offline, detach, or bridge
++  teardown
++- teardown removes any remaining live mappings and releases metadata
++- ``ENDPOINT_OFFLINE`` also clears any pending map-ACK state for the old epoch
++
++Capability Latching
++-------------------
++
++Transport capability selection is latched at child plug time:
++
++- extra features and transport capability snapshots are fixed during pre-plug
++- runtime control messages update endpoint state, but do not rewrite latched
++  transport capability model used by already plugged children
++
++Capability validation and max-size derivation are split by source:
++
++- ``ATTACH`` validates ``revision`` against
++  ``VIRTIO_MSG_LINUX_BRIDGE_REVISION_SUPPORTED``
++- ``max_msg_size`` normalization: ``0 -> VIRTIO_MSG_MAX_SIZE``
++- bounds: ``virtio_msg_header_size() <= max_msg_size <= sizeof(VirtIOMSG)``
++- attach snapshots provide the only source for transport and bridge feature
++  bitmaps
++- ``ENDPOINT_ONLINE`` refreshes endpoint ``bus_name`` and endpoint
++  ``max_msg_size`` only (no revision/features update)
++- effective transport max is recomputed as
++  ``min(vmm_max_msg_size, endpoint_max_msg_size_when_online)``, with the
++  endpoint term absent while offline
++
++Topology Publication Model
++--------------------------
++
++Topology publication uses a full-snapshot ``SET_DEVICES`` model:
++
++- attach-online snapshots and later ``ENDPOINT_ONLINE`` transitions enter
++  ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- ``machine_done`` and ``ENDPOINT_ONLINE`` may publish topology only from
++  ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- successful ``SET_DEVICES`` is the only transition into
++  ``ATTACHED_ONLINE_ACTIVE``
++- failed ``SET_DEVICES`` leaves the session attached but quiesced in
++  ``ATTACHED_ONLINE_NEEDS_TOPOLOGY`` until a later successful publish
++- transient ``SET_DEVICES`` failures (for example ``EAGAIN``/``EBUSY``) use a
++  backend-local bounded timer/backoff retry while the session remains in
++  ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- this topology retry is canceled once ``SET_DEVICES`` succeeds or the session
++  leaves ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- the published range is ``first_dev_num = 0`` through
++  ``last_dev_num = VIRTIO_MSG_MAX_DEVS - 1``
++- bitmap bit ``n`` maps to external device number ``first_dev_num + n``
++- runtime child hotplug and unplug are unsupported
++- no runtime ``DEV_NUM_ADD``/``DEV_NUM_REMOVE`` publication path is kept
++- the ``virtio-msg`` proxy bus is intentionally not hotpluggable
++
++``ENDPOINT_OFFLINE`` is treated as an attached-but-offline epoch transition,
++not as an implicit detach. QEMU keeps the bridge session attached, clears
++pending-TX entries and retry state, clears pending map-ACK state, unmaps all
++bridge mappings, invalidates proxy caches, and resets attached child devices.
++The device reset is retained QEMU transport policy layered on top of the Linux
++bridge ABI rather than an ABI requirement.
++
++Concurrency Notes
++-----------------
++
++The backend separates wakeup handling by fd role:
++
++- ``call_fd`` callback runs control/map processing before RX ring dequeue,
++  allowing endpoint-state and map-event progress on RX wakeups
++- ``dev_fd`` callback drains both control and map-event queues, and retries
++  pending map-event ACKs as needed (primary wakeup source)
++
++This split keeps RX ring traffic isolated while preserving ordered handling for
++endpoint-state and map-event transitions, even when control work is triggered
++by ``call_fd`` wakeups.
++
++Migration
++---------
++
++Migration is explicitly blocked for this backend.
++
++Reason: bridge session state (resolved endpoint handle, attached fd state,
++map tokens, and host bridge lifecycle) is host-local and cannot be
++transparently reconstructed on destination.
++
++Tracing and Debugging
++---------------------
++
++Relevant diagnostics include:
++
++- guest-error logs for malformed control payloads or endpoint mismatch
++- warning logs for short/failed eventfd writes and fd read errors
++- tracepoints covering endpoint and peer state transitions
++- map lifecycle traces:
++  ``virtio_msg_linux_bridge_map_event_recv``,
++  ``virtio_msg_linux_bridge_map_event_ack``,
++  ``virtio_msg_linux_bridge_map_event_install``,
++  ``virtio_msg_linux_bridge_map_event_remove``,
++  ``virtio_msg_linux_bridge_map_event_busy``,
++  ``virtio_msg_linux_bridge_map_evict``,
++  ``virtio_msg_linux_bridge_map_ref_acquire``,
++  ``virtio_msg_linux_bridge_map_ref_release``
+-- 
+2.53.0
+

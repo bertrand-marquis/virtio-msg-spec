@@ -1,0 +1,39 @@
+From 0ec820b809bd997d6a5dbb66cb31da2c8f8b21bf Mon Sep 17 00:00:00 2001
+Message-ID: <0ec820b809bd997d6a5dbb66cb31da2c8f8b21bf.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:46 +0200
+Subject: [RFC PATCH 11/28] memory: fully reset MemoryRegionCache state
+
+Make address_space_cache_init_empty() clear pointer, translation,
+length, write state, and MemoryRegionSection fields.
+
+This gives callers one helper that fully resets the cache object.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ include/system/memory_cached.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/include/system/memory_cached.h b/include/system/memory_cached.h
+index 6eb6179140b8..49f48cbc0e1a 100644
+--- a/include/system/memory_cached.h
++++ b/include/system/memory_cached.h
+@@ -132,9 +132,13 @@ int64_t address_space_cache_init(MemoryRegionCache *cache,
+  */
+ static inline void address_space_cache_init_empty(MemoryRegionCache *cache)
+ {
++    cache->ptr = NULL;
++    cache->xlat = 0;
++    cache->len = 0;
+     cache->mrs.mr = NULL;
+     /* There is no real need to initialize fv, but it makes Coverity happy. */
+     cache->fv = NULL;
++    cache->is_write = false;
+ }
+ 
+ /**
+-- 
+2.53.0
+
