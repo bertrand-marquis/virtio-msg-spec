@@ -1,0 +1,273 @@
+From 8e041146f4f080c019942cfb4115f720c28f1509 Mon Sep 17 00:00:00 2001
+Message-ID: <8e041146f4f080c019942cfb4115f720c28f1509.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:47 +0200
+Subject: [RFC PATCH 25/28] docs/system: document virtio-msg linux bridge usage
+
+Add system documentation for using the virtio-msg linux bridge.
+
+Keep the patch scoped to user-facing documentation only.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ docs/system/devices/virtio/index.rst          |   1 +
+ .../virtio/virtio-msg-linux-bridge.rst        | 233 ++++++++++++++++++
+ 2 files changed, 234 insertions(+)
+ create mode 100644 docs/system/devices/virtio/virtio-msg-linux-bridge.rst
+
+diff --git a/docs/system/devices/virtio/index.rst b/docs/system/devices/virtio/index.rst
+index f2d8c2435397..3e7552de4ab1 100644
+--- a/docs/system/devices/virtio/index.rst
++++ b/docs/system/devices/virtio/index.rst
+@@ -22,6 +22,7 @@ can also be off-loaded to an external process via :ref:`vhost user
+ 
+    virtio-gpu.rst
+    virtio-msg-amp-pci.rst
++   virtio-msg-linux-bridge.rst
+    virtio-pmem.rst
+    virtio-snd.rst
+    vhost-user.rst
+diff --git a/docs/system/devices/virtio/virtio-msg-linux-bridge.rst b/docs/system/devices/virtio/virtio-msg-linux-bridge.rst
+new file mode 100644
+index 000000000000..605053d5e3d6
+--- /dev/null
++++ b/docs/system/devices/virtio/virtio-msg-linux-bridge.rst
+@@ -0,0 +1,233 @@
++.. SPDX-License-Identifier: GPL-2.0-or-later
++
++Virtio-msg Linux Bridge
++=======================
++
++This document describes how to use the Linux bridge backend for
++``virtio-msg`` from the QEMU command line.
++
++Overview
++--------
++
++The Linux bridge backend connects a QEMU ``virtio-msg`` transport to a host
++bridge endpoint (typically through ``/dev/virtio-msg-bridge``).
++
++Most users should instantiate the transport container device:
++
++- ``virtio-msg-linux-bridge-transport``
++
++This container model creates:
++
++- a top-level ``virtio-msg-outer-bus``
++- a ``virtio-msg`` transport
++- an internal ``virtio-msg-linux-bridge`` backend
++
++A standalone backend model is also available for integrators that already
++instantiate ``virtio-msg`` separately:
++
++- ``virtio-msg-linux-bridge``
++
++Requirements
++------------
++
++- QEMU built with ``CONFIG_VIRTIO_MSG_LINUX_BRIDGE``.
++- Host bridge device node available (default: ``/dev/virtio-msg-bridge``).
++- A valid bridge endpoint.
++
++Endpoint Syntax
++---------------
++
++The ``endpoint`` property format is ``bus-name[:bus-id]``:
++
++- ``bus-name`` is required.
++- ``bus-id`` is optional.
++- ``bus-id`` is passed as a string to the kernel bridge backend.
++
++Examples:
++
++- ``loopback``
++- ``ffa:5``
++- ``ffa:0x5``
++
++Canonical Transport Mode
++------------------------
++
++Use ``virtio-msg-linux-bridge-transport`` as the default entry point:
++
++.. code-block:: none
++
++   -device virtio-msg-linux-bridge-transport,id=vmsgt0,endpoint=loopback \
++   -device virtio-rng-device,bus=/vmsgt0/bus/virtio-msg/bus0/virtio-msg-dev
++
++To use a non-default bridge node:
++
++.. code-block:: none
++
++   -device virtio-msg-linux-bridge-transport,id=vmsgt0,endpoint=ffa:5,devnode=/dev/virtio-msg-bridge0
++
++Standalone Backend Mode
++-----------------------
++
++Standalone mode is intended for integration with an already existing
++``virtio-msg`` object:
++
++.. code-block:: none
++
++   -device virtio-msg,id=vmsg0 \
++   -device virtio-msg-linux-bridge,id=vmsgbr0,endpoint=loopback,bus=/vmsg0/msg-bus \
++   -device virtio-rng-device,bus=/vmsg0/bus0/virtio-msg-dev
++
++Use standalone mode only when you need explicit control over how
++``virtio-msg`` is instantiated.
++
++Properties
++----------
++
++Both models expose the same backend configuration properties:
++
++- ``endpoint`` (required)
++- ``create-endpoint`` (optional, default ``off``)
++- ``devnode`` (optional, default ``/dev/virtio-msg-bridge``)
++- ``tx-ring-entries`` (default ``256``)
++- ``tx-ring-entry-size`` (default ``128`` in transport mode)
++- ``rx-ring-entries`` (default ``256``)
++- ``rx-ring-entry-size`` (default ``128`` in transport mode)
++
++The standalone backend also exposes:
++
++- ``vmm-max-msg-size`` (optional, default ``128``)
++
++``create-endpoint=off`` keeps launch policy fail-fast if the selected endpoint
++does not already exist in the host bridge backend.
++Use ``create-endpoint=on`` only when you explicitly want QEMU to create a
++missing endpoint (for example, offline staging workflows).
++
++In transport mode, the bridge is attached with ``vmm_max_msg_size=128``, and
++the default ring geometry is 256 entries by 128-byte slots for both TX and RX.
++For the current v1 bridge UAPI, transport-mode ring geometry is effectively
++fixed to that 256x128 shape rather than a general tuning knob.
++Endpoint ``max_msg_size`` is still learned per attach epoch from ``ATTACH``
++and later ``ENDPOINT_ONLINE`` lifecycle refresh events, and may be smaller.
++For standalone mode, both rings must use exactly ``256`` entries, and
++``entry-size`` must equal the attach-time ``vmm-max-msg-size`` rounded up to
++the bridge alignment (``128`` bytes in the current UAPI).
++
++Operational Notes
++-----------------
++
++- Attach may succeed while the endpoint is offline.
++- ``ATTACH`` is the authoritative initial capability snapshot for one attach
++  epoch. It provides the transport revision and feature bits, plus endpoint
++  online/offline state and initial endpoint max message size when already
++  online.
++- If attach already reports the endpoint online, QEMU uses that snapshot
++  directly and does not wait for a synthetic ``ENDPOINT_ONLINE`` event.
++- ``RESOLVE_ENDPOINT`` uses create flags only when ``create-endpoint=on``.
++- Default policy is ``create-endpoint=off`` for explicit pre-provisioned
++  endpoints.
++- QEMU keeps control-path receive active while an attach is offline or waiting
++  for topology publication, but it blocks endpoint-scoped RX, TX, map-event,
++  and pending required-delivery flush work until topology publication
++  succeeds for the current online epoch.
++- QEMU publishes a full topology snapshot through ``SET_DEVICES`` after the
++  bridge is attached and machine initialization is complete when the attach
++  snapshot is already online, and republishes the full snapshot after each
++  later ``ENDPOINT_ONLINE`` transition.
++- The published transport topology uses external device numbers
++  ``[0..VIRTIO_MSG_MAX_DEVS - 1]``.
++- ``SET_DEVICES`` uses inclusive ``first_dev_num`` and ``last_dev_num`` values,
++  and bitmap bit ``n`` maps to ``first_dev_num + n``.
++- Runtime child hotplug and unplug are unsupported.
++- The ``virtio-msg`` proxy bus is intentionally not hotpluggable.
++- While offline or still waiting for ``SET_DEVICES`` to complete for a new
++  online epoch, transmit requests return retry and required-delivery TX is not
++  queued.
++- Required traffic (synchronous responses plus used/config notifications) is
++  queued for eventual delivery when transient backpressure occurs, with a
++  bounded timer-backed retry (1..64 ms) only after ``SET_DEVICES`` succeeds
++  for the current online epoch.
++- Required traffic retry is canceled when the queue drains or the endpoint
++  leaves that active online state.
++- Generic DMA windows are published and revoked by bridge map events through
++  provider-backed RAM subregions in the bridge DMA address space.
++- DMA visibility comes from those bridge map events rather than from any
++  ``GET_SHM`` transport message path.
++- ``ADD`` map events may advertise ``mmap_length`` larger than the active DMA
++  window; QEMU maps the delivered extent and exposes exactly ``length`` bytes
++  of guest-visible DMA space.
++- ``DEL_REQ`` map events revoke DMA visibility immediately, return
++  ``MAP_ACK_RETRY`` while local references remain, and return
++  ``MAP_ACK_OK`` only on a later retry after local teardown completes.
++- QEMU does not evict installed mappings only to free cache space.
++- ``ENDPOINT_OFFLINE`` is an attached-but-offline transition, not a detach.
++- ``ENDPOINT_OFFLINE`` clears pending required-delivery TX state, clears
++  pending map-ACK state, revokes all live bridge DMA mappings, and resets
++  attached child devices.
++- The child-device reset on ``ENDPOINT_OFFLINE`` is retained QEMU transport
++  policy, not a Linux bridge ABI requirement.
++- Guest queue accesses and later DMA buffers use the bridge-managed DMA
++  address space, so map-event updates directly control when published DMA
++  ranges become usable or removable.
++- ``ENDPOINT_ONLINE`` and ``ENDPOINT_OFFLINE`` are the only runtime endpoint
++  lifecycle notifications.
++- ``ENDPOINT_ONLINE`` is a lifecycle refresh payload carrying ``endpoint_id``,
++  ``bus_name``, and endpoint ``max_msg_size`` only; it does not republish
++  revision or feature bitmaps.
++- ``dev_fd`` carries both endpoint control notifications and map events.
++- ``ATTACH`` validates revision and initial max message size.
++- Runtime ``ENDPOINT_ONLINE`` validates endpoint ``max_msg_size`` only, using
++  ``0 -> VIRTIO_MSG_MAX_SIZE`` with
++  ``virtio_msg_header_size() <= max_msg_size <= 128``.
++- Bridge map events accept ``bus_addr == 0`` as long as length and alignment
++  requirements are satisfied.
++
++Limitations
++-----------
++
++- Migration is blocked for this backend (bridge session state is host-local).
++
++Troubleshooting
++---------------
++
++- Confirm the bridge device node exists and permissions are correct.
++- Confirm the selected endpoint exists and is valid for the backend bus.
++- If the endpoint is offline, expect retry behavior until an online transition.
++- If transport devices do not appear after boot, confirm machine
++  initialization completed and the endpoint reached the online state so QEMU
++  could publish the topology snapshot through ``SET_DEVICES`` and move the
++  session into its active online state.
++- If online events are rejected, verify bridge revision and max message size
++  match the supported capability contract.
++
++Tracing
++-------
++
++QEMU tracepoints are available for the Linux bridge backend. To enable all
++bridge trace events:
++
++.. code-block:: none
++
++   -trace enable=virtio_msg_linux_bridge_*
++
++To discover event names:
++
++.. code-block:: none
++
++   -trace help
++
++and filter for ``virtio_msg_linux_bridge_``.
++
++To write traces to a file with the ``simple`` trace backend:
++
++.. code-block:: none
++
++   -trace enable=virtio_msg_linux_bridge_*,file=/tmp/vmsg.trace
++
++If QEMU is built without ``simple`` backend support, traces can still be
++captured by redirecting stderr.
++
++Developer Notes
++---------------
++
++Implementation details and internal contracts are documented in QEMU's
++developer documentation.
+-- 
+2.53.0
+

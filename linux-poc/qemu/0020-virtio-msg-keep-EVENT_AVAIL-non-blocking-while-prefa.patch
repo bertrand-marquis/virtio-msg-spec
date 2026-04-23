@@ -1,0 +1,131 @@
+From d9528f86e131ad3cb9aa254547041c8cea7929b9 Mon Sep 17 00:00:00 2001
+Message-ID: <d9528f86e131ad3cb9aa254547041c8cea7929b9.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:47 +0200
+Subject: [RFC PATCH 20/28] virtio-msg: keep EVENT_AVAIL non-blocking while
+ prefaulting split vrings
+
+Prefault split vring mappings before processing EVENT_AVAIL so the
+event path can remain non-blocking.
+
+Also ensure the virtqueue region caches are initialized when the event
+path needs them.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/virtio-msg.c | 70 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 68 insertions(+), 2 deletions(-)
+
+diff --git a/hw/virtio/virtio-msg.c b/hw/virtio/virtio-msg.c
+index 64bd30939534..dfba2a2e4cfb 100644
+--- a/hw/virtio/virtio-msg.c
++++ b/hw/virtio/virtio-msg.c
+@@ -519,12 +519,57 @@ static int virtio_msg_reset_vqueue(VirtIOMSGProxy *s, VirtIOMSG *msg)
+     return VIRTIO_MSG_NO_ERROR;
+ }
+ 
++static bool virtio_msg_prefault_split_vring_for_event_avail(VirtIODevice *vdev,
++                                                             uint16_t vq_idx,
++                                                             hwaddr desc_addr,
++                                                             hwaddr avail_addr,
++                                                             hwaddr used_addr)
++{
++    struct {
++        hwaddr addr;
++        hwaddr size;
++    } ranges[] = {
++        { desc_addr, virtio_queue_get_desc_size(vdev, vq_idx) },
++        { avail_addr, virtio_queue_get_avail_size(vdev, vq_idx) },
++        { used_addr, virtio_queue_get_used_size(vdev, vq_idx) },
++    };
++    uint8_t probe[64];
++    bool ok = true;
++    size_t i;
++
++    for (i = 0; i < ARRAY_SIZE(ranges); i++) {
++        hwaddr off;
++
++        for (off = 0; off < ranges[i].size; ) {
++            hwaddr len = MIN((hwaddr)sizeof(probe), ranges[i].size - off);
++
++            MemTxResult tx_result;
++
++            tx_result = address_space_read(vdev->dma_as, ranges[i].addr + off,
++                                           MEMTXATTRS_UNSPECIFIED,
++                                           probe, len);
++            if (tx_result) {
++                ok = false;
++                goto out;
++            }
++            off += len;
++        }
++    }
++
++out:
++    return ok;
++}
++
+ static int virtio_msg_event_avail(VirtIOMSGProxy *s,
+                                   VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev;
+     uint16_t vq_idx = msg->event_avail.index;
++    uint16_t qsize = 0;
+     VirtQueue *vq;
++    hwaddr desc_addr = 0;
++    hwaddr avail_addr = 0;
++    hwaddr used_addr = 0;
+     int ret;
+ 
+     ret = virtio_msg_lookup_vdev(s, msg->dev_num, NULL, &vdev);
+@@ -548,15 +593,23 @@ static int virtio_msg_event_avail(VirtIOMSGProxy *s,
+         return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+-    if (!virtio_queue_get_num(vdev, vq_idx)) {
++    qsize = virtio_queue_get_num(vdev, vq_idx);
++    if (!qsize) {
+         virtio_error(vdev, "Notification to unconfigured VQ!");
+         return VIRTIO_MSG_NO_ERROR;
+     }
+ 
++    desc_addr = virtio_queue_get_desc_addr(vdev, vq_idx);
++    avail_addr = virtio_queue_get_avail_addr(vdev, vq_idx);
++    used_addr = virtio_queue_get_used_addr(vdev, vq_idx);
++
++    if (!virtio_queue_region_cache_valid(vdev, vq_idx)) {
++        virtio_init_region_cache(vdev, vq_idx);
++    }
++
+     vq = virtio_get_queue(vdev, vq_idx);
+     if (virtio_vdev_has_feature(vdev, VIRTIO_F_NOTIFICATION_DATA)) {
+         uint32_t next_offset_wrap = msg->event_avail.next_offset_wrap;
+-        uint16_t qsize = virtio_queue_get_num(vdev, vq_idx);
+         uint32_t offset = next_offset_wrap & 0x7fffffff;
+         bool wrap = next_offset_wrap & 0x80000000;
+         uint16_t data;
+@@ -572,6 +625,19 @@ static int virtio_msg_event_avail(VirtIOMSGProxy *s,
+ 
+         virtio_queue_set_shadow_avail_idx(vq, data);
+     }
++
++    if (!virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED)) {
++        /*
++         * This notification path must not block the bridge RX loop. A light
++         * prefault is acceptable, but do not wait synchronously for split-ring
++         * descriptors to become visible before notifying the device model.
++         */
++        virtio_msg_prefault_split_vring_for_event_avail(vdev, vq_idx,
++                                                        desc_addr,
++                                                        avail_addr,
++                                                        used_addr);
++    }
++
+     virtio_queue_notify(vdev, msg->event_avail.index);
+     return VIRTIO_MSG_NO_ERROR;
+ }
+-- 
+2.53.0
+

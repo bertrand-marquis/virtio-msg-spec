@@ -1,0 +1,41 @@
+From f7eda950b068886a9fab1e88a8824de276a0f94a Mon Sep 17 00:00:00 2001
+Message-ID: <f7eda950b068886a9fab1e88a8824de276a0f94a.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:46 +0200
+Subject: [RFC PATCH 12/28] virtio: re-evaluate VIRTIO_F_IOMMU_PLATFORM after
+ pre_plugged()
+
+Re-check VIRTIO_F_IOMMU_PLATFORM after the pre_plugged()/feature setup
+path in virtio_bus_device_plugged().
+
+This keeps the DMA address-space decision in sync with transport-added
+features.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/virtio-bus.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hw/virtio/virtio-bus.c b/hw/virtio/virtio-bus.c
+index cef944e01588..f8d2127e70ed 100644
+--- a/hw/virtio/virtio-bus.c
++++ b/hw/virtio/virtio-bus.c
+@@ -75,6 +75,13 @@ void virtio_bus_device_plugged(VirtIODevice *vdev, Error **errp)
+         return;
+     }
+ 
++    /*
++     * pre_plugged()/get_features may add transport-provided DMA features
++     * (for example VIRTIO_F_IOMMU_PLATFORM). Re-evaluate the flag after
++     * feature population so get_dma_as() can be engaged when needed.
++     */
++    has_iommu |= virtio_host_has_feature(vdev, VIRTIO_F_IOMMU_PLATFORM);
++
+     if (klass->device_plugged != NULL) {
+         klass->device_plugged(qbus->parent, &local_err);
+     }
+-- 
+2.53.0
+

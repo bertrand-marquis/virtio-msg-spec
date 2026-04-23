@@ -1,0 +1,308 @@
+From 1619fb840b4632525f4bf3973193ac75bff256a5 Mon Sep 17 00:00:00 2001
+Message-ID: <1619fb840b4632525f4bf3973193ac75bff256a5.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:47 +0200
+Subject: [RFC PATCH 24/28] hw/virtio: add virtio-msg linux bridge transport
+ parent
+
+Add the composite transport parent that wires virtio-msg to the linux
+bridge backend.
+
+Keep the patch scoped to parent creation and machine/FDT integration.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/arm/virt.c                                 |   3 +
+ hw/core/sysbus-fdt.c                          |   2 +
+ hw/virtio/meson.build                         |   6 +-
+ hw/virtio/virtio-msg-linux-bridge-transport.c | 203 ++++++++++++++++++
+ include/hw/virtio/virtio-msg.h                |   3 +
+ 5 files changed, 215 insertions(+), 2 deletions(-)
+ create mode 100644 hw/virtio/virtio-msg-linux-bridge-transport.c
+
+diff --git a/hw/arm/virt.c b/hw/arm/virt.c
+index cab2e21e8ae9..94d1c28771bc 100644
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -89,6 +89,7 @@
+ #include "hw/mem/nvdimm.h"
+ #include "hw/acpi/generic_event_device.h"
+ #include "hw/uefi/var-service-api.h"
++#include "hw/virtio/virtio-msg.h"
+ #include "hw/virtio/virtio-md-pci.h"
+ #include "hw/virtio/virtio-iommu.h"
+ #include "hw/char/pl011.h"
+@@ -3474,6 +3475,8 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_RAMFB_DEVICE);
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_UEFI_VARS_SYSBUS);
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_ARM_SMMUV3);
++    machine_class_allow_dynamic_sysbus_dev(
++        mc, TYPE_VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT);
+ #ifdef CONFIG_TPM
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
+ #endif
+diff --git a/hw/core/sysbus-fdt.c b/hw/core/sysbus-fdt.c
+index 89d0c464454a..72ad4587e564 100644
+--- a/hw/core/sysbus-fdt.c
++++ b/hw/core/sysbus-fdt.c
+@@ -35,6 +35,7 @@
+ #include "hw/core/platform-bus.h"
+ #include "hw/display/ramfb.h"
+ #include "hw/uefi/var-service-api.h"
++#include "hw/virtio/virtio-msg.h"
+ #include "hw/arm/fdt.h"
+ 
+ /*
+@@ -140,6 +141,7 @@ static const BindingEntry bindings[] = {
+     TYPE_BINDING(TYPE_ARM_SMMUV3, no_fdt_node),
+     TYPE_BINDING(TYPE_RAMFB_DEVICE, no_fdt_node),
+     TYPE_BINDING(TYPE_UEFI_VARS_SYSBUS, add_uefi_vars_node),
++    TYPE_BINDING(TYPE_VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT, no_fdt_node),
+     TYPE_BINDING("", NULL), /* last element */
+ };
+ 
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index f19fc132818b..0c0dc7906ee5 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -17,8 +17,10 @@ specific_virtio_ss.add(when: 'CONFIG_VIRTIO_MSG', if_true: files(
+     'virtio-msg.c',
+     'virtio-msg-bus.c',
+ ))
+-specific_virtio_ss.add(when: 'CONFIG_VIRTIO_MSG_LINUX_BRIDGE',
+-                       if_true: files('virtio-msg-linux-bridge.c'))
++specific_virtio_ss.add(when: 'CONFIG_VIRTIO_MSG_LINUX_BRIDGE', if_true: files(
++    'virtio-msg-linux-bridge.c',
++    'virtio-msg-linux-bridge-transport.c',
++))
+ 
+ if have_vhost
+   system_virtio_ss.add(files('vhost.c'))
+diff --git a/hw/virtio/virtio-msg-linux-bridge-transport.c b/hw/virtio/virtio-msg-linux-bridge-transport.c
+new file mode 100644
+index 000000000000..64f210f3088e
+--- /dev/null
++++ b/hw/virtio/virtio-msg-linux-bridge-transport.c
+@@ -0,0 +1,203 @@
++/*
++ * Virtio-msg Linux bridge transport composite device.
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/virtio/virtio-msg.h"
++
++#define TYPE_VIRTIO_MSG_LINUX_BRIDGE "virtio-msg-linux-bridge"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMSGLinuxBridgeTransport,
++                           VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT)
++
++#define VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_VMM_MAX_MSG_SIZE_DEFAULT \
++    VIRTIO_MSG_MAX_SIZE
++#define VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_RING_ENTRY_SIZE_DEFAULT \
++    VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_VMM_MAX_MSG_SIZE_DEFAULT
++#define VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_RING_ENTRIES_DEFAULT 256U
++
++typedef struct VirtIOMSGLinuxBridgeTransport {
++    SysBusDevice parent_obj;
++
++    BusState outer_bus;
++    VirtIOMSGProxy proxy;
++    DeviceState *bridge;
++
++    char *endpoint;
++    bool create_endpoint;
++    char *devnode;
++    uint32_t tx_ring_entries;
++    uint32_t tx_ring_entry_size;
++    uint32_t rx_ring_entries;
++    uint32_t rx_ring_entry_size;
++} VirtIOMSGLinuxBridgeTransport;
++
++static bool virtio_msg_linux_bridge_transport_set_bridge_props(
++    VirtIOMSGLinuxBridgeTransport *s, DeviceState *bridge, Error **errp)
++{
++    if (!object_property_set_str(OBJECT(bridge), "endpoint",
++                                 s->endpoint, errp)) {
++        return false;
++    }
++
++    if (!object_property_set_bool(OBJECT(bridge), "create-endpoint",
++                                  s->create_endpoint, errp)) {
++        return false;
++    }
++
++    if (s->devnode &&
++        !object_property_set_str(OBJECT(bridge), "devnode", s->devnode, errp)) {
++        return false;
++    }
++
++    if (!object_property_set_uint(OBJECT(bridge), "tx-ring-entries",
++                                  s->tx_ring_entries, errp)) {
++        return false;
++    }
++
++    if (!object_property_set_uint(OBJECT(bridge), "tx-ring-entry-size",
++                                  s->tx_ring_entry_size, errp)) {
++        return false;
++    }
++
++    if (!object_property_set_uint(OBJECT(bridge), "rx-ring-entries",
++                                  s->rx_ring_entries, errp)) {
++        return false;
++    }
++
++    if (!object_property_set_uint(OBJECT(bridge), "rx-ring-entry-size",
++                                  s->rx_ring_entry_size, errp)) {
++        return false;
++    }
++
++    if (!object_property_set_uint(
++            OBJECT(bridge), "vmm-max-msg-size",
++            VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_VMM_MAX_MSG_SIZE_DEFAULT,
++            errp)) {
++        return false;
++    }
++
++    return true;
++}
++
++static void virtio_msg_linux_bridge_transport_realize(DeviceState *dev,
++                                                      Error **errp)
++{
++    VirtIOMSGLinuxBridgeTransport *s =
++        VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT(dev);
++    Object *obj = OBJECT(dev);
++    DeviceState *bridge;
++
++    if (!s->endpoint || !s->endpoint[0]) {
++        error_setg(errp, "endpoint is required and must not be empty");
++        return;
++    }
++
++    qbus_init(&s->outer_bus, sizeof(s->outer_bus),
++              TYPE_VIRTIO_MSG_OUTER_BUS, dev, "bus");
++
++    object_initialize_child(obj, "virtio-msg", &s->proxy, TYPE_VIRTIO_MSG);
++    if (!qdev_realize(DEVICE(&s->proxy), BUS(&s->outer_bus), errp)) {
++        return;
++    }
++
++    bridge = qdev_new(TYPE_VIRTIO_MSG_LINUX_BRIDGE);
++    if (!virtio_msg_linux_bridge_transport_set_bridge_props(s, bridge, errp)) {
++        object_unref(OBJECT(bridge));
++        qdev_unrealize(DEVICE(&s->proxy));
++        return;
++    }
++
++    if (!qdev_realize(bridge, &s->proxy.msg_bus, errp)) {
++        object_unref(OBJECT(bridge));
++        qdev_unrealize(DEVICE(&s->proxy));
++        return;
++    }
++
++    s->bridge = bridge;
++}
++
++static void virtio_msg_linux_bridge_transport_unrealize(DeviceState *dev)
++{
++    VirtIOMSGLinuxBridgeTransport *s =
++        VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT(dev);
++
++    if (s->bridge) {
++        qdev_unrealize(s->bridge);
++        object_unref(OBJECT(s->bridge));
++        s->bridge = NULL;
++    }
++
++    qdev_unrealize(DEVICE(&s->proxy));
++}
++
++static const Property virtio_msg_linux_bridge_transport_properties[] = {
++    DEFINE_PROP_STRING("endpoint", VirtIOMSGLinuxBridgeTransport, endpoint),
++    DEFINE_PROP_BOOL("create-endpoint", VirtIOMSGLinuxBridgeTransport,
++                     create_endpoint, false),
++    DEFINE_PROP_STRING("devnode", VirtIOMSGLinuxBridgeTransport, devnode),
++    DEFINE_PROP_UINT32("tx-ring-entries", VirtIOMSGLinuxBridgeTransport,
++                       tx_ring_entries,
++                       VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_RING_ENTRIES_DEFAULT),
++    DEFINE_PROP_UINT32("tx-ring-entry-size", VirtIOMSGLinuxBridgeTransport,
++                       tx_ring_entry_size,
++                    VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_RING_ENTRY_SIZE_DEFAULT),
++    DEFINE_PROP_UINT32("rx-ring-entries", VirtIOMSGLinuxBridgeTransport,
++                       rx_ring_entries,
++                       VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_RING_ENTRIES_DEFAULT),
++    DEFINE_PROP_UINT32("rx-ring-entry-size", VirtIOMSGLinuxBridgeTransport,
++                       rx_ring_entry_size,
++                    VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT_RING_ENTRY_SIZE_DEFAULT),
++};
++
++static void virtio_msg_linux_bridge_transport_finalize(Object *obj)
++{
++    VirtIOMSGLinuxBridgeTransport *s =
++        VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT(obj);
++
++    g_free(s->endpoint);
++    g_free(s->devnode);
++}
++
++static void virtio_msg_linux_bridge_transport_init(Object *obj)
++{
++    VirtIOMSGLinuxBridgeTransport *s =
++        VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT(obj);
++
++    s->bridge = NULL;
++}
++
++static void virtio_msg_linux_bridge_transport_class_init(ObjectClass *klass,
++                                                         const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    device_class_set_props(dc, virtio_msg_linux_bridge_transport_properties);
++    dc->desc = "virtio-msg Linux bridge transport composite parent";
++    dc->user_creatable = true;
++    dc->realize = virtio_msg_linux_bridge_transport_realize;
++    dc->unrealize = virtio_msg_linux_bridge_transport_unrealize;
++}
++
++static const TypeInfo virtio_msg_linux_bridge_transport_type_info = {
++    .name = TYPE_VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(VirtIOMSGLinuxBridgeTransport),
++    .instance_init = virtio_msg_linux_bridge_transport_init,
++    .instance_finalize = virtio_msg_linux_bridge_transport_finalize,
++    .class_init = virtio_msg_linux_bridge_transport_class_init,
++};
++
++static void virtio_msg_linux_bridge_transport_register_types(void)
++{
++    type_register_static(&virtio_msg_linux_bridge_transport_type_info);
++}
++
++type_init(virtio_msg_linux_bridge_transport_register_types)
+diff --git a/include/hw/virtio/virtio-msg.h b/include/hw/virtio/virtio-msg.h
+index e57cc2d21c97..9525f46649b1 100644
+--- a/include/hw/virtio/virtio-msg.h
++++ b/include/hw/virtio/virtio-msg.h
+@@ -29,6 +29,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMSGDev, VIRTIO_MSG_DEV)
+ #define TYPE_VIRTIO_MSG "virtio-msg"
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMSGProxy, VIRTIO_MSG)
+ 
++#define TYPE_VIRTIO_MSG_LINUX_BRIDGE_TRANSPORT \
++    "virtio-msg-linux-bridge-transport"
++
+ /*
+  * Keep this enabled to route virtio-msg diagnostics through LOG_GUEST_ERROR,
+  * which makes them visible with "-d guest_errors". Comment it out while
+-- 
+2.53.0
+
