@@ -1,0 +1,89 @@
+From 9ebf975fb830b344ddcc4bb2e21e793791927dd9 Mon Sep 17 00:00:00 2001
+Message-ID: <9ebf975fb830b344ddcc4bb2e21e793791927dd9.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:45 +0200
+Subject: [RFC PATCH 08/28] physmem: resolve provider-backed RAMBlocks from
+ host pointers
+
+Teach physmem host-pointer lookups to resolve provider-backed RAMBlocks
+through RAMBlockMapOps::from_host() for both the MRU fast path and the
+full RAMBlock scan.
+
+Use the provider-reported offset as the authoritative result.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ system/physmem.c | 35 +++++++++++++++++++++++++----------
+ 1 file changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/system/physmem.c b/system/physmem.c
+index b2492ef64096..b00684fc75cb 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -2801,29 +2801,43 @@ RAMBlock *qemu_ram_block_from_host(void *ptr, bool round_offset,
+ {
+     RAMBlock *block;
+     uint8_t *host = ptr;
++    RCU_READ_LOCK_GUARD();
+ 
+     if (xen_enabled()) {
+         ram_addr_t ram_addr;
+-        RCU_READ_LOCK_GUARD();
+-        ram_addr = xen_ram_addr_from_mapcache(ptr);
+-        if (ram_addr == RAM_ADDR_INVALID) {
+-            return NULL;
+-        }
+ 
+-        block = qemu_get_ram_block(ram_addr);
+-        if (block) {
+-            *offset = ram_addr - block->offset;
++        ram_addr = xen_ram_addr_from_mapcache(ptr);
++        if (ram_addr != RAM_ADDR_INVALID) {
++            block = qemu_get_ram_block(ram_addr);
++            if (block) {
++                *offset = ram_addr - block->offset;
++            }
++            return block;
+         }
+-        return block;
++        /*
++         * Xen mapcache misses intentionally fall back to provider from_host:
++         * provider-backed RAMBlocks are not discoverable through mapcache.
++         */
+     }
+ 
+-    RCU_READ_LOCK_GUARD();
+     block = qatomic_rcu_read(&ram_list.mru_block);
++    if (block && block->mr->ram_map_ops && block->host == NULL &&
++        block->mr->ram_map_ops->from_host &&
++        block->mr->ram_map_ops->from_host(block->mr->ram_map_opaque, block,
++                                          ptr, offset)) {
++        goto found_with_offset;
++    }
+     if (block && block->host && host - block->host < block->max_length) {
+         goto found;
+     }
+ 
+     RAMBLOCK_FOREACH(block) {
++        if (block->mr->ram_map_ops && block->host == NULL &&
++            block->mr->ram_map_ops->from_host &&
++            block->mr->ram_map_ops->from_host(block->mr->ram_map_opaque,
++                                              block, ptr, offset)) {
++            goto found_with_offset;
++        }
+         /* This case append when the block is not mapped. */
+         if (block->host == NULL) {
+             continue;
+@@ -2837,6 +2851,7 @@ RAMBlock *qemu_ram_block_from_host(void *ptr, bool round_offset,
+ 
+ found:
+     *offset = (host - block->host);
++found_with_offset:
+     if (round_offset) {
+         *offset &= TARGET_PAGE_MASK;
+     }
+-- 
+2.53.0
+

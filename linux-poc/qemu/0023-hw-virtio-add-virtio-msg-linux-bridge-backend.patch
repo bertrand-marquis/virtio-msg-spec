@@ -1,0 +1,3609 @@
+From 5de987f148336a80bea1fea05d78b58fe82b7d75 Mon Sep 17 00:00:00 2001
+Message-ID: <5de987f148336a80bea1fea05d78b58fe82b7d75.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:47 +0200
+Subject: [RFC PATCH 23/28] hw/virtio: add virtio-msg linux bridge backend
+
+Add the linux bridge backend that connects virtio-msg requests to the
+host bridge device and maintains dynamic DMA map state.
+
+Implement realize, reset, runtime paths, property handling, and build
+wiring under hw/virtio for the bridge backend.
+
+Fold the bridge log ownership and reduced trace surface into this patch
+so backend diagnostics land in their final RFC form.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/Kconfig                   |    6 +
+ hw/virtio/meson.build               |    2 +
+ hw/virtio/trace-events              |    6 +
+ hw/virtio/virtio-msg-linux-bridge.c | 3366 +++++++++++++++++++++++++++
+ include/hw/virtio/virtio-msg-prot.h |    2 +
+ include/hw/virtio/virtio-msg.h      |  128 +
+ 6 files changed, 3510 insertions(+)
+ create mode 100644 hw/virtio/virtio-msg-linux-bridge.c
+
+diff --git a/hw/virtio/Kconfig b/hw/virtio/Kconfig
+index f362c50c59a6..1baf39127c62 100644
+--- a/hw/virtio/Kconfig
++++ b/hw/virtio/Kconfig
+@@ -30,6 +30,12 @@ config VIRTIO_MSG
+     bool
+     select VIRTIO
+ 
++config VIRTIO_MSG_LINUX_BRIDGE
++    bool
++    default y
++    depends on VIRTIO_MSG
++    depends on LINUX
++
+ config VIRTIO_CCW
+     bool
+     select VIRTIO
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index a5b9234df1f9..f19fc132818b 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -17,6 +17,8 @@ specific_virtio_ss.add(when: 'CONFIG_VIRTIO_MSG', if_true: files(
+     'virtio-msg.c',
+     'virtio-msg-bus.c',
+ ))
++specific_virtio_ss.add(when: 'CONFIG_VIRTIO_MSG_LINUX_BRIDGE',
++                       if_true: files('virtio-msg-linux-bridge.c'))
+ 
+ if have_vhost
+   system_virtio_ss.add(files('vhost.c'))
+diff --git a/hw/virtio/trace-events b/hw/virtio/trace-events
+index 658cc365e701..d740247dac59 100644
+--- a/hw/virtio/trace-events
++++ b/hw/virtio/trace-events
+@@ -78,6 +78,12 @@ virtio_notify_irqfd_deferred_fn(void *vdev, void *vq) "vdev %p vq %p"
+ virtio_notify(void *vdev, void *vq) "vdev %p vq %p"
+ virtio_set_status(void *vdev, uint8_t val) "vdev %p val %u"
+ 
++# virtio-msg-linux-bridge.c
++virtio_msg_linux_bridge_rx_msg(uint32_t endpoint_id, uint8_t msg_id, uint8_t type, uint16_t dev_num, uint16_t token, uint16_t msg_size) "ep=%u msg_id=0x%02x type=0x%02x dev=%u token=%u size=%u"
++virtio_msg_linux_bridge_tx_msg(uint32_t endpoint_id, uint8_t msg_id, uint8_t type, uint16_t dev_num, uint16_t token, uint16_t msg_size) "ep=%u msg_id=0x%02x type=0x%02x dev=%u token=%u size=%u"
++virtio_msg_linux_bridge_map_event_install(uint32_t endpoint_id, uint64_t epoch, uint64_t map_id, uint64_t bus_addr, uint64_t length, uint64_t mmap_offset, uint64_t mmap_length) "ep=%u epoch=%"PRIu64" map_id=%"PRIu64" addr=0x%"PRIx64" len=0x%"PRIx64" off=0x%"PRIx64" mmap_len=0x%"PRIx64
++virtio_msg_linux_bridge_map_event_remove(uint32_t endpoint_id, uint64_t epoch, uint64_t map_id, uint64_t bus_addr, uint64_t length) "ep=%u epoch=%"PRIu64" map_id=%"PRIu64" addr=0x%"PRIx64" len=0x%"PRIx64
++
+ # virtio-rng.c
+ virtio_rng_guest_not_ready(void *rng) "rng %p: guest not ready"
+ virtio_rng_cpu_is_stopped(void *rng, int size) "rng %p: cpu is stopped, dropping %d bytes"
+diff --git a/hw/virtio/virtio-msg-linux-bridge.c b/hw/virtio/virtio-msg-linux-bridge.c
+new file mode 100644
+index 000000000000..e5f54821447b
+--- /dev/null
++++ b/hw/virtio/virtio-msg-linux-bridge.c
+@@ -0,0 +1,3366 @@
++/*
++ * Virtio-msg Linux bridge backend (skeleton).
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include <sys/eventfd.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <linux/virtio_msg_bus_bridge.h>
++#include "qapi/error.h"
++#include "qemu/atomic.h"
++#include "qemu/error-report.h"
++#include "qemu/log.h"
++#include "qemu/main-loop.h"
++#include "qemu/memfd.h"
++#include "qemu/thread.h"
++#include "qemu/timer.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/virtio/virtio-msg-bus.h"
++#include "hw/virtio/virtio-msg.h"
++#include "migration/blocker.h"
++#include "system/ramblock.h"
++#include "system/system.h"
++#include "trace.h"
++
++#define TYPE_VIRTIO_MSG_LINUX_BRIDGE "virtio-msg-linux-bridge"
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMSGLinuxBridge, VIRTIO_MSG_LINUX_BRIDGE)
++
++#define VIRTIO_MSG_LINUX_BRIDGE_DEVNODE_DEFAULT "/dev/virtio-msg-bridge"
++/*
++ * Keep these defaults aligned with vmsg_bus UAPI defaults:
++ * VMSG_BRIDGE_UAPI_RING_ENTRY_SIZE_DEFAULT and
++ * VMSG_BRIDGE_UAPI_RING_ENTRIES_DEFAULT.
++ */
++#define VIRTIO_MSG_LINUX_BRIDGE_RING_ENTRY_SIZE_DEFAULT VIRTIO_MSG_MAX_SIZE
++#define VIRTIO_MSG_LINUX_BRIDGE_RING_ENTRIES_DEFAULT 256U
++#define VIRTIO_MSG_LINUX_BRIDGE_REVISION_SUPPORTED 1U
++#define VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_BITMAP_BYTES \
++    ((VIRTIO_MSG_MAX_DEVS + 7) / 8)
++#define VIRTIO_MSG_LINUX_BRIDGE_PEER_REASON_READY 1U
++#define VIRTIO_MSG_LINUX_BRIDGE_PEER_REASON_DOWN  2U
++#define VIRTIO_MSG_LINUX_BRIDGE_RELEASE_REASON_REALIZE_ERROR 1U
++#define VIRTIO_MSG_LINUX_BRIDGE_RELEASE_REASON_UNREALIZE     2U
++#define VIRTIO_MSG_LINUX_BRIDGE_FD_KIND_CALL                 1U
++#define VIRTIO_MSG_LINUX_BRIDGE_FD_KIND_KICK                 2U
++#define VIRTIO_MSG_LINUX_BRIDGE_FD_KIND_RING                 3U
++#define VIRTIO_MSG_LINUX_BRIDGE_FD_KIND_DEV                  4U
++#define VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_DELAY_MIN_MS  1U
++#define VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_DELAY_MAX_MS  64U
++#define VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_MAX_FAILURES  8U
++typedef struct VirtIOMSGLinuxBridgeMapEntry VirtIOMSGLinuxBridgeMapEntry;
++struct VirtIOMSGLinuxBridgeMapEntry {
++    QTAILQ_ENTRY(VirtIOMSGLinuxBridgeMapEntry) node;
++    VirtIOMSGLinuxBridge *bridge;
++    uint64_t map_id;
++    uint64_t epoch;
++    uint64_t bus_addr;
++    uint64_t length;
++    uint64_t mmap_offset;
++    uint64_t mmap_length;
++    uint32_t pin_refs;
++    uint32_t active_refs;
++    uint32_t install_refs;
++    uint64_t last_use_seq;
++    void *host_addr;
++    MemoryRegion subregion_mr;
++    bool subregion_attached;
++    bool del_req_pending;
++    bool revoked;
++};
++
++typedef struct VirtIOMSGLinuxBridgePendingTx VirtIOMSGLinuxBridgePendingTx;
++struct VirtIOMSGLinuxBridgePendingTx {
++    QTAILQ_ENTRY(VirtIOMSGLinuxBridgePendingTx) node;
++    VirtIOMSG msg;
++};
++
++typedef enum VirtIOMSGLinuxBridgeSessionState {
++    VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_DETACHED = 0,
++    VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_OFFLINE,
++    VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_NEEDS_TOPOLOGY,
++    VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_ACTIVE,
++    VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_FAILED,
++} VirtIOMSGLinuxBridgeSessionState;
++
++typedef struct VirtIOMSGLinuxBridge {
++    VirtIOMSGBusDevice parent_obj;
++
++    char *endpoint;
++    bool create_endpoint;
++    struct vmsg_bridge_uapi_endpoint_addr endpoint_addr;
++    uint32_t endpoint_handle;
++    bool endpoint_resolved;
++    char *devnode;
++    uint32_t tx_ring_entries;
++    uint32_t tx_ring_entry_size;
++    uint32_t rx_ring_entries;
++    uint32_t rx_ring_entry_size;
++
++    int dev_fd;
++    int ring_fd;
++    int kick_fd;
++    int call_fd;
++
++    struct vmsg_bridge_uapi_ring_info tx_ring_info;
++    struct vmsg_bridge_uapi_ring_info rx_ring_info;
++    struct vmsg_bridge_uapi_caps caps;
++    VirtIOMSGTransportCaps transport_caps;
++    uint32_t vmm_max_msg_size;
++    uint32_t endpoint_max_msg_size;
++
++    void *rings;
++    size_t rings_size;
++    MemoryRegion dma_mr;
++    AddressSpace dma_as;
++    bool dma_as_initialized;
++    /*
++     * map_lock is taken from both BQL/main-loop control-path handlers and
++     * RAMBlockMapOps callbacks. RAM mapping paths must not rely on BQL.
++     */
++    QemuMutex map_lock;
++    QTAILQ_HEAD(, VirtIOMSGLinuxBridgeMapEntry) map_entries;
++    VirtIOMSGLinuxBridgeMapEntry *map_last_covering;
++    uint64_t map_use_seq;
++    Error *migration_blocker;
++    Notifier machine_done;
++    bool attached;
++    bool machine_ready;
++    VirtIOMSGLinuxBridgeSessionState session_state;
++    bool map_ack_pending;
++    uint64_t map_ack_seq;
++    uint16_t map_ack_type;
++    uint16_t map_ack_status;
++    QTAILQ_HEAD(, VirtIOMSGLinuxBridgePendingTx) pending_tx;
++    QEMUTimer *topology_retry_timer;
++    uint32_t topology_retry_delay_ms;
++    uint32_t topology_retry_failures;
++    QEMUTimer *pending_tx_retry_timer;
++    uint32_t pending_tx_retry_delay_ms;
++} VirtIOMSGLinuxBridge;
++
++typedef enum VirtIOMSGLinuxBridgeAckStatus {
++    VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_OK = 0,
++    VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_TRANSIENT,
++    VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_FAILED,
++} VirtIOMSGLinuxBridgeAckStatus;
++
++static const char *virtio_msg_linux_bridge_msg_direction(bool rx)
++{
++    return rx ? "rx" : "tx";
++}
++
++static void virtio_msg_linux_bridge_msg_payload_summary(const VirtIOMSG *msg,
++                                                        char *buf,
++                                                        size_t buf_size)
++{
++    bool response = msg->type & VIRTIO_MSG_TYPE_RESPONSE;
++
++    if (!buf_size) {
++        return;
++    }
++
++    buf[0] = '\0';
++
++    if (msg->type & VIRTIO_MSG_TYPE_BUS) {
++        switch (msg->msg_id) {
++        case VIRTIO_MSG_BUS_GET_DEVICES:
++            if (response) {
++                snprintf(buf, buf_size,
++                         "offset=%u num=%u next_offset=%u",
++                         le16_to_cpu(msg->bus_get_devices_resp.offset),
++                         le16_to_cpu(msg->bus_get_devices_resp.num),
++                         le16_to_cpu(msg->bus_get_devices_resp.next_offset));
++            } else {
++                snprintf(buf, buf_size, "offset=%u num=%u",
++                         le16_to_cpu(msg->bus_get_devices.offset),
++                         le16_to_cpu(msg->bus_get_devices.num));
++            }
++            break;
++        case VIRTIO_MSG_BUS_PING:
++            snprintf(buf, buf_size, "data=0x%x",
++                     response ? le32_to_cpu(msg->bus_ping_resp.data) :
++                     le32_to_cpu(msg->bus_ping.data));
++            break;
++        case VIRTIO_MSG_BUS_EVENT_DEVICE:
++            snprintf(buf, buf_size,
++                     "dev=%u state=0x%x",
++                     le16_to_cpu(msg->bus_event_device.dev_num),
++                     le16_to_cpu(msg->bus_event_device.dev_state));
++            break;
++        default:
++            break;
++        }
++        return;
++    }
++
++    if (response) {
++        switch (msg->msg_id) {
++        case VIRTIO_MSG_GET_VQUEUE:
++            snprintf(buf, buf_size,
++                     "idx=%u max=%u size=%u desc=0x%" PRIx64
++                     " driver=0x%" PRIx64 " device=0x%" PRIx64,
++                     le32_to_cpu(msg->get_vqueue_resp.index),
++                     le32_to_cpu(msg->get_vqueue_resp.max_size),
++                     le32_to_cpu(msg->get_vqueue_resp.size),
++                     le64_to_cpu(msg->get_vqueue_resp.descriptor_addr),
++                     le64_to_cpu(msg->get_vqueue_resp.driver_addr),
++                     le64_to_cpu(msg->get_vqueue_resp.device_addr));
++            break;
++        case VIRTIO_MSG_GET_CONFIG:
++            snprintf(buf, buf_size, "offset=%u size=%u",
++                     le32_to_cpu(msg->get_config_resp.offset),
++                     le32_to_cpu(msg->get_config_resp.size));
++            break;
++        case VIRTIO_MSG_SET_CONFIG:
++            snprintf(buf, buf_size, "offset=%u size=%u",
++                     le32_to_cpu(msg->set_config_resp.offset),
++                     le32_to_cpu(msg->set_config_resp.size));
++            break;
++        default:
++            break;
++        }
++        return;
++    }
++
++    switch (msg->msg_id) {
++    case VIRTIO_MSG_GET_VQUEUE:
++        snprintf(buf, buf_size, "idx=%u",
++                 le32_to_cpu(msg->get_vqueue.index));
++        break;
++    case VIRTIO_MSG_SET_VQUEUE:
++        snprintf(buf, buf_size,
++                 "idx=%u size=%u desc=0x%" PRIx64
++                 " driver=0x%" PRIx64 " device=0x%" PRIx64,
++                 le32_to_cpu(msg->set_vqueue.index),
++                 le32_to_cpu(msg->set_vqueue.size),
++                 le64_to_cpu(msg->set_vqueue.descriptor_addr),
++                 le64_to_cpu(msg->set_vqueue.driver_addr),
++                 le64_to_cpu(msg->set_vqueue.device_addr));
++        break;
++    case VIRTIO_MSG_RESET_VQUEUE:
++        snprintf(buf, buf_size, "idx=%u",
++                 le32_to_cpu(msg->reset_vqueue.index));
++        break;
++    case VIRTIO_MSG_GET_CONFIG:
++        snprintf(buf, buf_size, "offset=%u size=%u",
++                 le32_to_cpu(msg->get_config.offset),
++                 le32_to_cpu(msg->get_config.size));
++        break;
++    case VIRTIO_MSG_SET_CONFIG:
++        snprintf(buf, buf_size, "offset=%u size=%u",
++                 le32_to_cpu(msg->set_config.offset),
++                 le32_to_cpu(msg->set_config.size));
++        break;
++    case VIRTIO_MSG_EVENT_CONFIG:
++        snprintf(buf, buf_size,
++                 "status=0x%x gen=%u offset=%u size=%u",
++                 le32_to_cpu(msg->event_config.status),
++                 le32_to_cpu(msg->event_config.generation),
++                 le32_to_cpu(msg->event_config.offset),
++                 le32_to_cpu(msg->event_config.size));
++        break;
++    case VIRTIO_MSG_EVENT_AVAIL:
++        snprintf(buf, buf_size,
++                 "idx=%u next_wrap=0x%x",
++                 le32_to_cpu(msg->event_avail.index),
++                 le32_to_cpu(msg->event_avail.next_offset_wrap));
++        break;
++    case VIRTIO_MSG_EVENT_USED:
++        snprintf(buf, buf_size, "idx=%u",
++                 le32_to_cpu(msg->event_used.index));
++        break;
++    default:
++        break;
++    }
++}
++
++static void virtio_msg_linux_bridge_log_msg_summary(VirtIOMSGLinuxBridge *s,
++                                                   const VirtIOMSG *msg,
++                                                   bool rx)
++{
++    char payload[192];
++    const char *name = virtio_msg_debug_id_to_str(msg->type, msg->msg_id);
++    const char *direction = virtio_msg_linux_bridge_msg_direction(rx);
++    uint16_t dev_num = le16_to_cpu(msg->dev_num);
++    uint16_t token = le16_to_cpu(msg->token);
++    uint16_t size = le16_to_cpu(msg->msg_size);
++    uint32_t endpoint_handle = s ? s->endpoint_handle : 0;
++
++    virtio_msg_linux_bridge_msg_payload_summary(msg, payload, sizeof(payload));
++
++    virtio_msg_debug_log_impl("bridge",
++                              "%s: endpoint=%" PRIu32 " %s %s dev=%u token=%u "
++                              "size=%u%s%s",
++                              __func__, endpoint_handle, direction,
++                              name ? name : "UNKNOWN",
++                              dev_num, token, size,
++                              payload[0] ? " " : "", payload);
++}
++
++static void virtio_msg_linux_bridge_log_map_event_summary(
++    const char *stage,
++    VirtIOMSGLinuxBridge *s,
++    const struct vmsg_bridge_uapi_map_event *event)
++{
++    uint32_t endpoint_handle = s ? s->endpoint_handle : 0;
++    virtio_msg_debug_log_impl(
++        "bridge",
++        "%s: endpoint=%" PRIu32 " %s epoch=%" PRIu64 " map_id=%" PRIu64
++        " seq=%" PRIu64 " addr=0x%" PRIx64 " len=0x%" PRIx64 "",
++        __func__, endpoint_handle, stage,
++        (uint64_t)event->epoch,
++        (uint64_t)event->map_id,
++        (uint64_t)event->seq,
++        (uint64_t)event->bus_addr,
++        (uint64_t)event->length);
++}
++
++static void virtio_msg_linux_bridge_cancel_topology_retry(
++    VirtIOMSGLinuxBridge *s);
++
++static void virtio_msg_linux_bridge_set_state(
++    VirtIOMSGLinuxBridge *s,
++    VirtIOMSGLinuxBridgeSessionState state)
++{
++    s->session_state = state;
++
++    switch (state) {
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_NEEDS_TOPOLOGY:
++        s->caps.flags |= VMSG_BRIDGE_UAPI_CAP_F_ENDPOINT_ONLINE;
++        s->topology_retry_failures = 0;
++        s->topology_retry_delay_ms =
++            VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_DELAY_MIN_MS;
++        break;
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_ACTIVE:
++        s->caps.flags |= VMSG_BRIDGE_UAPI_CAP_F_ENDPOINT_ONLINE;
++        virtio_msg_linux_bridge_cancel_topology_retry(s);
++        break;
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_FAILED:
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_OFFLINE:
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_DETACHED:
++        s->caps.flags &= ~VMSG_BRIDGE_UAPI_CAP_F_ENDPOINT_ONLINE;
++        virtio_msg_linux_bridge_cancel_topology_retry(s);
++        break;
++    default:
++        g_assert_not_reached();
++    }
++}
++
++static bool virtio_msg_linux_bridge_state_allows_control(
++    const VirtIOMSGLinuxBridge *s)
++{
++    switch (s->session_state) {
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_OFFLINE:
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_NEEDS_TOPOLOGY:
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_ACTIVE:
++        return true;
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_DETACHED:
++    case VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_FAILED:
++        return false;
++    default:
++        g_assert_not_reached();
++    }
++}
++
++static bool virtio_msg_linux_bridge_state_allows_topology(
++    const VirtIOMSGLinuxBridge *s)
++{
++    return s->session_state ==
++        VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_NEEDS_TOPOLOGY;
++}
++
++static bool virtio_msg_linux_bridge_state_allows_map(
++    const VirtIOMSGLinuxBridge *s)
++{
++    return s->session_state ==
++        VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_ACTIVE;
++}
++
++static bool virtio_msg_linux_bridge_state_allows_data(
++    const VirtIOMSGLinuxBridge *s)
++{
++    return s->session_state ==
++        VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_ACTIVE;
++}
++
++static VirtIOMSGProxy *virtio_msg_linux_bridge_get_proxy(
++    VirtIOMSGLinuxBridge *s);
++
++typedef enum VirtIOMSGLinuxBridgeCapsValidationResult {
++    VIRTIO_MSG_LINUX_BRIDGE_CAPS_VALIDATION_OK = 0,
++    VIRTIO_MSG_LINUX_BRIDGE_CAPS_VALIDATION_BAD_REVISION,
++    VIRTIO_MSG_LINUX_BRIDGE_CAPS_VALIDATION_BAD_MAX_MSG_SIZE,
++} VirtIOMSGLinuxBridgeCapsValidationResult;
++
++static void virtio_msg_linux_bridge_process(VirtIOMSGBusDevice *bd);
++static void virtio_msg_linux_bridge_callfd_read(void *opaque);
++static void virtio_msg_linux_bridge_devfd_read(void *opaque);
++static void virtio_msg_linux_bridge_process_rx_ring(VirtIOMSGLinuxBridge *s,
++                                                    bool drain_callfd);
++static void virtio_msg_linux_bridge_process_control_path(
++    VirtIOMSGLinuxBridge *s, bool schedule_retry);
++static void virtio_msg_linux_bridge_fail_attach(VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_detach(VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_release_endpoint(VirtIOMSGLinuxBridge *s);
++static bool virtio_msg_linux_bridge_publish_topology_set_devices(
++    VirtIOMSGLinuxBridge *s, int *set_devices_errno, Error **errp);
++static bool virtio_msg_linux_bridge_maybe_publish_topology(
++    VirtIOMSGLinuxBridge *s, Error **errp);
++static void virtio_msg_linux_bridge_register_machine_done_notifier(
++    VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_unregister_machine_done_notifier(
++    VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_reset_transport_caps(
++    VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_latch_transport_caps(
++    VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_free_map_entry_bh(void *opaque);
++static bool virtio_msg_linux_bridge_revoke_entry_locked(
++    VirtIOMSGLinuxBridge *s, VirtIOMSGLinuxBridgeMapEntry *entry);
++static bool virtio_msg_linux_bridge_try_finalize_revoked_locked(
++    VirtIOMSGLinuxBridge *s, VirtIOMSGLinuxBridgeMapEntry *entry);
++static bool virtio_msg_linux_bridge_complete_del_req_locked(
++    VirtIOMSGLinuxBridge *s, VirtIOMSGLinuxBridgeMapEntry *entry);
++static int virtio_msg_linux_bridge_send(VirtIOMSGBusDevice *bd,
++                                        VirtIOMSG *msg_req);
++static int virtio_msg_linux_bridge_send_must_deliver(VirtIOMSGBusDevice *bd,
++                                                     VirtIOMSG *msg_req);
++static bool virtio_msg_linux_bridge_queue_pending_tx(VirtIOMSGLinuxBridge *s,
++                                                     const VirtIOMSG *msg);
++static bool virtio_msg_linux_bridge_flush_pending_tx(VirtIOMSGLinuxBridge *s,
++                                                     bool schedule_retry);
++static void virtio_msg_linux_bridge_clear_pending_tx(VirtIOMSGLinuxBridge *s);
++static bool virtio_msg_linux_bridge_can_flush_pending_tx(
++    const VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_schedule_pending_tx_retry(
++    VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_cancel_pending_tx_retry(
++    VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_pending_tx_retry_cb(void *opaque);
++static void virtio_msg_linux_bridge_schedule_topology_retry(
++    VirtIOMSGLinuxBridge *s);
++static void virtio_msg_linux_bridge_topology_retry_cb(void *opaque);
++static void virtio_msg_linux_bridge_purge_rx_ring(VirtIOMSGLinuxBridge *s);
++
++static bool virtio_msg_linux_bridge_ring_valid(uint32_t entries,
++                                               uint32_t entry_size)
++{
++    uint32_t min_entry_size = QEMU_ALIGN_UP(VIRTIO_MSG_MAX_SIZE,
++                                            VMSG_BRIDGE_UAPI_RING_ENTRY_ALIGN);
++
++    /* Mirror the current v1 bridge UAPI requirement: exactly 256 entries. */
++    return entries == VIRTIO_MSG_LINUX_BRIDGE_RING_ENTRIES_DEFAULT &&
++        entry_size >= min_entry_size &&
++        entry_size % VMSG_BRIDGE_UAPI_RING_ENTRY_ALIGN == 0;
++}
++
++static uint32_t virtio_msg_linux_bridge_max_msg_size(VirtIOMSGLinuxBridge *s)
++{
++    uint32_t max_msg_size = s->vmm_max_msg_size;
++    uint32_t endpoint_max_msg_size = s->endpoint_max_msg_size;
++
++    if (!max_msg_size) {
++        max_msg_size = VIRTIO_MSG_MAX_SIZE;
++    }
++    if (!endpoint_max_msg_size) {
++        return max_msg_size;
++    }
++
++    return MIN(max_msg_size, endpoint_max_msg_size);
++}
++
++static uint32_t virtio_msg_linux_bridge_aligned_max_msg_size(
++    uint32_t max_msg_size)
++{
++    return QEMU_ALIGN_UP(max_msg_size, VMSG_BRIDGE_UAPI_RING_ENTRY_ALIGN);
++}
++
++static bool virtio_msg_linux_bridge_entry_size_matches_vmm_max(
++    VirtIOMSGLinuxBridge *s, uint32_t entry_size)
++{
++    uint32_t aligned_max = virtio_msg_linux_bridge_aligned_max_msg_size(
++        s->vmm_max_msg_size);
++
++    return entry_size == aligned_max &&
++        entry_size % VMSG_BRIDGE_UAPI_RING_ENTRY_ALIGN == 0;
++}
++
++static bool virtio_msg_linux_bridge_msg_size_valid(VirtIOMSGLinuxBridge *s,
++                                                   uint16_t msg_size,
++                                                   uint32_t entry_size)
++{
++    size_t min_size = virtio_msg_header_size();
++    uint32_t max_size = virtio_msg_linux_bridge_max_msg_size(s);
++
++    return msg_size >= min_size &&
++           msg_size <= max_size &&
++           msg_size <= entry_size;
++}
++
++static int virtio_msg_linux_bridge_ioctl(int fd, unsigned long req, void *arg)
++{
++    int ret;
++
++    do {
++        ret = ioctl(fd, req, arg);
++    } while (ret < 0 && errno == EINTR);
++
++    return ret;
++}
++
++static void virtio_msg_linux_bridge_close_fd(int *fd)
++{
++    if (*fd >= 0) {
++        qemu_close(*fd);
++        *fd = -1;
++    }
++}
++
++static bool virtio_msg_linux_bridge_errno_is_transient(int err)
++{
++    switch (err) {
++    case EAGAIN:
++#ifdef EWOULDBLOCK
++#if EWOULDBLOCK != EAGAIN
++    case EWOULDBLOCK:
++#endif
++#endif
++    case ENOSPC:
++    case ENOMEM:
++    case EBUSY:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static bool virtio_msg_linux_bridge_errno_is_terminal(int err)
++{
++    switch (err) {
++    case ENOTCONN:
++    case EPROTO:
++        return true;
++    default:
++        return false;
++    }
++}
++
++static int virtio_msg_linux_bridge_receive_error_to_errno(int ret)
++{
++    switch (ret) {
++    case VIRTIO_MSG_ERROR_NO_DEVICE:
++        return -ENODEV;
++    case VIRTIO_MSG_ERROR_UNSUPPORTED_MESSAGE_ID:
++        return -EOPNOTSUPP;
++    case VIRTIO_MSG_ERROR_BAD_MESSAGE:
++        return -EPROTO;
++    case VIRTIO_MSG_ERROR_MEMORY:
++        return -ENOMEM;
++    case VIRTIO_MSG_ERROR_TIMEOUT:
++        return -ETIMEDOUT;
++    default:
++        return 0;
++    }
++}
++
++static bool virtio_msg_linux_bridge_is_transport_request(const VirtIOMSG *msg)
++{
++    /*
++     * Transport message IDs use bit 6 to distinguish requests from events:
++     * 0x00-0x3f and 0x80-0xbf are requests, while 0x40-0x7f and 0xc0-0xff
++     * are events. Responses and bus traffic are excluded separately.
++     */
++    return !(msg->type & (VIRTIO_MSG_TYPE_BUS | VIRTIO_MSG_TYPE_RESPONSE)) &&
++           !(msg->msg_id & VIRTIO_MSG_EVENT_CONFIG);
++}
++
++static int virtio_msg_linux_bridge_report_msg_error(VirtIOMSGLinuxBridge *s,
++                                                    const VirtIOMSG *msg,
++                                                    int ret)
++{
++    struct vmsg_bridge_uapi_msg_error msg_error = { 0 };
++    int report_error = virtio_msg_linux_bridge_receive_error_to_errno(ret);
++
++    if (!report_error) {
++        return 0;
++    }
++
++    msg_error.dev_num = msg->dev_num;
++    msg_error.token = msg->token;
++    msg_error.msg_id = msg->msg_id;
++    msg_error.error = report_error;
++
++    if (virtio_msg_linux_bridge_ioctl(s->dev_fd, VMSG_BRIDGE_IOCTL_MSG_ERROR,
++                                      &msg_error) >= 0) {
++        return 0;
++    }
++
++    return -errno;
++}
++
++static bool virtio_msg_linux_bridge_parse_endpoint(VirtIOMSGLinuxBridge *s,
++                                                   Error **errp)
++{
++    struct vmsg_bridge_uapi_endpoint_addr addr = { 0 };
++    const char *endpoint = s->endpoint;
++    const char *sep;
++    const char *bus_id = "";
++    size_t bus_name_len;
++    size_t bus_id_len;
++
++    if (!endpoint || !endpoint[0]) {
++        VIRTIO_MSG_LOG("bridge", "endpoint property is empty");
++        error_setg(errp, "endpoint is required and must not be empty");
++        return false;
++    }
++
++    sep = strchr(endpoint, ':');
++    bus_name_len = sep ? (size_t)(sep - endpoint) : strlen(endpoint);
++    if (bus_name_len == 0) {
++        VIRTIO_MSG_LOG("bridge", "invalid endpoint '%s': empty bus name",
++                       endpoint);
++        error_setg(errp, "invalid endpoint '%s': bus-name is empty", endpoint);
++        return false;
++    }
++    if (bus_name_len >= VMSG_BRIDGE_UAPI_BUS_NAME_LEN) {
++        VIRTIO_MSG_LOG("bridge", "invalid endpoint '%s': bus name too long",
++                       endpoint);
++        error_setg(errp,
++                   "invalid endpoint '%s': bus-name is too long (max %u chars)",
++                   endpoint, VMSG_BRIDGE_UAPI_BUS_NAME_LEN - 1);
++        return false;
++    }
++
++    memcpy(addr.bus_name, endpoint, bus_name_len);
++    if (sep) {
++        bus_id = sep + 1;
++    }
++
++    bus_id_len = strlen(bus_id);
++    if (bus_id_len >= VMSG_BRIDGE_UAPI_BUS_ID_LEN) {
++        VIRTIO_MSG_LOG("bridge", "invalid endpoint '%s': bus id too long",
++                       endpoint);
++        error_setg(errp,
++                   "invalid endpoint '%s': bus-id is too long (max %u chars)",
++                   endpoint, VMSG_BRIDGE_UAPI_BUS_ID_LEN - 1);
++        return false;
++    }
++    memcpy(addr.bus_id, bus_id, bus_id_len);
++
++    s->endpoint_addr = addr;
++    return true;
++}
++
++static bool virtio_msg_linux_bridge_resolve_endpoint(VirtIOMSGLinuxBridge *s,
++                                                     Error **errp)
++{
++    struct vmsg_bridge_uapi_resolve_endpoint resolve = { 0 };
++    int ret;
++
++    resolve.addr = s->endpoint_addr;
++    resolve.flags = s->create_endpoint ?
++        VMSG_BRIDGE_UAPI_RESOLVE_F_CREATE : 0;
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd,
++                                        VMSG_BRIDGE_IOCTL_RESOLVE_ENDPOINT,
++                                        &resolve);
++    if (ret < 0) {
++        VIRTIO_MSG_LOG("bridge",
++                       "RESOLVE_ENDPOINT failed endpoint=%s create=%d: %s",
++                       s->endpoint, s->create_endpoint, strerror(errno));
++        error_setg_errno(errp, errno,
++                         "bridge RESOLVE_ENDPOINT failed for endpoint '%s'",
++                         s->endpoint);
++        return false;
++    }
++    if (!resolve.handle) {
++        VIRTIO_MSG_LOG("bridge",
++                       "RESOLVE_ENDPOINT returned handle 0 endpoint=%s",
++                       s->endpoint);
++        error_setg(errp,
++                   "bridge RESOLVE_ENDPOINT returned invalid handle 0 "
++                   "for endpoint '%s'",
++                   s->endpoint);
++        return false;
++    }
++
++    s->endpoint_handle = resolve.handle;
++    s->endpoint_resolved = true;
++    VIRTIO_MSG_LOG("bridge", "resolved endpoint=%s handle=%u create=%d",
++                   s->endpoint, s->endpoint_handle, s->create_endpoint);
++    return true;
++}
++
++static void virtio_msg_linux_bridge_release_endpoint(VirtIOMSGLinuxBridge *s)
++{
++    struct vmsg_bridge_uapi_release_endpoint release = { 0 };
++    int ret;
++
++    if (!s->endpoint_resolved || s->dev_fd < 0) {
++        return;
++    }
++
++    release.handle = s->endpoint_handle;
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd,
++                                        VMSG_BRIDGE_IOCTL_RELEASE_ENDPOINT,
++                                        &release);
++    if (ret < 0) {
++        VIRTIO_MSG_LOG("bridge",
++                       "RELEASE_ENDPOINT failed handle=%u: %s",
++                       s->endpoint_handle, strerror(errno));
++    } else {
++        VIRTIO_MSG_LOG("bridge", "released endpoint handle=%u",
++                       s->endpoint_handle);
++    }
++    s->endpoint_resolved = false;
++    s->endpoint_handle = 0;
++}
++
++static void virtio_msg_linux_bridge_release_rings(VirtIOMSGLinuxBridge *s)
++{
++    if (!s->rings) {
++        return;
++    }
++
++    if (munmap(s->rings, s->rings_size) < 0) {
++        VIRTIO_MSG_LOG("bridge", "ring munmap failed: %s", strerror(errno));
++    }
++    s->rings = NULL;
++    s->rings_size = 0;
++}
++
++static void
++virtio_msg_linux_bridge_map_cache_invalidate_locked(VirtIOMSGLinuxBridge *s)
++{
++    s->map_last_covering = NULL;
++}
++
++static void virtio_msg_linux_bridge_map_touch_locked(
++    VirtIOMSGLinuxBridge *s, VirtIOMSGLinuxBridgeMapEntry *entry)
++{
++    s->map_use_seq++;
++    entry->last_use_seq = s->map_use_seq;
++    s->map_last_covering = entry;
++}
++
++static bool virtio_msg_linux_bridge_map_busy_locked(
++    const VirtIOMSGLinuxBridgeMapEntry *entry)
++{
++    return entry->pin_refs != 0 ||
++           entry->active_refs != 0 ||
++           entry->install_refs != 0;
++}
++
++static bool virtio_msg_linux_bridge_ranges_overlap(uint64_t first_addr,
++                                                   uint64_t first_len,
++                                                   uint64_t second_addr,
++                                                   uint64_t second_len)
++{
++    uint64_t first_end;
++    uint64_t second_end;
++
++    if (!first_len || !second_len) {
++        return false;
++    }
++
++    if (first_addr > UINT64_MAX - first_len ||
++        second_addr > UINT64_MAX - second_len) {
++        return true;
++    }
++
++    first_end = first_addr + first_len;
++    second_end = second_addr + second_len;
++
++    return first_addr < second_end && second_addr < first_end;
++}
++
++static VirtIOMSGLinuxBridgeMapEntry *
++virtio_msg_linux_bridge_find_map_entry_by_id_locked(
++    VirtIOMSGLinuxBridge *s, uint64_t epoch, uint64_t map_id)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry;
++
++    QTAILQ_FOREACH(entry, &s->map_entries, node) {
++        if (!entry->revoked &&
++            entry->epoch == epoch && entry->map_id == map_id) {
++            return entry;
++        }
++    }
++
++    return NULL;
++}
++
++static VirtIOMSGLinuxBridgeMapEntry *
++virtio_msg_linux_bridge_find_map_entry_by_id_any_locked(
++    VirtIOMSGLinuxBridge *s, uint64_t epoch, uint64_t map_id)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry;
++
++    QTAILQ_FOREACH(entry, &s->map_entries, node) {
++        if (entry->epoch == epoch && entry->map_id == map_id) {
++            return entry;
++        }
++    }
++
++    return NULL;
++}
++
++static VirtIOMSGLinuxBridgeMapEntry *
++virtio_msg_linux_bridge_find_map_overlap_locked(
++    VirtIOMSGLinuxBridge *s, uint64_t bus_addr, uint64_t length)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry;
++
++    QTAILQ_FOREACH(entry, &s->map_entries, node) {
++        if (!entry->revoked &&
++            virtio_msg_linux_bridge_ranges_overlap(entry->bus_addr,
++                                                   entry->length,
++                                                   bus_addr, length)) {
++            return entry;
++        }
++    }
++
++    return NULL;
++}
++
++static bool virtio_msg_linux_bridge_revoke_entry_locked(
++    VirtIOMSGLinuxBridge *s, VirtIOMSGLinuxBridgeMapEntry *entry)
++{
++    if (entry->revoked) {
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "revoke skip already revoked epoch=%" PRIu64
++                                " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                                " length=0x%" PRIx64
++                                " del_req_pending=%d attached=%d",
++                                entry->epoch, entry->map_id, entry->bus_addr,
++                                entry->length, entry->del_req_pending,
++                                entry->subregion_attached);
++        return true;
++    }
++
++    VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                            "revoke begin epoch=%" PRIu64
++                            " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                            " length=0x%" PRIx64
++                            " del_req_pending=%d attached=%d"
++                            " pin_refs=%u active_refs=%u install_refs=%u",
++                            entry->epoch, entry->map_id, entry->bus_addr,
++                            entry->length, entry->del_req_pending,
++                            entry->subregion_attached, entry->pin_refs,
++                            entry->active_refs, entry->install_refs);
++    if (s->map_last_covering == entry) {
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "revoke invalidating covering cache "
++                                "epoch=%" PRIu64 " map_id=%" PRIu64,
++                                entry->epoch, entry->map_id);
++        virtio_msg_linux_bridge_map_cache_invalidate_locked(s);
++    }
++
++    if (entry->subregion_attached) {
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "revoke detaching subregion epoch=%" PRIu64
++                                " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                                " length=0x%" PRIx64,
++                                entry->epoch, entry->map_id, entry->bus_addr,
++                                entry->length);
++        memory_region_del_subregion(&s->dma_mr, &entry->subregion_mr);
++        object_unparent(OBJECT(&entry->subregion_mr));
++        entry->subregion_attached = false;
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "revoke detached subregion epoch=%" PRIu64
++                                " map_id=%" PRIu64,
++                                entry->epoch, entry->map_id);
++    }
++
++    VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                            "revoke mapping epoch=%" PRIu64
++                            " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                            " length=0x%" PRIx64 " pin_refs=%u active_refs=%u",
++                            entry->epoch, entry->map_id, entry->bus_addr,
++                            entry->length, entry->pin_refs,
++                            entry->active_refs);
++    entry->revoked = true;
++    return true;
++}
++
++static bool virtio_msg_linux_bridge_try_finalize_revoked_locked(
++    VirtIOMSGLinuxBridge *s, VirtIOMSGLinuxBridgeMapEntry *entry)
++{
++    bool ok = true;
++
++    if (!entry->revoked) {
++        return true;
++    }
++
++    if (virtio_msg_linux_bridge_map_busy_locked(entry)) {
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "finalize deferred epoch=%" PRIu64
++                                " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                                " length=0x%" PRIx64
++                                " del_req_pending=%d pin_refs=%u"
++                                " active_refs=%u install_refs=%u",
++                                entry->epoch, entry->map_id, entry->bus_addr,
++                                entry->length, entry->del_req_pending,
++                                entry->pin_refs, entry->active_refs,
++                                entry->install_refs);
++        return true;
++    }
++
++    if (s->map_last_covering == entry) {
++        virtio_msg_linux_bridge_map_cache_invalidate_locked(s);
++    }
++
++    QTAILQ_REMOVE(&s->map_entries, entry, node);
++
++    if (entry->host_addr && entry->mmap_length) {
++        if (munmap(entry->host_addr, entry->mmap_length) < 0) {
++            VIRTIO_MSG_ERROR_LOG("bridge",
++                                 "mapping munmap failed epoch=%" PRIu64
++                                 " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                                 " length=0x%" PRIx64 ": %s",
++                                 entry->epoch, entry->map_id, entry->bus_addr,
++                                 entry->length, strerror(errno));
++            ok = false;
++        }
++    }
++
++    VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                            "finalize revoked mapping epoch=%" PRIu64
++                            " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                            " length=0x%" PRIx64,
++                            entry->epoch, entry->map_id, entry->bus_addr,
++                            entry->length);
++    aio_bh_schedule_oneshot(qemu_get_current_aio_context(),
++                            virtio_msg_linux_bridge_free_map_entry_bh, entry);
++    return ok;
++}
++
++static bool virtio_msg_linux_bridge_complete_del_req_locked(
++    VirtIOMSGLinuxBridge *s, VirtIOMSGLinuxBridgeMapEntry *entry)
++{
++    bool ok;
++    uint64_t epoch = entry->epoch;
++    uint64_t map_id = entry->map_id;
++    uint64_t bus_addr = entry->bus_addr;
++    uint64_t length = entry->length;
++
++    entry->del_req_pending = false;
++    VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                           "complete DEL_REQ epoch=%" PRIu64
++                           " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                           " length=0x%" PRIx64,
++                           epoch, map_id, bus_addr, length);
++    ok = virtio_msg_linux_bridge_try_finalize_revoked_locked(s, entry);
++    if (!ok) {
++        return false;
++    }
++
++    trace_virtio_msg_linux_bridge_map_event_remove(s->endpoint_handle,
++                                                   epoch, map_id, bus_addr,
++                                                   length);
++    return true;
++}
++
++static void virtio_msg_linux_bridge_free_map_entry_bh(void *opaque)
++{
++    g_free(opaque);
++}
++
++static void virtio_msg_linux_bridge_unmap_all(VirtIOMSGLinuxBridge *s)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry;
++    VirtIOMSGLinuxBridgeMapEntry *next;
++
++    qemu_mutex_lock(&s->map_lock);
++    QTAILQ_FOREACH_SAFE(entry, &s->map_entries, node, next) {
++        entry->del_req_pending = false;
++        virtio_msg_linux_bridge_revoke_entry_locked(s, entry);
++        virtio_msg_linux_bridge_try_finalize_revoked_locked(s, entry);
++    }
++    qemu_mutex_unlock(&s->map_lock);
++}
++
++static uint32_t *virtio_msg_linux_bridge_map_refs_by_kind(
++    VirtIOMSGLinuxBridgeMapEntry *entry, RAMBlockMapKind kind)
++{
++    switch (kind) {
++    case RAM_BLOCK_MAP_KIND_DIRECT:
++        return &entry->active_refs;
++    case RAM_BLOCK_MAP_KIND_CACHE:
++        return &entry->pin_refs;
++    default:
++        return NULL;
++    }
++}
++
++static void *virtio_msg_linux_bridge_ram_map(void *opaque, RAMBlock *block,
++                                             ram_addr_t offset, hwaddr *len,
++                                             bool is_write,
++                                             RAMBlockMapKind kind)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry = opaque;
++    VirtIOMSGLinuxBridge *s = entry->bridge;
++    uint32_t *refs;
++    void *host_ptr = NULL;
++
++    (void)block;
++    if (!len || *len == 0) {
++        return NULL;
++    }
++
++    qemu_mutex_lock(&s->map_lock);
++    refs = virtio_msg_linux_bridge_map_refs_by_kind(entry, kind);
++    if (entry->revoked || !entry->host_addr || offset >= entry->length ||
++        !refs || *refs == UINT32_MAX) {
++        *len = 0;
++        goto out;
++    }
++
++    *len = MIN(*len, entry->length - offset);
++    host_ptr = (uint8_t *)entry->host_addr + offset;
++    (*refs)++;
++    virtio_msg_linux_bridge_map_touch_locked(s, entry);
++out:
++    qemu_mutex_unlock(&s->map_lock);
++    return host_ptr;
++}
++
++static bool virtio_msg_linux_bridge_ram_from_host(void *opaque, RAMBlock *block,
++                                                  void *host,
++                                                  ram_addr_t *offset)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry = opaque;
++    uintptr_t base;
++    uintptr_t ptr;
++    ram_addr_t delta;
++
++    (void)block;
++    if (!entry->host_addr || !host) {
++        return false;
++    }
++
++    base = (uintptr_t)entry->host_addr;
++    ptr = (uintptr_t)host;
++    if (ptr < base) {
++        return false;
++    }
++
++    delta = ptr - base;
++    if (delta >= entry->length) {
++        return false;
++    }
++
++    *offset = delta;
++    return true;
++}
++
++static void virtio_msg_linux_bridge_ram_put(void *opaque, RAMBlock *block,
++                                            void *host, ram_addr_t offset,
++                                            hwaddr len, bool is_write,
++                                            RAMBlockMapKind kind)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry = opaque;
++    VirtIOMSGLinuxBridge *s = entry->bridge;
++    uint32_t *refs;
++
++    (void)block;
++    (void)host;
++    (void)offset;
++    (void)len;
++
++    qemu_mutex_lock(&s->map_lock);
++    refs = virtio_msg_linux_bridge_map_refs_by_kind(entry, kind);
++    if (!refs) {
++        qemu_mutex_unlock(&s->map_lock);
++        return;
++    }
++
++    if (!*refs) {
++        VIRTIO_MSG_LOG("bridge",
++                       "unbalanced mapping release epoch=%" PRIu64
++                       " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                       " length=0x%" PRIx64,
++                       entry->epoch, entry->map_id,
++                       entry->bus_addr, entry->length);
++        qemu_mutex_unlock(&s->map_lock);
++        return;
++    }
++
++    (*refs)--;
++    if (!entry->revoked) {
++        virtio_msg_linux_bridge_map_touch_locked(s, entry);
++    }
++    if (entry->revoked || entry->del_req_pending) {
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "release ref epoch=%" PRIu64
++                                " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                                " length=0x%" PRIx64
++                                " revoked=%d del_req_pending=%d"
++                                " pin_refs=%u active_refs=%u install_refs=%u",
++                                entry->epoch, entry->map_id, entry->bus_addr,
++                                entry->length, entry->revoked,
++                                entry->del_req_pending, entry->pin_refs,
++                                entry->active_refs, entry->install_refs);
++    }
++    if (!entry->del_req_pending) {
++        virtio_msg_linux_bridge_try_finalize_revoked_locked(s, entry);
++    } else if (entry->revoked &&
++               !virtio_msg_linux_bridge_map_busy_locked(entry)) {
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "pending revoke reached zero refs "
++                                "epoch=%" PRIu64
++                                " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                                " length=0x%" PRIx64
++                                " waiting for DEL_REQ retry completion",
++                                entry->epoch, entry->map_id, entry->bus_addr,
++                                entry->length);
++    }
++    qemu_mutex_unlock(&s->map_lock);
++}
++
++static const RAMBlockMapOps virtio_msg_linux_bridge_ram_map_ops = {
++    .map = virtio_msg_linux_bridge_ram_map,
++    .from_host = virtio_msg_linux_bridge_ram_from_host,
++    .put = virtio_msg_linux_bridge_ram_put,
++};
++
++static uint16_t virtio_msg_linux_bridge_handle_map_event_add(
++    VirtIOMSGLinuxBridge *s, const struct vmsg_bridge_uapi_map_event *event)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry;
++    VirtIOMSGLinuxBridgeMapEntry *conflict;
++    g_autofree char *subregion_name = NULL;
++    Error *local_err = NULL;
++    uint64_t page_size = qemu_real_host_page_size();
++    void *host_addr;
++    int err;
++
++    virtio_msg_linux_bridge_log_map_event_summary("map_event_add recv",
++                                                 s, event);
++    if (!event->length ||
++        !QEMU_IS_ALIGNED(event->bus_addr, page_size) ||
++        !QEMU_IS_ALIGNED(event->length, page_size) ||
++        !QEMU_IS_ALIGNED(event->mmap_offset, page_size) ||
++        event->mmap_length < event->length) {
++        virtio_msg_linux_bridge_log_map_event_summary(
++            "map_event_add invalid length/alignment", s, event);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    if (event->bus_addr > UINT64_MAX - event->length) {
++        virtio_msg_linux_bridge_log_map_event_summary(
++            "map_event_add overflow", s, event);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    if (event->mmap_length > SIZE_MAX) {
++        virtio_msg_linux_bridge_log_map_event_summary(
++            "map_event_add oversized", s, event);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    qemu_mutex_lock(&s->map_lock);
++    entry = virtio_msg_linux_bridge_find_map_entry_by_id_locked(
++        s, event->epoch, event->map_id);
++    conflict = virtio_msg_linux_bridge_find_map_overlap_locked(
++        s, event->bus_addr, event->length);
++    qemu_mutex_unlock(&s->map_lock);
++    if (entry || conflict) {
++        virtio_msg_linux_bridge_log_map_event_summary(
++            "map_event_add duplicate", s, event);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    host_addr = mmap(NULL, event->mmap_length, PROT_READ | PROT_WRITE,
++                     MAP_SHARED, s->dev_fd, event->mmap_offset);
++    if (host_addr == MAP_FAILED) {
++        host_addr = NULL;
++        err = errno;
++        virtio_msg_linux_bridge_log_map_event_summary(
++            "map_event_add mmap failed", s, event);
++        return virtio_msg_linux_bridge_errno_is_transient(err) ?
++            VMSG_BRIDGE_UAPI_MAP_ACK_RETRY :
++            VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    qemu_mutex_lock(&s->map_lock);
++    entry = virtio_msg_linux_bridge_find_map_entry_by_id_locked(
++        s, event->epoch, event->map_id);
++    conflict = virtio_msg_linux_bridge_find_map_overlap_locked(
++        s, event->bus_addr, event->length);
++    if (entry || conflict) {
++        qemu_mutex_unlock(&s->map_lock);
++        if (munmap(host_addr, event->mmap_length) < 0) {
++            VIRTIO_MSG_ERROR_LOG("bridge",
++                                 "map ADD cleanup munmap failed: %s",
++                                 strerror(errno));
++        }
++        virtio_msg_linux_bridge_log_map_event_summary(
++            "map_event_add duplicate after mmap", s, event);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    entry = g_new0(VirtIOMSGLinuxBridgeMapEntry, 1);
++    entry->bridge = s;
++    entry->map_id = event->map_id;
++    entry->epoch = event->epoch;
++    entry->bus_addr = event->bus_addr;
++    entry->length = event->length;
++    entry->mmap_offset = event->mmap_offset;
++    entry->mmap_length = event->mmap_length;
++    entry->host_addr = host_addr;
++    entry->install_refs = 1;
++    QTAILQ_INSERT_TAIL(&s->map_entries, entry, node);
++    qemu_mutex_unlock(&s->map_lock);
++
++    subregion_name = g_strdup_printf(TYPE_VIRTIO_MSG_LINUX_BRIDGE
++                                     "-dma-map-%" PRIu64 "-%" PRIu64,
++                                     entry->epoch, entry->map_id);
++    if (!memory_region_init_ram_map_nomigrate(
++            &entry->subregion_mr, OBJECT(s), subregion_name, entry->length,
++            &virtio_msg_linux_bridge_ram_map_ops, entry, &local_err)) {
++        qemu_mutex_lock(&s->map_lock);
++        QTAILQ_REMOVE(&s->map_entries, entry, node);
++        qemu_mutex_unlock(&s->map_lock);
++        if (munmap(host_addr, event->mmap_length) < 0) {
++            VIRTIO_MSG_ERROR_LOG("bridge",
++                                 "map ADD cleanup after RAM init failed: %s",
++                                 strerror(errno));
++        }
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "map ADD RAM region init failed "
++                                "epoch=%" PRIu64 " map_id=%" PRIu64
++                                " bus_addr=0x%" PRIx64
++                                " length=0x%" PRIx64 ": %s",
++                                (uint64_t)event->epoch,
++                                (uint64_t)event->map_id,
++                                (uint64_t)event->bus_addr,
++                                (uint64_t)event->length,
++                                error_get_pretty(local_err));
++        error_report_err(local_err);
++        g_free(entry);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_RETRY;
++    }
++    memory_region_add_subregion(&s->dma_mr, entry->bus_addr,
++                                &entry->subregion_mr);
++    qemu_mutex_lock(&s->map_lock);
++    entry->subregion_attached = true;
++    entry->install_refs = 0;
++    virtio_msg_linux_bridge_map_touch_locked(s, entry);
++    qemu_mutex_unlock(&s->map_lock);
++    VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                            "activate mapping seq=%" PRIu64
++                            " epoch=%" PRIu64 " map_id=%" PRIu64
++                            " bus_addr=0x%" PRIx64 " length=0x%" PRIx64,
++                            (uint64_t)event->seq, (uint64_t)event->epoch,
++                            (uint64_t)event->map_id, (uint64_t)event->bus_addr,
++                            (uint64_t)event->length);
++    trace_virtio_msg_linux_bridge_map_event_install(s->endpoint_handle,
++                                                    entry->epoch,
++                                                    entry->map_id,
++                                                    entry->bus_addr,
++                                                    entry->length,
++                                                    entry->mmap_offset,
++                                                    entry->mmap_length);
++    virtio_msg_linux_bridge_log_map_event_summary("map_event_add installed",
++                                                 s, event);
++    return VMSG_BRIDGE_UAPI_MAP_ACK_OK;
++}
++
++static uint16_t virtio_msg_linux_bridge_handle_map_event_del_req(
++    VirtIOMSGLinuxBridge *s, const struct vmsg_bridge_uapi_map_event *event)
++{
++    VirtIOMSGLinuxBridgeMapEntry *entry;
++    uint64_t page_size = qemu_real_host_page_size();
++    bool busy = false;
++    bool ok;
++
++    VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                           "handle MAP_EVENT_DEL_REQ seq=%" PRIu64
++                           " epoch=%" PRIu64 " map_id=%" PRIu64
++                           " bus_addr=0x%" PRIx64 " length=0x%" PRIx64,
++                           (uint64_t)event->seq, (uint64_t)event->epoch,
++                           (uint64_t)event->map_id, (uint64_t)event->bus_addr,
++                           (uint64_t)event->length);
++    if (!event->length ||
++        !QEMU_IS_ALIGNED(event->bus_addr, page_size) ||
++        !QEMU_IS_ALIGNED(event->length, page_size)) {
++        VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                               "invalid map DEL_REQ seq=%" PRIu64
++                               " epoch=%" PRIu64 " map_id=%" PRIu64
++                               " bus_addr=0x%" PRIx64 " length=0x%" PRIx64
++                               " page_size=0x%" PRIx64,
++                               (uint64_t)event->seq, (uint64_t)event->epoch,
++                               (uint64_t)event->map_id,
++                               (uint64_t)event->bus_addr,
++                               (uint64_t)event->length, page_size);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    qemu_mutex_lock(&s->map_lock);
++    entry = virtio_msg_linux_bridge_find_map_entry_by_id_any_locked(
++        s, event->epoch, event->map_id);
++    if (!entry) {
++        qemu_mutex_unlock(&s->map_lock);
++        VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                               "map DEL_REQ for unknown mapping seq=%" PRIu64
++                               " epoch=%" PRIu64 " map_id=%" PRIu64,
++                               (uint64_t)event->seq, (uint64_t)event->epoch,
++                               (uint64_t)event->map_id);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    if (entry->bus_addr != event->bus_addr || entry->length != event->length) {
++        qemu_mutex_unlock(&s->map_lock);
++        VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                               "map DEL_REQ identity mismatch seq=%" PRIu64
++                               " epoch=%" PRIu64 " map_id=%" PRIu64
++                               " bus_addr=0x%" PRIx64 " length=0x%" PRIx64,
++                               (uint64_t)event->seq, (uint64_t)event->epoch,
++                               (uint64_t)event->map_id,
++                               (uint64_t)event->bus_addr,
++                               (uint64_t)event->length);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    if (entry->del_req_pending) {
++        if (virtio_msg_linux_bridge_map_busy_locked(entry)) {
++            VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                                   "DEL_REQ retry still busy epoch=%" PRIu64
++                                   " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                                   " length=0x%" PRIx64
++                                   " pin_refs=%u active_refs=%u"
++                                   " install_refs=%u",
++                                   entry->epoch, entry->map_id,
++                                   entry->bus_addr, entry->length,
++                                   entry->pin_refs, entry->active_refs,
++                                   entry->install_refs);
++            qemu_mutex_unlock(&s->map_lock);
++            return VMSG_BRIDGE_UAPI_MAP_ACK_RETRY;
++        }
++
++        VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                               "DEL_REQ retry completing epoch=%" PRIu64
++                               " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                               " length=0x%" PRIx64,
++                               entry->epoch, entry->map_id, entry->bus_addr,
++                               entry->length);
++        ok = virtio_msg_linux_bridge_complete_del_req_locked(s, entry);
++        qemu_mutex_unlock(&s->map_lock);
++        if (ok) {
++            return VMSG_BRIDGE_UAPI_MAP_ACK_OK;
++        }
++
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    if (virtio_msg_linux_bridge_map_busy_locked(entry)) {
++        busy = true;
++        entry->del_req_pending = true;
++        VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                                "busy mapping on DEL_REQ epoch=%" PRIu64
++                                " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                                " length=0x%" PRIx64 " pin_refs=%u "
++                                "active_refs=%u install_refs=%u",
++                                entry->epoch, entry->map_id, entry->bus_addr,
++                                entry->length, entry->pin_refs,
++                                entry->active_refs, entry->install_refs);
++    }
++    VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                            "request revoke from DEL_REQ epoch=%" PRIu64
++                            " map_id=%" PRIu64 " bus_addr=0x%" PRIx64
++                            " length=0x%" PRIx64,
++                            entry->epoch, entry->map_id, entry->bus_addr,
++                            entry->length);
++    ok = virtio_msg_linux_bridge_revoke_entry_locked(s, entry);
++    VIRTIO_MSG_MAP_LIFE_LOG("bridge",
++                            "revoke request returned epoch=%" PRIu64
++                            " map_id=%" PRIu64 " ok=%d revoked=%d"
++                            " del_req_pending=%d attached=%d",
++                            entry->epoch, entry->map_id, ok, entry->revoked,
++                            entry->del_req_pending, entry->subregion_attached);
++    if (ok && !busy) {
++        ok = virtio_msg_linux_bridge_complete_del_req_locked(s, entry);
++    }
++    qemu_mutex_unlock(&s->map_lock);
++
++    if (!ok) {
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++
++    return busy ? VMSG_BRIDGE_UAPI_MAP_ACK_RETRY :
++        VMSG_BRIDGE_UAPI_MAP_ACK_OK;
++}
++
++static bool virtio_msg_linux_bridge_setup_dma_as(VirtIOMSGLinuxBridge *s)
++{
++    if (s->dma_as_initialized) {
++        return true;
++    }
++
++    memory_region_init(&s->dma_mr, OBJECT(s),
++                       TYPE_VIRTIO_MSG_LINUX_BRIDGE "-dma", UINT64_MAX);
++    address_space_init(&s->dma_as, &s->dma_mr,
++                       TYPE_VIRTIO_MSG_LINUX_BRIDGE "-dma-as");
++    address_space_set_direct_map_only(&s->dma_as, true);
++    s->dma_as_initialized = true;
++    return true;
++}
++
++static void virtio_msg_linux_bridge_reset_transport_caps(
++    VirtIOMSGLinuxBridge *s)
++{
++    if (s->dma_as_initialized) {
++        s->transport_caps.dma_as = &s->dma_as;
++    } else {
++        s->transport_caps.dma_as = &address_space_memory;
++    }
++    s->transport_caps.extra_features = 0;
++    s->transport_caps.max_msg_size = VIRTIO_MSG_MAX_SIZE;
++    s->transport_caps.ready = false;
++    s->vmm_max_msg_size = VIRTIO_MSG_MAX_SIZE;
++    s->endpoint_max_msg_size = 0;
++}
++
++static void virtio_msg_linux_bridge_latch_transport_caps(
++    VirtIOMSGLinuxBridge *s)
++{
++    s->transport_caps.dma_as = &s->dma_as;
++    s->transport_caps.extra_features = BIT_ULL(VIRTIO_F_IOMMU_PLATFORM);
++    s->transport_caps.max_msg_size = virtio_msg_linux_bridge_max_msg_size(s);
++    s->transport_caps.ready = true;
++}
++
++static void virtio_msg_linux_bridge_fill_transport_caps(
++    VirtIOMSGBusDevice *bd, VirtIOMSGTransportCaps *caps)
++{
++    VirtIOMSGLinuxBridge *s = VIRTIO_MSG_LINUX_BRIDGE(bd);
++
++    *caps = s->transport_caps;
++}
++
++static void virtio_msg_linux_bridge_release_dma_as(VirtIOMSGLinuxBridge *s)
++{
++    if (!s->dma_as_initialized) {
++        return;
++    }
++
++    virtio_msg_linux_bridge_unmap_all(s);
++    address_space_destroy(&s->dma_as);
++    object_unparent(OBJECT(&s->dma_mr));
++    s->dma_as_initialized = false;
++}
++
++static void virtio_msg_linux_bridge_clear_map_event_state(
++    VirtIOMSGLinuxBridge *s)
++{
++    s->map_ack_pending = false;
++    s->map_ack_seq = 0;
++    s->map_ack_type = 0;
++    s->map_ack_status = 0;
++}
++
++static bool virtio_msg_linux_bridge_add_migration_blocker(
++    VirtIOMSGLinuxBridge *s, Error **errp)
++{
++    if (s->migration_blocker) {
++        return true;
++    }
++
++    error_setg(&s->migration_blocker,
++               "%s does not support migration: "
++               "bridge session state is host-local",
++               TYPE_VIRTIO_MSG_LINUX_BRIDGE);
++    if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
++        return false;
++    }
++
++    return true;
++}
++
++static void virtio_msg_linux_bridge_fail_attach(VirtIOMSGLinuxBridge *s)
++{
++    int ret;
++    int err;
++
++    if (s->call_fd >= 0) {
++        VIRTIO_MSG_LOG("bridge",
++                       "call_fd handler remove reason=fail_attach "
++                       "endpoint=%u call_fd=%d attached=%d state=%d",
++                       s->endpoint_handle, s->call_fd, s->attached,
++                       s->session_state);
++        qemu_set_fd_handler(s->call_fd, NULL, NULL, NULL);
++    }
++    if (s->dev_fd >= 0) {
++        qemu_set_fd_handler(s->dev_fd, NULL, NULL, NULL);
++    }
++
++    virtio_msg_linux_bridge_clear_pending_tx(s);
++    virtio_msg_linux_bridge_purge_rx_ring(s);
++    virtio_msg_linux_bridge_clear_map_event_state(s);
++    virtio_msg_linux_bridge_unmap_all(s);
++
++    if (s->attached && s->dev_fd >= 0) {
++        ret = virtio_msg_linux_bridge_ioctl(s->dev_fd,
++                                            VMSG_BRIDGE_IOCTL_DETACH,
++                                            NULL);
++        err = (ret < 0) ? errno : 0;
++        if (ret < 0) {
++            VIRTIO_MSG_LOG("bridge",
++                           "DETACH failed while entering ATTACHED_FAILED "
++                           "endpoint=%u: %s",
++                           s->endpoint_handle, strerror(err));
++        }
++    }
++    s->attached = false;
++    virtio_msg_linux_bridge_release_endpoint(s);
++    virtio_msg_linux_bridge_set_state(
++        s, VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_FAILED);
++}
++
++static void virtio_msg_linux_bridge_release_resources(VirtIOMSGLinuxBridge *s,
++                                                      uint32_t reason)
++{
++    virtio_msg_linux_bridge_clear_pending_tx(s);
++    virtio_msg_linux_bridge_clear_map_event_state(s);
++    virtio_msg_linux_bridge_unmap_all(s);
++    virtio_msg_linux_bridge_detach(s);
++    virtio_msg_linux_bridge_release_endpoint(s);
++    virtio_msg_linux_bridge_unregister_machine_done_notifier(s);
++
++    migrate_del_blocker(&s->migration_blocker);
++    virtio_msg_linux_bridge_reset_transport_caps(s);
++    virtio_msg_linux_bridge_release_dma_as(s);
++    virtio_msg_linux_bridge_release_rings(s);
++    if (s->call_fd >= 0) {
++        VIRTIO_MSG_LOG("bridge",
++                       "call_fd handler remove reason=release_resources "
++                       "endpoint=%u call_fd=%d attached=%d state=%d "
++                       "release_reason=%u",
++                       s->endpoint_handle, s->call_fd, s->attached,
++                       s->session_state, reason);
++        qemu_set_fd_handler(s->call_fd, NULL, NULL, NULL);
++    }
++    if (s->dev_fd >= 0) {
++        qemu_set_fd_handler(s->dev_fd, NULL, NULL, NULL);
++    }
++    if (s->call_fd >= 0) {
++        VIRTIO_MSG_LOG("bridge",
++                       "call_fd close reason=release_resources endpoint=%u "
++                       "call_fd=%d release_reason=%u",
++                       s->endpoint_handle, s->call_fd, reason);
++    }
++    virtio_msg_linux_bridge_close_fd(&s->call_fd);
++    virtio_msg_linux_bridge_close_fd(&s->kick_fd);
++    virtio_msg_linux_bridge_close_fd(&s->ring_fd);
++    virtio_msg_linux_bridge_close_fd(&s->dev_fd);
++    memset(&s->tx_ring_info, 0, sizeof(s->tx_ring_info));
++    memset(&s->rx_ring_info, 0, sizeof(s->rx_ring_info));
++    memset(&s->endpoint_addr, 0, sizeof(s->endpoint_addr));
++    memset(&s->caps, 0, sizeof(s->caps));
++    s->map_last_covering = NULL;
++    s->map_use_seq = 0;
++    s->endpoint_handle = 0;
++    s->endpoint_resolved = false;
++    s->attached = false;
++    s->machine_ready = false;
++    virtio_msg_linux_bridge_clear_map_event_state(s);
++    virtio_msg_linux_bridge_set_state(
++        s, VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_DETACHED);
++}
++
++static void virtio_msg_linux_bridge_reset_devices(VirtIOMSGLinuxBridge *s)
++{
++    VirtIOMSGProxy *proxy = s->parent_obj.opaque;
++    uint16_t i;
++
++    if (!proxy) {
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(proxy->devs); i++) {
++        VirtIODevice *vdev = virtio_bus_get_device(&proxy->devs[i].bus);
++
++        if (!vdev) {
++            continue;
++        }
++
++        virtio_bus_reset(&proxy->devs[i].bus);
++        proxy->devs[i].guest_features = 0;
++    }
++}
++
++static VirtIOMSGProxy *virtio_msg_linux_bridge_get_proxy(
++    VirtIOMSGLinuxBridge *s)
++{
++    VirtIOMSGProxy *proxy = s->parent_obj.opaque;
++    BusState *bus;
++    DeviceState *parent;
++
++    if (proxy) {
++        return proxy;
++    }
++
++    bus = qdev_get_parent_bus(DEVICE(s));
++    if (!bus || !bus->parent) {
++        return NULL;
++    }
++
++    parent = bus->parent;
++    if (!object_dynamic_cast(OBJECT(parent), TYPE_VIRTIO_MSG)) {
++        return NULL;
++    }
++
++    return VIRTIO_MSG(parent);
++}
++
++static void virtio_msg_linux_bridge_build_device_bitmap(VirtIOMSGLinuxBridge *s,
++                                                        uint8_t *bitmap)
++{
++    VirtIOMSGProxy *proxy = virtio_msg_linux_bridge_get_proxy(s);
++    uint16_t dev_num;
++
++    memset(bitmap, 0, VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_BITMAP_BYTES);
++    if (!proxy) {
++        return;
++    }
++
++    for (dev_num = 0; dev_num < VIRTIO_MSG_MAX_DEVS; dev_num++) {
++        VirtIODevice *vdev = virtio_bus_get_device(&proxy->devs[dev_num].bus);
++
++        if (!vdev) {
++            continue;
++        }
++
++        bitmap[dev_num / 8] |= (1U << (dev_num % 8));
++    }
++}
++
++static bool virtio_msg_linux_bridge_publish_topology_set_devices(
++    VirtIOMSGLinuxBridge *s, int *set_devices_errno, Error **errp)
++{
++    struct vmsg_bridge_uapi_set_devices set = { 0 };
++    uint8_t bitmap[VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_BITMAP_BYTES];
++    int err;
++    int ret;
++
++    virtio_msg_linux_bridge_build_device_bitmap(s, bitmap);
++
++    set.endpoint_id = s->endpoint_handle;
++    set.first_dev_num = 0;
++    set.last_dev_num = VIRTIO_MSG_MAX_DEVS - 1;
++    set.flags = VMSG_BRIDGE_UAPI_SET_DEVICES_F_CLEAR;
++    set.bitmap_bytes = sizeof(bitmap);
++    set.bitmap_ptr = (uintptr_t)bitmap;
++
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd,
++                                        VMSG_BRIDGE_IOCTL_SET_DEVICES,
++                                        &set);
++    if (ret >= 0) {
++        VIRTIO_MSG_LOG("bridge",
++                       "published device topology endpoint=%u range=%u-%u",
++                       s->endpoint_handle, set.first_dev_num,
++                       set.last_dev_num);
++        if (set_devices_errno) {
++            *set_devices_errno = 0;
++        }
++        return true;
++    }
++
++    err = errno;
++    if (set_devices_errno) {
++        *set_devices_errno = err;
++    }
++    if (errp) {
++        error_setg_errno(errp, err, "bridge SET_DEVICES failed");
++    } else {
++        VIRTIO_MSG_LOG("bridge", "SET_DEVICES failed: %s", strerror(err));
++    }
++    return false;
++}
++
++static bool virtio_msg_linux_bridge_maybe_publish_topology(
++    VirtIOMSGLinuxBridge *s, Error **errp)
++{
++    int set_devices_errno = 0;
++
++    if (!s->attached || !s->machine_ready ||
++        !virtio_msg_linux_bridge_state_allows_topology(s)) {
++        return true;
++    }
++
++    if (!virtio_msg_linux_bridge_publish_topology_set_devices(
++            s, &set_devices_errno, NULL)) {
++        if (virtio_msg_linux_bridge_errno_is_terminal(set_devices_errno)) {
++            if (errp) {
++                error_setg_errno(errp, set_devices_errno,
++                                 "bridge SET_DEVICES failed");
++            }
++            virtio_msg_linux_bridge_fail_attach(s);
++            return false;
++        }
++
++        if (virtio_msg_linux_bridge_errno_is_transient(set_devices_errno)) {
++            if (s->topology_retry_failures >=
++                VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_MAX_FAILURES) {
++                if (errp) {
++                    error_setg(errp,
++                               "bridge SET_DEVICES failed too many times "
++                               "(last errno=%d: %s)",
++                               set_devices_errno,
++                               strerror(set_devices_errno));
++                }
++                virtio_msg_linux_bridge_fail_attach(s);
++                return false;
++            }
++
++            s->topology_retry_failures++;
++            VIRTIO_MSG_LOG("bridge",
++                           "transient SET_DEVICES failure endpoint=%u "
++                           "errno=%d (%s), retry=%u/%u delay=%u ms",
++                           s->endpoint_handle, set_devices_errno,
++                           strerror(set_devices_errno),
++                           s->topology_retry_failures,
++                           VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_MAX_FAILURES,
++                           s->topology_retry_delay_ms);
++            virtio_msg_linux_bridge_schedule_topology_retry(s);
++            if (s->topology_retry_delay_ms <
++                VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_DELAY_MAX_MS) {
++                s->topology_retry_delay_ms = MIN(
++                    s->topology_retry_delay_ms * 2,
++                    VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_DELAY_MAX_MS);
++            }
++            return true;
++        }
++
++        if (errp) {
++            error_setg_errno(errp, set_devices_errno,
++                             "bridge SET_DEVICES failed");
++        }
++        return false;
++    }
++
++    virtio_msg_linux_bridge_set_state(
++        s, VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_ACTIVE);
++    return true;
++}
++
++static void virtio_msg_linux_bridge_schedule_topology_retry(
++    VirtIOMSGLinuxBridge *s)
++{
++    int64_t now;
++
++    if (!s->topology_retry_timer) {
++        return;
++    }
++
++    if (!s->attached || !s->machine_ready ||
++        !virtio_msg_linux_bridge_state_allows_topology(s)) {
++        return;
++    }
++
++    if (!s->topology_retry_delay_ms) {
++        s->topology_retry_delay_ms =
++            VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_DELAY_MIN_MS;
++    }
++
++    now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    timer_mod_anticipate(s->topology_retry_timer,
++                         now + s->topology_retry_delay_ms);
++}
++
++static void virtio_msg_linux_bridge_cancel_topology_retry(
++    VirtIOMSGLinuxBridge *s)
++{
++    if (!s->topology_retry_timer) {
++        return;
++    }
++
++    timer_del(s->topology_retry_timer);
++    s->topology_retry_failures = 0;
++    s->topology_retry_delay_ms =
++        VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_DELAY_MIN_MS;
++}
++
++static void virtio_msg_linux_bridge_topology_retry_cb(void *opaque)
++{
++    VirtIOMSGLinuxBridge *s = opaque;
++    Error *local_err = NULL;
++
++    if (!s->attached || !s->machine_ready ||
++        !virtio_msg_linux_bridge_state_allows_topology(s)) {
++        virtio_msg_linux_bridge_cancel_topology_retry(s);
++        return;
++    }
++
++    if (!virtio_msg_linux_bridge_maybe_publish_topology(s, &local_err)) {
++        if (local_err) {
++            error_report_err(local_err);
++        }
++        return;
++    }
++
++    if (!virtio_msg_linux_bridge_state_allows_topology(s)) {
++        virtio_msg_linux_bridge_cancel_topology_retry(s);
++    }
++}
++
++static void virtio_msg_linux_bridge_machine_done(Notifier *notifier, void *data)
++{
++    VirtIOMSGLinuxBridge *s = container_of(notifier, VirtIOMSGLinuxBridge,
++                                           machine_done);
++    Error *local_err = NULL;
++
++    (void)data;
++    s->machine_ready = true;
++    VIRTIO_MSG_LOG("bridge", "machine init done endpoint=%u",
++                   s->endpoint_handle);
++    if (!virtio_msg_linux_bridge_maybe_publish_topology(s, &local_err)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "topology publish after machine-ready failed: %s",
++                       error_get_pretty(local_err));
++        error_report_err(local_err);
++    }
++}
++
++static void virtio_msg_linux_bridge_register_machine_done_notifier(
++    VirtIOMSGLinuxBridge *s)
++{
++    if (s->machine_done.notify) {
++        return;
++    }
++
++    s->machine_done.notify = virtio_msg_linux_bridge_machine_done;
++    qemu_add_machine_init_done_notifier(&s->machine_done);
++}
++
++static void virtio_msg_linux_bridge_unregister_machine_done_notifier(
++    VirtIOMSGLinuxBridge *s)
++{
++    if (!s->machine_done.notify) {
++        return;
++    }
++
++    qemu_remove_machine_init_done_notifier(&s->machine_done);
++    s->machine_done.notify = NULL;
++}
++
++static struct vmsg_bridge_uapi_ring_hdr *
++virtio_msg_linux_bridge_ring_hdr(VirtIOMSGLinuxBridge *s,
++                                 const struct vmsg_bridge_uapi_ring_info *ring)
++{
++    return (void *)((uint8_t *)s->rings + ring->offset);
++}
++
++static uint8_t *
++virtio_msg_linux_bridge_ring_entry(struct vmsg_bridge_uapi_ring_hdr *hdr,
++                                   const struct vmsg_bridge_uapi_ring_info
++                                   *ring,
++                                   uint32_t idx)
++{
++    uint8_t *base = (uint8_t *)hdr + sizeof(*hdr);
++
++    return base + ((uint64_t)idx * ring->entry_size);
++}
++
++static uint32_t virtio_msg_linux_bridge_ring_slot_index(uint32_t cursor,
++                                                        uint32_t entries)
++{
++    return cursor % entries;
++}
++
++static uint32_t virtio_msg_linux_bridge_ring_used(uint32_t prod,
++                                                  uint32_t cons)
++{
++    return prod - cons;
++}
++
++static void virtio_msg_linux_bridge_purge_rx_ring(VirtIOMSGLinuxBridge *s)
++{
++    struct vmsg_bridge_uapi_ring_hdr *hdr;
++    uint32_t prod;
++    uint32_t cons;
++    uint32_t used;
++
++    if (!s->rings) {
++        return;
++    }
++
++    hdr = virtio_msg_linux_bridge_ring_hdr(s, &s->rx_ring_info);
++    prod = qatomic_load_acquire(&hdr->prod);
++    cons = qatomic_read(&hdr->cons);
++    used = virtio_msg_linux_bridge_ring_used(prod, cons);
++    if (used == 0) {
++        return;
++    }
++
++    qatomic_store_release(&hdr->cons, prod);
++}
++
++static void virtio_msg_linux_bridge_kick(VirtIOMSGLinuxBridge *s)
++{
++    uint64_t one = 1;
++    ssize_t ret;
++
++    do {
++        ret = write(s->kick_fd, &one, sizeof(one));
++    } while (ret < 0 && errno == EINTR);
++
++    if (ret == sizeof(one) ||
++        (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
++        return;
++    }
++
++    if (ret >= 0) {
++        VIRTIO_MSG_LOG("bridge", "short kick write: %zd bytes", ret);
++        return;
++    }
++
++    VIRTIO_MSG_LOG("bridge", "kick write failed: %s", strerror(errno));
++}
++
++static void virtio_msg_linux_bridge_drain_callfd(VirtIOMSGLinuxBridge *s)
++{
++    uint64_t value;
++    ssize_t ret;
++
++    while (true) {
++        ret = read(s->call_fd, &value, sizeof(value));
++        if (ret == sizeof(value)) {
++            (void)value;
++            continue;
++        }
++
++        if (ret < 0 && errno == EINTR) {
++            continue;
++        }
++
++        if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++            VIRTIO_MSG_LOG("bridge", "callfd read failed: %s",
++                           strerror(errno));
++        }
++        return;
++    }
++}
++
++static bool virtio_msg_linux_bridge_ctrl_payload_exact(
++    const struct vmsg_bridge_uapi_control_msg *msg, size_t payload_size)
++{
++    return msg->payload_len == payload_size;
++}
++
++static VirtIOMSGLinuxBridgeCapsValidationResult
++virtio_msg_linux_bridge_validate_caps_common(uint32_t revision,
++                                             uint32_t max_msg_size,
++                                             uint32_t *validated_max_msg_size)
++{
++    uint32_t normalized_max_msg_size = max_msg_size;
++    size_t min_msg_size = virtio_msg_header_size();
++
++    if (!normalized_max_msg_size) {
++        normalized_max_msg_size = VIRTIO_MSG_MAX_SIZE;
++    }
++
++    *validated_max_msg_size = normalized_max_msg_size;
++
++    if (revision != VIRTIO_MSG_LINUX_BRIDGE_REVISION_SUPPORTED) {
++        return VIRTIO_MSG_LINUX_BRIDGE_CAPS_VALIDATION_BAD_REVISION;
++    }
++
++    if (normalized_max_msg_size < min_msg_size ||
++        normalized_max_msg_size > VIRTIO_MSG_MAX_SIZE) {
++        return VIRTIO_MSG_LINUX_BRIDGE_CAPS_VALIDATION_BAD_MAX_MSG_SIZE;
++    }
++
++    return VIRTIO_MSG_LINUX_BRIDGE_CAPS_VALIDATION_OK;
++}
++
++static bool virtio_msg_linux_bridge_validate_online_max_msg_size(
++    uint32_t max_msg_size, uint32_t *validated_max_msg_size)
++{
++    size_t min_msg_size = virtio_msg_header_size();
++    uint32_t normalized_max_msg_size = max_msg_size;
++
++    if (!normalized_max_msg_size) {
++        normalized_max_msg_size = VIRTIO_MSG_MAX_SIZE;
++    }
++
++    *validated_max_msg_size = normalized_max_msg_size;
++    return normalized_max_msg_size >= min_msg_size &&
++        normalized_max_msg_size <= VIRTIO_MSG_MAX_SIZE;
++}
++
++static void virtio_msg_linux_bridge_apply_caps_common(
++    VirtIOMSGLinuxBridge *s,
++    uint32_t revision,
++    uint32_t max_msg_size,
++    uint64_t transport_features,
++    uint64_t bridge_features)
++{
++    s->caps.revision = revision;
++    s->caps.max_msg_size = max_msg_size;
++    s->caps.transport_features = transport_features;
++    s->caps.bridge_features = bridge_features;
++}
++
++static void virtio_msg_linux_bridge_handle_endpoint_online(
++    VirtIOMSGLinuxBridge *s,
++    const struct vmsg_bridge_uapi_control_msg *msg)
++{
++    struct vmsg_bridge_uapi_ctrl_endpoint_online online;
++    uint32_t max_msg_size;
++    Error *local_err = NULL;
++
++    if (!virtio_msg_linux_bridge_ctrl_payload_exact(msg, sizeof(online))) {
++        VIRTIO_MSG_LOG("bridge",
++                       "ENDPOINT_ONLINE invalid payload length=%u",
++                       msg->payload_len);
++        return;
++    }
++
++    memcpy(&online, msg->payload, sizeof(online));
++    if (online.endpoint_id != s->endpoint_handle) {
++        VIRTIO_MSG_LOG("bridge",
++                       "ENDPOINT_ONLINE endpoint mismatch got=%u expected=%u",
++                       online.endpoint_id, s->endpoint_handle);
++        return;
++    }
++
++    if (!virtio_msg_linux_bridge_validate_online_max_msg_size(
++            online.max_msg_size, &max_msg_size)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "ENDPOINT_ONLINE unsupported max_msg_size=%u "
++                       "supported=%zu..%zu",
++                       max_msg_size,
++                       virtio_msg_header_size(), (size_t)VIRTIO_MSG_MAX_SIZE);
++        return;
++    }
++
++    memcpy(s->endpoint_addr.bus_name, online.bus_name,
++           sizeof(s->endpoint_addr.bus_name));
++    s->endpoint_addr.bus_name[VMSG_BRIDGE_UAPI_BUS_NAME_LEN - 1] = '\0';
++    s->endpoint_max_msg_size = max_msg_size;
++    s->caps.max_msg_size = max_msg_size;
++    virtio_msg_linux_bridge_latch_transport_caps(s);
++    virtio_msg_linux_bridge_set_state(
++        s,
++        VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_NEEDS_TOPOLOGY);
++    VIRTIO_MSG_LOG("bridge",
++                   "endpoint online endpoint=%u bus_name=%s "
++                   "endpoint_max_msg_size=%u transport_max_msg_size=%u",
++                   s->endpoint_handle, s->endpoint_addr.bus_name,
++                   s->endpoint_max_msg_size,
++                   virtio_msg_linux_bridge_max_msg_size(s));
++    if (!virtio_msg_linux_bridge_maybe_publish_topology(s, &local_err)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "topology publish after endpoint-online failed: %s",
++                       error_get_pretty(local_err));
++        error_report_err(local_err);
++    }
++}
++
++static void virtio_msg_linux_bridge_handle_endpoint_offline(
++    VirtIOMSGLinuxBridge *s,
++    const struct vmsg_bridge_uapi_control_msg *msg)
++{
++    struct vmsg_bridge_uapi_ctrl_endpoint_offline offline;
++
++    if (!virtio_msg_linux_bridge_ctrl_payload_exact(msg, sizeof(offline))) {
++        VIRTIO_MSG_LOG("bridge",
++                       "ENDPOINT_OFFLINE invalid payload length=%u",
++                       msg->payload_len);
++        return;
++    }
++
++    memcpy(&offline, msg->payload, sizeof(offline));
++    if (offline.endpoint_id != s->endpoint_handle) {
++        VIRTIO_MSG_LOG("bridge",
++                       "ENDPOINT_OFFLINE endpoint mismatch got=%u expected=%u",
++                       offline.endpoint_id, s->endpoint_handle);
++        return;
++    }
++
++    virtio_msg_linux_bridge_set_state(
++        s, VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_OFFLINE);
++    virtio_msg_linux_bridge_clear_pending_tx(s);
++    virtio_msg_linux_bridge_purge_rx_ring(s);
++    virtio_msg_linux_bridge_clear_map_event_state(s);
++    virtio_msg_linux_bridge_unmap_all(s);
++    VIRTIO_MSG_LOG("bridge", "endpoint offline endpoint=%u reason=%u",
++                   s->endpoint_handle, offline.reason);
++    virtio_msg_linux_bridge_reset_devices(s);
++}
++
++static void virtio_msg_linux_bridge_handle_control_msg(VirtIOMSGLinuxBridge *s,
++    const struct vmsg_bridge_uapi_control_msg *msg)
++{
++    switch (msg->type) {
++    case VMSG_BRIDGE_UAPI_CTRL_TYPE_ENDPOINT_ONLINE:
++        virtio_msg_linux_bridge_handle_endpoint_online(s, msg);
++        break;
++    case VMSG_BRIDGE_UAPI_CTRL_TYPE_ENDPOINT_OFFLINE:
++        virtio_msg_linux_bridge_handle_endpoint_offline(s, msg);
++        break;
++    default:
++        VIRTIO_MSG_LOG("bridge", "unsupported control type=%u", msg->type);
++        break;
++    }
++}
++
++static uint16_t virtio_msg_linux_bridge_handle_map_event(
++    VirtIOMSGLinuxBridge *s, const struct vmsg_bridge_uapi_map_event *event)
++{
++    switch (event->type) {
++    case VMSG_BRIDGE_UAPI_MAP_EVENT_ADD:
++        return virtio_msg_linux_bridge_handle_map_event_add(s, event);
++    case VMSG_BRIDGE_UAPI_MAP_EVENT_DEL_REQ:
++        return virtio_msg_linux_bridge_handle_map_event_del_req(s, event);
++    default:
++        VIRTIO_MSG_LOG("bridge", "unsupported map event type=%u",
++                       event->type);
++        return VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++    }
++}
++
++static bool virtio_msg_linux_bridge_process_one_control_recv(
++    VirtIOMSGLinuxBridge *s)
++{
++    struct vmsg_bridge_uapi_control_msg msg = { 0 };
++    int err;
++    int ret;
++
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd,
++                                        VMSG_BRIDGE_IOCTL_CONTROL_RECV,
++                                        &msg);
++    if (ret < 0) {
++        err = errno;
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++            return false;
++        }
++        if (virtio_msg_linux_bridge_errno_is_transient(err)) {
++            return false;
++        }
++        VIRTIO_MSG_LOG("bridge", "CONTROL_RECV failed: %s", strerror(err));
++        if (virtio_msg_linux_bridge_errno_is_terminal(err)) {
++            virtio_msg_linux_bridge_fail_attach(s);
++        }
++        return false;
++    }
++
++    virtio_msg_linux_bridge_handle_control_msg(s, &msg);
++
++    return true;
++}
++
++static bool virtio_msg_linux_bridge_try_ack_pending_map_event(
++    VirtIOMSGLinuxBridge *s,
++    VirtIOMSGLinuxBridgeAckStatus *status)
++{
++    struct vmsg_bridge_uapi_map_event_ack ack = { 0 };
++    int err;
++    int ret;
++
++    *status = VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_OK;
++    if (!virtio_msg_linux_bridge_state_allows_map(s)) {
++        return false;
++    }
++
++    if (!s->map_ack_pending) {
++        return true;
++    }
++
++    ack.seq = s->map_ack_seq;
++    ack.type = s->map_ack_type;
++    ack.status = s->map_ack_status;
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd,
++                                        VMSG_BRIDGE_IOCTL_MAP_EVENT_ACK,
++                                        &ack);
++    err = (ret < 0) ? errno : 0;
++    if (ret >= 0) {
++        bool reject = s->map_ack_status == VMSG_BRIDGE_UAPI_MAP_ACK_REJECT;
++
++        s->map_ack_pending = false;
++        VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                               "MAP_EVENT_ACK sent seq=%" PRIu64
++                               " type=%u status=%u",
++                               (uint64_t)s->map_ack_seq, s->map_ack_type,
++                               s->map_ack_status);
++        if (reject) {
++            VIRTIO_MSG_ERROR_LOG("bridge",
++                                 "MAP_EVENT_ACK accepted REJECT seq=%" PRIu64
++                                 " type=%u; entering ATTACHED_FAILED",
++                                 (uint64_t)s->map_ack_seq, s->map_ack_type);
++            virtio_msg_linux_bridge_fail_attach(s);
++            *status = VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_FAILED;
++            return false;
++        }
++        return true;
++    }
++
++    if (virtio_msg_linux_bridge_errno_is_transient(err)) {
++        *status = VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_TRANSIENT;
++        return false;
++    }
++
++    VIRTIO_MSG_ERROR_LOG("bridge",
++                         "MAP_EVENT_ACK failed seq=%" PRIu64
++                         " type=%u status=%u: %s",
++                         (uint64_t)s->map_ack_seq, s->map_ack_type,
++                         s->map_ack_status, strerror(err));
++    if (virtio_msg_linux_bridge_errno_is_terminal(err)) {
++        virtio_msg_linux_bridge_fail_attach(s);
++    }
++    s->map_ack_pending = false;
++    *status = VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_FAILED;
++    return false;
++}
++
++static bool virtio_msg_linux_bridge_process_one_map_event(
++    VirtIOMSGLinuxBridge *s)
++{
++    struct vmsg_bridge_uapi_map_event_recv recv = { 0 };
++    uint16_t ack_status;
++    int err;
++    int ret;
++
++    if (!virtio_msg_linux_bridge_state_allows_map(s)) {
++        return false;
++    }
++
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd,
++                                        VMSG_BRIDGE_IOCTL_MAP_EVENT_RECV,
++                                        &recv);
++    if (ret < 0) {
++        err = errno;
++        if (errno == EAGAIN || errno == EWOULDBLOCK) {
++            return false;
++        }
++        if (virtio_msg_linux_bridge_errno_is_transient(err)) {
++            return false;
++        }
++        VIRTIO_MSG_ERROR_LOG("bridge", "MAP_EVENT_RECV failed: %s",
++                             strerror(err));
++        if (virtio_msg_linux_bridge_errno_is_terminal(err)) {
++            virtio_msg_linux_bridge_fail_attach(s);
++        }
++        return false;
++    }
++
++    VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                           "MAP_EVENT_RECV seq=%" PRIu64
++                           " type=%u epoch=%" PRIu64 " map_id=%" PRIu64
++                           " bus_addr=0x%" PRIx64 " length=0x%" PRIx64,
++                           (uint64_t)recv.event.seq, recv.event.type,
++                           (uint64_t)recv.event.epoch,
++                           (uint64_t)recv.event.map_id,
++                           (uint64_t)recv.event.bus_addr,
++                           (uint64_t)recv.event.length);
++    ack_status = virtio_msg_linux_bridge_handle_map_event(s, &recv.event);
++    s->map_ack_seq = recv.event.seq;
++    s->map_ack_type = recv.event.type;
++    s->map_ack_status = ack_status;
++    s->map_ack_pending = true;
++    VIRTIO_MSG_MAP_CTL_LOG("bridge",
++                           "MAP_EVENT_RECV handled seq=%" PRIu64
++                           " type=%u ack_status=%u",
++                           (uint64_t)s->map_ack_seq, s->map_ack_type,
++                           s->map_ack_status);
++    return true;
++}
++
++static bool virtio_msg_linux_bridge_process_map_events(
++    VirtIOMSGLinuxBridge *s, bool *blocked)
++{
++    VirtIOMSGLinuxBridgeAckStatus ack_status;
++    bool progress = false;
++
++    *blocked = false;
++    if (!virtio_msg_linux_bridge_state_allows_map(s)) {
++        return false;
++    }
++
++    if (s->map_ack_pending) {
++        if (!virtio_msg_linux_bridge_try_ack_pending_map_event(s,
++                                                               &ack_status)) {
++            if (ack_status == VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_TRANSIENT &&
++                s->map_ack_pending) {
++                *blocked = true;
++                return false;
++            }
++            if (!virtio_msg_linux_bridge_state_allows_control(s)) {
++                *blocked = true;
++                return false;
++            }
++            progress = true;
++        } else {
++            progress = true;
++        }
++    }
++
++    if (!virtio_msg_linux_bridge_process_one_map_event(s)) {
++        if (!virtio_msg_linux_bridge_state_allows_control(s)) {
++            *blocked = true;
++        }
++        return progress;
++    }
++
++    progress = true;
++    if (!virtio_msg_linux_bridge_try_ack_pending_map_event(s, &ack_status)) {
++        if (ack_status == VIRTIO_MSG_LINUX_BRIDGE_ACK_STATUS_TRANSIENT &&
++            s->map_ack_pending) {
++            *blocked = true;
++        } else if (!virtio_msg_linux_bridge_state_allows_control(s)) {
++            *blocked = true;
++        }
++        return progress;
++    }
++
++    return true;
++}
++
++static bool virtio_msg_linux_bridge_compute_ring_layout(VirtIOMSGLinuxBridge *s,
++                                                        Error **errp)
++{
++    uint64_t page_size = qemu_real_host_page_size();
++    uint64_t tx_bytes;
++    uint64_t rx_bytes;
++    uint64_t rx_offset;
++    uint64_t total_size;
++
++    if (s->tx_ring_entries >
++        (UINT64_MAX - sizeof(struct vmsg_bridge_uapi_ring_hdr)) /
++        s->tx_ring_entry_size) {
++        VIRTIO_MSG_LOG("bridge",
++                       "tx ring geometry overflow entries=%u entry_size=%u",
++                       s->tx_ring_entries, s->tx_ring_entry_size);
++        error_setg(errp, "tx ring geometry overflows");
++        return false;
++    }
++
++    if (s->rx_ring_entries >
++        (UINT64_MAX - sizeof(struct vmsg_bridge_uapi_ring_hdr)) /
++        s->rx_ring_entry_size) {
++        VIRTIO_MSG_LOG("bridge",
++                       "rx ring geometry overflow entries=%u entry_size=%u",
++                       s->rx_ring_entries, s->rx_ring_entry_size);
++        error_setg(errp, "rx ring geometry overflows");
++        return false;
++    }
++
++    tx_bytes = sizeof(struct vmsg_bridge_uapi_ring_hdr) +
++               (uint64_t)s->tx_ring_entries * s->tx_ring_entry_size;
++    rx_bytes = sizeof(struct vmsg_bridge_uapi_ring_hdr) +
++               (uint64_t)s->rx_ring_entries * s->rx_ring_entry_size;
++
++    tx_bytes = QEMU_ALIGN_UP(tx_bytes, page_size);
++    rx_bytes = QEMU_ALIGN_UP(rx_bytes, page_size);
++    rx_offset = tx_bytes;
++
++    if (UINT64_MAX - rx_offset < rx_bytes) {
++        VIRTIO_MSG_LOG("bridge", "ring backing size overflow");
++        error_setg(errp, "ring backing size overflows");
++        return false;
++    }
++    total_size = rx_offset + rx_bytes;
++    if (total_size > SIZE_MAX) {
++        VIRTIO_MSG_LOG("bridge", "ring backing too large size=0x%" PRIx64,
++                       total_size);
++        error_setg(errp, "ring backing is too large");
++        return false;
++    }
++
++    s->tx_ring_info.offset = 0;
++    s->tx_ring_info.bytes = tx_bytes;
++    s->tx_ring_info.entries = s->tx_ring_entries;
++    s->tx_ring_info.entry_size = s->tx_ring_entry_size;
++
++    s->rx_ring_info.offset = rx_offset;
++    s->rx_ring_info.bytes = rx_bytes;
++    s->rx_ring_info.entries = s->rx_ring_entries;
++    s->rx_ring_info.entry_size = s->rx_ring_entry_size;
++
++    s->rings_size = total_size;
++    return true;
++}
++
++static void virtio_msg_linux_bridge_init_ring(
++    void *rings, const struct vmsg_bridge_uapi_ring_info *ring)
++{
++    struct vmsg_bridge_uapi_ring_hdr *hdr = (void *)((uint8_t *)rings +
++                                                   ring->offset);
++
++    memset(hdr, 0, ring->bytes);
++    hdr->entries = ring->entries;
++    hdr->entry_size = ring->entry_size;
++}
++
++static bool virtio_msg_linux_bridge_setup_rings(VirtIOMSGLinuxBridge *s,
++                                                Error **errp)
++{
++    s->ring_fd = qemu_memfd_create("vmsg-bridge-rings", s->rings_size,
++                                   false, 0, 0, errp);
++    if (s->ring_fd < 0) {
++        return false;
++    }
++
++    s->rings = mmap(NULL, s->rings_size, PROT_READ | PROT_WRITE,
++                    MAP_SHARED, s->ring_fd, 0);
++    if (s->rings == MAP_FAILED) {
++        s->rings = NULL;
++        VIRTIO_MSG_LOG("bridge", "ring mmap failed size=0x%zx: %s",
++                       s->rings_size, strerror(errno));
++        error_setg_errno(errp, errno, "failed to mmap rings");
++        return false;
++    }
++
++    virtio_msg_linux_bridge_init_ring(s->rings, &s->tx_ring_info);
++    virtio_msg_linux_bridge_init_ring(s->rings, &s->rx_ring_info);
++    return true;
++}
++
++static bool virtio_msg_linux_bridge_setup_eventfds(VirtIOMSGLinuxBridge *s,
++                                                   Error **errp)
++{
++    s->kick_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++    if (s->kick_fd < 0) {
++        VIRTIO_MSG_LOG("bridge", "kick_fd creation failed: %s",
++                       strerror(errno));
++        error_setg_errno(errp, errno, "failed to create kick_fd");
++        return false;
++    }
++
++    s->call_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++    if (s->call_fd < 0) {
++        VIRTIO_MSG_LOG("bridge", "call_fd creation failed: %s",
++                       strerror(errno));
++        error_setg_errno(errp, errno, "failed to create call_fd");
++        return false;
++    }
++
++    return true;
++}
++
++static bool virtio_msg_linux_bridge_attach(VirtIOMSGLinuxBridge *s,
++                                           Error **errp)
++{
++    struct vmsg_bridge_uapi_attach attach = { 0 };
++    VirtIOMSGLinuxBridgeCapsValidationResult caps_result;
++    VirtIOMSGLinuxBridgeSessionState session_state;
++    bool endpoint_online;
++    uint32_t attach_max_msg_size;
++    int ret;
++
++    attach.endpoint_id = s->endpoint_handle;
++    attach.ring_fd = s->ring_fd;
++    attach.kick_fd = s->kick_fd;
++    attach.call_fd = s->call_fd;
++    attach.vmm_max_msg_size = s->vmm_max_msg_size;
++    attach.tx = s->tx_ring_info;
++    attach.rx = s->rx_ring_info;
++
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd, VMSG_BRIDGE_IOCTL_ATTACH,
++                                        &attach);
++    if (ret < 0) {
++        VIRTIO_MSG_LOG("bridge", "ATTACH failed endpoint=%u: %s",
++                       s->endpoint_handle, strerror(errno));
++        error_setg_errno(errp, errno, "bridge ATTACH failed");
++        return false;
++    }
++
++    if (attach.caps.uapi_version != VMSG_BRIDGE_UAPI_VERSION) {
++        VIRTIO_MSG_LOG("bridge",
++                       "ATTACH returned unsupported UAPI version=%u "
++                       "expected=%u",
++                       attach.caps.uapi_version, VMSG_BRIDGE_UAPI_VERSION);
++        error_setg(errp,
++                   "bridge ATTACH returned unsupported UAPI version %u "
++                   "(expected %u)",
++                   attach.caps.uapi_version, VMSG_BRIDGE_UAPI_VERSION);
++        goto out_detach;
++    }
++    endpoint_online =
++        (attach.caps.flags & VMSG_BRIDGE_UAPI_CAP_F_ENDPOINT_ONLINE) != 0;
++
++    caps_result = virtio_msg_linux_bridge_validate_caps_common(
++        attach.caps.revision, attach.caps.max_msg_size,
++        &attach_max_msg_size);
++    if (caps_result == VIRTIO_MSG_LINUX_BRIDGE_CAPS_VALIDATION_BAD_REVISION) {
++        VIRTIO_MSG_LOG("bridge",
++                       "ATTACH returned unsupported revision=%u expected=%u",
++                       attach.caps.revision,
++                       VIRTIO_MSG_LINUX_BRIDGE_REVISION_SUPPORTED);
++        error_setg(errp,
++                   "bridge ATTACH returned unsupported transport "
++                   "revision %u (expected %u)",
++                   attach.caps.revision,
++                   VIRTIO_MSG_LINUX_BRIDGE_REVISION_SUPPORTED);
++        goto out_detach;
++    }
++    if (caps_result ==
++        VIRTIO_MSG_LINUX_BRIDGE_CAPS_VALIDATION_BAD_MAX_MSG_SIZE) {
++        VIRTIO_MSG_LOG("bridge",
++                       "ATTACH returned unsupported max_msg_size=%u "
++                       "supported=%zu..%zu",
++                       attach_max_msg_size, virtio_msg_header_size(),
++                       (size_t)VIRTIO_MSG_MAX_SIZE);
++        error_setg(errp,
++                   "bridge ATTACH returned unsupported max_msg_size %u "
++                   "(supported range %zu..%zu)",
++                   attach_max_msg_size,
++                   virtio_msg_header_size(),
++                   (size_t)VIRTIO_MSG_MAX_SIZE);
++        goto out_detach;
++    }
++
++    s->caps = attach.caps;
++    s->endpoint_max_msg_size = endpoint_online ? attach_max_msg_size : 0;
++    s->caps.max_msg_size = s->endpoint_max_msg_size;
++    if (endpoint_online) {
++        virtio_msg_linux_bridge_apply_caps_common(
++            s, attach.caps.revision, s->endpoint_max_msg_size,
++            attach.caps.transport_features, attach.caps.bridge_features);
++    }
++    session_state = endpoint_online ?
++        VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_ONLINE_NEEDS_TOPOLOGY :
++        VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_ATTACHED_OFFLINE;
++    virtio_msg_linux_bridge_clear_map_event_state(s);
++    s->attached = true;
++    virtio_msg_linux_bridge_set_state(s, session_state);
++    qemu_set_fd_handler(s->dev_fd, virtio_msg_linux_bridge_devfd_read,
++                        NULL, s);
++    qemu_set_fd_handler(s->call_fd, virtio_msg_linux_bridge_callfd_read,
++                        NULL, s);
++    VIRTIO_MSG_LOG("bridge",
++                   "call_fd handler register reason=attach endpoint=%u "
++                   "call_fd=%d attached=%d state=%d",
++                   s->endpoint_handle, s->call_fd, s->attached,
++                   s->session_state);
++    VIRTIO_MSG_LOG("bridge",
++                   "attached endpoint=%u online=%d revision=%u "
++                   "endpoint_max_msg_size=%u transport_max_msg_size=%u",
++                   s->endpoint_handle, endpoint_online,
++                   s->caps.revision, s->caps.max_msg_size,
++                   virtio_msg_linux_bridge_max_msg_size(s));
++    return true;
++
++out_detach:
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd, VMSG_BRIDGE_IOCTL_DETACH,
++                                        NULL);
++    if (ret < 0) {
++        VIRTIO_MSG_LOG("bridge",
++                       "DETACH after failed attach validation failed: %s",
++                       strerror(errno));
++    }
++
++    return false;
++}
++
++static void virtio_msg_linux_bridge_detach(VirtIOMSGLinuxBridge *s)
++{
++    int ret;
++
++    if (s->call_fd >= 0) {
++        VIRTIO_MSG_LOG("bridge",
++                       "call_fd handler remove reason=detach endpoint=%u "
++                       "call_fd=%d attached=%d state=%d",
++                       s->endpoint_handle, s->call_fd, s->attached,
++                       s->session_state);
++        qemu_set_fd_handler(s->call_fd, NULL, NULL, NULL);
++    }
++    if (s->dev_fd >= 0) {
++        qemu_set_fd_handler(s->dev_fd, NULL, NULL, NULL);
++    }
++
++    virtio_msg_linux_bridge_clear_pending_tx(s);
++    virtio_msg_linux_bridge_clear_map_event_state(s);
++    virtio_msg_linux_bridge_unmap_all(s);
++
++    if (!s->attached || s->dev_fd < 0) {
++        s->attached = false;
++        virtio_msg_linux_bridge_set_state(
++            s, VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_DETACHED);
++        return;
++    }
++
++    ret = virtio_msg_linux_bridge_ioctl(s->dev_fd, VMSG_BRIDGE_IOCTL_DETACH,
++                                        NULL);
++    if (ret < 0) {
++        VIRTIO_MSG_LOG("bridge", "DETACH failed endpoint=%u: %s",
++                       s->endpoint_handle, strerror(errno));
++    } else {
++        VIRTIO_MSG_LOG("bridge", "detached endpoint=%u",
++                       s->endpoint_handle);
++    }
++    s->attached = false;
++    virtio_msg_linux_bridge_set_state(
++        s, VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_DETACHED);
++}
++
++static void virtio_msg_linux_bridge_realize(DeviceState *dev, Error **errp)
++{
++    VirtIOMSGLinuxBridge *s = VIRTIO_MSG_LINUX_BRIDGE(dev);
++
++    if (!s->devnode) {
++        s->devnode = g_strdup(VIRTIO_MSG_LINUX_BRIDGE_DEVNODE_DEFAULT);
++    }
++
++    if (!s->devnode[0]) {
++        VIRTIO_MSG_LOG("bridge", "devnode property is empty");
++        error_setg(errp, "devnode must not be empty");
++        return;
++    }
++
++    if (!virtio_msg_linux_bridge_ring_valid(s->tx_ring_entries,
++                                            s->tx_ring_entry_size)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "invalid tx ring geometry entries=%u entry_size=%u",
++                       s->tx_ring_entries, s->tx_ring_entry_size);
++        error_setg(errp,
++                   "invalid tx ring geometry: entries=%u entry-size=%u",
++                   s->tx_ring_entries, s->tx_ring_entry_size);
++        return;
++    }
++    if (!virtio_msg_linux_bridge_entry_size_matches_vmm_max(
++            s, s->tx_ring_entry_size)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "invalid tx ring entry size=%u for vmm_max_msg_size=%u",
++                       s->tx_ring_entry_size, s->vmm_max_msg_size);
++        error_setg(errp,
++                   "invalid tx ring entry-size=%u for vmm-max-msg-size=%u",
++                   s->tx_ring_entry_size, s->vmm_max_msg_size);
++        return;
++    }
++
++    if (!virtio_msg_linux_bridge_ring_valid(s->rx_ring_entries,
++                                            s->rx_ring_entry_size)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "invalid rx ring geometry entries=%u entry_size=%u",
++                       s->rx_ring_entries, s->rx_ring_entry_size);
++        error_setg(errp,
++                   "invalid rx ring geometry: entries=%u entry-size=%u",
++                   s->rx_ring_entries, s->rx_ring_entry_size);
++        return;
++    }
++    if (!virtio_msg_linux_bridge_entry_size_matches_vmm_max(
++            s, s->rx_ring_entry_size)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "invalid rx ring entry size=%u for vmm_max_msg_size=%u",
++                       s->rx_ring_entry_size, s->vmm_max_msg_size);
++        error_setg(errp,
++                   "invalid rx ring entry-size=%u for vmm-max-msg-size=%u",
++                   s->rx_ring_entry_size, s->vmm_max_msg_size);
++        return;
++    }
++
++    if (!virtio_msg_linux_bridge_compute_ring_layout(s, errp)) {
++        return;
++    }
++
++    virtio_msg_linux_bridge_register_machine_done_notifier(s);
++
++    s->dev_fd = qemu_open(s->devnode, O_RDWR | O_NONBLOCK, errp);
++    if (*errp) {
++        goto out_err;
++    }
++
++    if (!virtio_msg_linux_bridge_parse_endpoint(s, errp)) {
++        goto out_err;
++    }
++
++    if (!virtio_msg_linux_bridge_resolve_endpoint(s, errp)) {
++        goto out_err;
++    }
++
++    if (!virtio_msg_linux_bridge_setup_rings(s, errp)) {
++        goto out_err;
++    }
++
++    if (!virtio_msg_linux_bridge_setup_eventfds(s, errp)) {
++        goto out_err;
++    }
++
++    if (!virtio_msg_linux_bridge_setup_dma_as(s)) {
++        goto out_err;
++    }
++
++    if (!virtio_msg_linux_bridge_attach(s, errp)) {
++        goto out_err;
++    }
++    virtio_msg_linux_bridge_latch_transport_caps(s);
++
++    if (!virtio_msg_linux_bridge_maybe_publish_topology(s, errp)) {
++        goto out_err;
++    }
++
++    if (!virtio_msg_linux_bridge_add_migration_blocker(s, errp)) {
++        goto out_err;
++    }
++
++    VIRTIO_MSG_LOG("bridge",
++                   "realized endpoint=%s handle=%u devnode=%s tx=%ux%u "
++                   "rx=%ux%u",
++                   s->endpoint, s->endpoint_handle, s->devnode,
++                   s->tx_ring_entries, s->tx_ring_entry_size,
++                   s->rx_ring_entries, s->rx_ring_entry_size);
++    return;
++
++out_err:
++    VIRTIO_MSG_LOG("bridge", "realize failed endpoint=%s devnode=%s",
++                   s->endpoint ? s->endpoint : "<null>",
++                   s->devnode ? s->devnode : "<null>");
++    virtio_msg_linux_bridge_release_resources(
++        s, VIRTIO_MSG_LINUX_BRIDGE_RELEASE_REASON_REALIZE_ERROR);
++}
++
++static void virtio_msg_linux_bridge_unrealize(DeviceState *dev)
++{
++    VirtIOMSGLinuxBridge *s = VIRTIO_MSG_LINUX_BRIDGE(dev);
++
++    VIRTIO_MSG_LOG("bridge", "unrealize endpoint=%u", s->endpoint_handle);
++    virtio_msg_linux_bridge_release_resources(
++        s, VIRTIO_MSG_LINUX_BRIDGE_RELEASE_REASON_UNREALIZE);
++}
++
++static void virtio_msg_linux_bridge_process_rx_ring(VirtIOMSGLinuxBridge *s,
++                                                    bool drain_callfd)
++{
++    struct vmsg_bridge_uapi_ring_hdr *hdr;
++    size_t header_size = virtio_msg_header_size();
++
++    if (!s->attached || !s->rings) {
++        return;
++    }
++
++    if (drain_callfd) {
++        virtio_msg_linux_bridge_drain_callfd(s);
++    }
++    if (!virtio_msg_linux_bridge_state_allows_data(s)) {
++        return;
++    }
++
++    hdr = virtio_msg_linux_bridge_ring_hdr(s, &s->rx_ring_info);
++
++    while (true) {
++        VirtIOMSG msg = { 0 };
++        uint32_t prod;
++        uint32_t cons;
++        uint32_t used;
++        uint32_t slot_idx;
++        uint32_t next_cons;
++        uint8_t *entry;
++        uint16_t msg_size;
++        int ret;
++
++        prod = qatomic_load_acquire(&hdr->prod);
++        cons = qatomic_read(&hdr->cons);
++        used = virtio_msg_linux_bridge_ring_used(prod, cons);
++
++        if (used == 0) {
++            return;
++        }
++
++        if (used > s->rx_ring_info.entries) {
++            VIRTIO_MSG_ERROR_LOG("bridge",
++                                 "invalid RX ring occupancy used=%u "
++                                 "entries=%u prod=%u cons=%u",
++                                 used, s->rx_ring_info.entries, prod, cons);
++            virtio_msg_linux_bridge_fail_attach(s);
++            return;
++        }
++
++        slot_idx = virtio_msg_linux_bridge_ring_slot_index(
++            cons, s->rx_ring_info.entries);
++        entry = virtio_msg_linux_bridge_ring_entry(hdr, &s->rx_ring_info,
++                                                   slot_idx);
++        memcpy(&msg, entry, header_size);
++        msg_size = le16_to_cpu(msg.msg_size);
++        next_cons = cons + 1;
++
++        if (!virtio_msg_linux_bridge_msg_size_valid(
++                s, msg_size, s->rx_ring_info.entry_size)) {
++            VIRTIO_MSG_ERROR_LOG("bridge",
++                                 "dropping malformed RX message size=%u "
++                                 "entry_size=%u max=%u",
++                                 msg_size, s->rx_ring_info.entry_size,
++                                 virtio_msg_linux_bridge_max_msg_size(s));
++            qatomic_store_release(&hdr->cons, next_cons);
++            continue;
++        }
++
++        memcpy((uint8_t *)&msg + header_size,
++               entry + header_size,
++               msg_size - header_size);
++        if (msg.type & VIRTIO_MSG_TYPE_BUS) {
++            VIRTIO_MSG_ERROR_LOG("bridge",
++                                 "unexpected RX bus-class traffic msg=%s(0x%x) "
++                                 "dev=%u token=%u",
++                                 virtio_msg_debug_id_to_str(msg.type,
++                                                            msg.msg_id),
++                                 msg.msg_id, msg.dev_num, msg.token);
++            virtio_msg_linux_bridge_fail_attach(s);
++            return;
++        }
++        trace_virtio_msg_linux_bridge_rx_msg(s->endpoint_handle,
++                                             msg.msg_id,
++                                             msg.type,
++                                             le16_to_cpu(msg.dev_num),
++                                             le16_to_cpu(msg.token),
++                                             msg_size);
++        virtio_msg_linux_bridge_log_msg_summary(s, &msg, true);
++        if (msg.msg_id == VIRTIO_MSG_EVENT_AVAIL) {
++            /*
++             * callfd_read() already drains control/map state once before RX,
++             * but a new MAP_EVENT_ADD can arrive after that pass and before
++             * EVENT_AVAIL is dispatched. Re-drain here to narrow that window.
++             */
++            virtio_msg_linux_bridge_process_control_path(s, true);
++            if (!s->attached || !s->rings ||
++                !virtio_msg_linux_bridge_state_allows_data(s)) {
++                return;
++            }
++        }
++        ret = virtio_msg_bus_receive(VIRTIO_MSG_BUS_DEVICE(s), &msg);
++        if (ret == VIRTIO_MSG_ERROR_RETRY) {
++            return;
++        }
++
++        if (ret != VIRTIO_MSG_NO_ERROR) {
++            VIRTIO_MSG_ERROR_LOG("bridge",
++                                 "rx handler returned %d (%s) for msg=%s(0x%x) "
++                                 "dev=%u token=%u",
++                                 ret, virtio_msg_result_to_str(ret),
++                                 virtio_msg_debug_id_to_str(msg.type,
++                                                            msg.msg_id),
++                                 msg.msg_id, msg.dev_num, msg.token);
++        }
++        if (ret != VIRTIO_MSG_NO_ERROR &&
++            virtio_msg_linux_bridge_is_transport_request(&msg)) {
++            int report_ret =
++                virtio_msg_linux_bridge_report_msg_error(s, &msg, ret);
++
++            if (report_ret < 0) {
++                int err = -report_ret;
++
++                if (virtio_msg_linux_bridge_errno_is_transient(err)) {
++                    return;
++                }
++
++                VIRTIO_MSG_ERROR_LOG("bridge",
++                                     "MSG_ERROR report failed msg=%s(0x%x) "
++                                     "dev=%u token=%u: %s",
++                                     virtio_msg_debug_id_to_str(msg.type,
++                                                                msg.msg_id),
++                                     msg.msg_id, msg.dev_num, msg.token,
++                                     strerror(err));
++                if (virtio_msg_linux_bridge_errno_is_terminal(err)) {
++                    virtio_msg_linux_bridge_fail_attach(s);
++                    return;
++                }
++            }
++        }
++        qatomic_store_release(&hdr->cons, next_cons);
++    }
++
++}
++
++static void
++virtio_msg_linux_bridge_process_control_path(VirtIOMSGLinuxBridge *s,
++                                             bool schedule_retry)
++{
++    if (!s->attached || s->dev_fd < 0) {
++        return;
++    }
++
++    if (!virtio_msg_linux_bridge_state_allows_control(s)) {
++        return;
++    }
++
++    while (true) {
++        bool control_progress;
++        bool map_progress = false;
++        bool map_blocked = false;
++
++        if (!s->attached || !virtio_msg_linux_bridge_state_allows_control(s)) {
++            return;
++        }
++
++        control_progress = virtio_msg_linux_bridge_process_one_control_recv(s);
++
++        if (virtio_msg_linux_bridge_process_map_events(s, &map_blocked)) {
++            map_progress = true;
++        }
++        if (map_blocked) {
++            return;
++        }
++
++        if (!control_progress && !map_progress) {
++            if (schedule_retry &&
++                virtio_msg_linux_bridge_can_flush_pending_tx(s)) {
++                virtio_msg_linux_bridge_flush_pending_tx(s, schedule_retry);
++            }
++            return;
++        }
++    }
++}
++
++static void virtio_msg_linux_bridge_process(VirtIOMSGBusDevice *bd)
++{
++    VirtIOMSGLinuxBridge *s = VIRTIO_MSG_LINUX_BRIDGE(bd);
++
++    virtio_msg_linux_bridge_process_control_path(s, true);
++    virtio_msg_linux_bridge_process_rx_ring(s, true);
++    if (virtio_msg_linux_bridge_can_flush_pending_tx(s)) {
++        virtio_msg_linux_bridge_flush_pending_tx(s, true);
++    }
++}
++
++static void virtio_msg_linux_bridge_callfd_read(void *opaque)
++{
++    VirtIOMSGLinuxBridge *s = opaque;
++
++    virtio_msg_linux_bridge_process_control_path(s, true);
++    virtio_msg_linux_bridge_drain_callfd(s);
++    virtio_msg_linux_bridge_process_rx_ring(s, false);
++    if (virtio_msg_linux_bridge_can_flush_pending_tx(s)) {
++        virtio_msg_linux_bridge_flush_pending_tx(s, true);
++    }
++}
++
++static void virtio_msg_linux_bridge_devfd_read(void *opaque)
++{
++    VirtIOMSGLinuxBridge *s = opaque;
++
++    virtio_msg_linux_bridge_process_control_path(s, true);
++    if (virtio_msg_linux_bridge_can_flush_pending_tx(s)) {
++        virtio_msg_linux_bridge_flush_pending_tx(s, true);
++    }
++}
++
++static bool virtio_msg_linux_bridge_queue_pending_tx(VirtIOMSGLinuxBridge *s,
++                                                     const VirtIOMSG *msg)
++{
++    VirtIOMSGLinuxBridgePendingTx *pending;
++
++    pending = g_try_new(VirtIOMSGLinuxBridgePendingTx, 1);
++    if (!pending) {
++        VIRTIO_MSG_LOG("bridge",
++                       "failed to queue pending TX msg=%s(0x%x) dev=%u "
++                       "token=%u: out of memory",
++                       virtio_msg_debug_id_to_str(msg->type, msg->msg_id),
++                       msg->msg_id, le16_to_cpu(msg->dev_num),
++                       le16_to_cpu(msg->token));
++        return false;
++    }
++
++    pending->msg = *msg;
++    QTAILQ_INSERT_TAIL(&s->pending_tx, pending, node);
++    return true;
++}
++
++static void virtio_msg_linux_bridge_clear_pending_tx(VirtIOMSGLinuxBridge *s)
++{
++    VirtIOMSGLinuxBridgePendingTx *pending;
++
++    while ((pending = QTAILQ_FIRST(&s->pending_tx))) {
++        QTAILQ_REMOVE(&s->pending_tx, pending, node);
++        g_free(pending);
++    }
++    virtio_msg_linux_bridge_cancel_pending_tx_retry(s);
++}
++
++static bool virtio_msg_linux_bridge_can_flush_pending_tx(
++    const VirtIOMSGLinuxBridge *s)
++{
++    return virtio_msg_linux_bridge_state_allows_data(s) &&
++        !s->map_ack_pending;
++}
++
++static void virtio_msg_linux_bridge_schedule_pending_tx_retry(
++    VirtIOMSGLinuxBridge *s)
++{
++    int64_t now;
++
++    if (!s->pending_tx_retry_timer) {
++        return;
++    }
++
++    if (!s->attached || !virtio_msg_linux_bridge_state_allows_data(s) ||
++        QTAILQ_EMPTY(&s->pending_tx)) {
++        return;
++    }
++
++    if (!s->pending_tx_retry_delay_ms) {
++        s->pending_tx_retry_delay_ms = 1;
++    }
++
++    now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    timer_mod_anticipate(s->pending_tx_retry_timer,
++                         now + s->pending_tx_retry_delay_ms);
++}
++
++static void virtio_msg_linux_bridge_cancel_pending_tx_retry(
++    VirtIOMSGLinuxBridge *s)
++{
++    if (!s->pending_tx_retry_timer) {
++        return;
++    }
++
++    timer_del(s->pending_tx_retry_timer);
++    s->pending_tx_retry_delay_ms = 1;
++}
++
++static void virtio_msg_linux_bridge_pending_tx_retry_cb(void *opaque)
++{
++    VirtIOMSGLinuxBridge *s = opaque;
++    bool progress = false;
++
++    if (!s->attached || !virtio_msg_linux_bridge_state_allows_data(s)) {
++        virtio_msg_linux_bridge_cancel_pending_tx_retry(s);
++        return;
++    }
++
++    virtio_msg_linux_bridge_process_control_path(s, false);
++    if (virtio_msg_linux_bridge_can_flush_pending_tx(s)) {
++        progress = virtio_msg_linux_bridge_flush_pending_tx(s, false);
++    }
++
++    if (!QTAILQ_EMPTY(&s->pending_tx) && s->attached &&
++        virtio_msg_linux_bridge_state_allows_data(s)) {
++        if (!progress) {
++            if (!s->pending_tx_retry_delay_ms) {
++                s->pending_tx_retry_delay_ms = 1;
++            } else if (s->pending_tx_retry_delay_ms < 64) {
++                s->pending_tx_retry_delay_ms =
++                    MIN(s->pending_tx_retry_delay_ms * 2, 64U);
++            }
++        }
++        virtio_msg_linux_bridge_schedule_pending_tx_retry(s);
++        return;
++    }
++
++    virtio_msg_linux_bridge_cancel_pending_tx_retry(s);
++}
++
++static int virtio_msg_linux_bridge_send(VirtIOMSGBusDevice *bd,
++                                        VirtIOMSG *msg_req)
++{
++    VirtIOMSGLinuxBridge *s = VIRTIO_MSG_LINUX_BRIDGE(bd);
++    struct vmsg_bridge_uapi_ring_hdr *hdr;
++    uint16_t msg_size = le16_to_cpu(msg_req->msg_size);
++    uint32_t prod;
++    uint32_t cons;
++    uint32_t used;
++    uint32_t slot_idx;
++    uint8_t *entry;
++
++    if (!s->attached || !s->rings) {
++        VIRTIO_MSG_ERROR_LOG("bridge", "TX while bridge is detached");
++        return VIRTIO_MSG_ERROR_MEMORY;
++    }
++
++    if (!virtio_msg_linux_bridge_state_allows_data(s)) {
++        VIRTIO_MSG_ERROR_LOG("bridge", "TX while endpoint=%u is not active",
++                             s->endpoint_handle);
++        return VIRTIO_MSG_ERROR_RETRY;
++    }
++
++    if (msg_req->type & VIRTIO_MSG_TYPE_BUS) {
++        VIRTIO_MSG_ERROR_LOG("bridge",
++                             "reject TX bus-class frame msg=%s(0x%x) "
++                             "dev=%u token=%u",
++                             virtio_msg_debug_id_to_str(msg_req->type,
++                                                        msg_req->msg_id),
++                             msg_req->msg_id, le16_to_cpu(msg_req->dev_num),
++                             le16_to_cpu(msg_req->token));
++        return VIRTIO_MSG_ERROR_BAD_MESSAGE;
++    }
++
++    if (!virtio_msg_linux_bridge_msg_size_valid(s, msg_size,
++                                                s->tx_ring_info.entry_size)) {
++        VIRTIO_MSG_ERROR_LOG("bridge",
++                             "reject TX msg=%s(0x%x) size=%u entry_size=%u "
++                             "max=%u",
++                             virtio_msg_debug_id_to_str(msg_req->type,
++                                                        msg_req->msg_id),
++                             msg_req->msg_id, msg_size,
++                             s->tx_ring_info.entry_size,
++                             virtio_msg_linux_bridge_max_msg_size(s));
++        return VIRTIO_MSG_ERROR_BAD_MESSAGE;
++    }
++    trace_virtio_msg_linux_bridge_tx_msg(s->endpoint_handle,
++                                         msg_req->msg_id,
++                                         msg_req->type,
++                                         le16_to_cpu(msg_req->dev_num),
++                                         le16_to_cpu(msg_req->token),
++                                         msg_size);
++    virtio_msg_linux_bridge_log_msg_summary(s, msg_req, false);
++
++    hdr = virtio_msg_linux_bridge_ring_hdr(s, &s->tx_ring_info);
++    prod = qatomic_read(&hdr->prod);
++    cons = qatomic_load_acquire(&hdr->cons);
++    used = virtio_msg_linux_bridge_ring_used(prod, cons);
++
++    if (used > s->tx_ring_info.entries) {
++        VIRTIO_MSG_ERROR_LOG("bridge",
++                             "invalid TX ring occupancy used=%u entries=%u "
++                             "prod=%u cons=%u",
++                             used, s->tx_ring_info.entries, prod, cons);
++        virtio_msg_linux_bridge_fail_attach(s);
++        return VIRTIO_MSG_ERROR_NO_DEVICE;
++    }
++
++    if (used == s->tx_ring_info.entries) {
++        return VIRTIO_MSG_ERROR_RETRY;
++    }
++
++    slot_idx = virtio_msg_linux_bridge_ring_slot_index(
++        prod, s->tx_ring_info.entries);
++    entry = virtio_msg_linux_bridge_ring_entry(hdr, &s->tx_ring_info, slot_idx);
++    memcpy(entry, msg_req, msg_size);
++
++    qatomic_store_release(&hdr->prod, prod + 1);
++
++    virtio_msg_linux_bridge_kick(s);
++    return VIRTIO_MSG_NO_ERROR;
++}
++
++static bool virtio_msg_linux_bridge_flush_pending_tx(VirtIOMSGLinuxBridge *s,
++                                                     bool schedule_retry)
++{
++    VirtIOMSGLinuxBridgePendingTx *pending;
++    bool progress = false;
++
++    while ((pending = QTAILQ_FIRST(&s->pending_tx))) {
++        int ret = virtio_msg_linux_bridge_send(VIRTIO_MSG_BUS_DEVICE(s),
++                                               &pending->msg);
++
++        if (ret == VIRTIO_MSG_NO_ERROR) {
++            QTAILQ_REMOVE(&s->pending_tx, pending, node);
++            g_free(pending);
++            s->pending_tx_retry_delay_ms = 1;
++            progress = true;
++            continue;
++        }
++
++        /*
++         * send() may have triggered a terminal detach path that clears the
++         * pending queue (including this node). Do not dereference or free a
++         * potentially stale pointer in that case.
++         */
++        if (!s->attached || QTAILQ_EMPTY(&s->pending_tx) ||
++            pending != QTAILQ_FIRST(&s->pending_tx)) {
++            return progress;
++        }
++
++        if (ret == VIRTIO_MSG_ERROR_RETRY) {
++            if (schedule_retry) {
++                virtio_msg_linux_bridge_schedule_pending_tx_retry(s);
++            }
++            return progress;
++        }
++
++        VIRTIO_MSG_LOG("bridge",
++                       "dropping queued TX msg=%s(0x%x) dev=%u token=%u "
++                       "ret=%d (%s)",
++                       virtio_msg_debug_id_to_str(pending->msg.type,
++                                                  pending->msg.msg_id),
++                       pending->msg.msg_id,
++                       le16_to_cpu(pending->msg.dev_num),
++                       le16_to_cpu(pending->msg.token), ret,
++                       virtio_msg_result_to_str(ret));
++        QTAILQ_REMOVE(&s->pending_tx, pending, node);
++        g_free(pending);
++    }
++
++    if (QTAILQ_EMPTY(&s->pending_tx)) {
++        virtio_msg_linux_bridge_cancel_pending_tx_retry(s);
++    }
++
++    return progress;
++}
++
++static int virtio_msg_linux_bridge_send_must_deliver(VirtIOMSGBusDevice *bd,
++                                                     VirtIOMSG *msg_req)
++{
++    VirtIOMSGLinuxBridge *s = VIRTIO_MSG_LINUX_BRIDGE(bd);
++    uint16_t msg_size = le16_to_cpu(msg_req->msg_size);
++    int ret;
++
++    if (!s->attached || !s->rings) {
++        VIRTIO_MSG_LOG("bridge", "must-deliver TX while bridge is detached");
++        return VIRTIO_MSG_ERROR_MEMORY;
++    }
++
++    if (!virtio_msg_linux_bridge_state_allows_data(s)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "must-deliver TX while endpoint=%u is not active",
++                       s->endpoint_handle);
++        return VIRTIO_MSG_ERROR_RETRY;
++    }
++
++    if (msg_req->type & VIRTIO_MSG_TYPE_BUS) {
++        VIRTIO_MSG_LOG("bridge",
++                       "reject must-deliver TX bus-class frame msg=%s(0x%x) "
++                       "dev=%u token=%u",
++                       virtio_msg_debug_id_to_str(msg_req->type,
++                                                  msg_req->msg_id),
++                       msg_req->msg_id, le16_to_cpu(msg_req->dev_num),
++                       le16_to_cpu(msg_req->token));
++        return VIRTIO_MSG_ERROR_BAD_MESSAGE;
++    }
++
++    if (!virtio_msg_linux_bridge_msg_size_valid(s, msg_size,
++                                                s->tx_ring_info.entry_size)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "reject must-deliver TX msg=%s(0x%x) size=%u "
++                       "entry_size=%u max=%u",
++                       virtio_msg_debug_id_to_str(msg_req->type,
++                                                  msg_req->msg_id),
++                       msg_req->msg_id, msg_size,
++                       s->tx_ring_info.entry_size,
++                       virtio_msg_linux_bridge_max_msg_size(s));
++        return VIRTIO_MSG_ERROR_BAD_MESSAGE;
++    }
++
++    if (!QTAILQ_EMPTY(&s->pending_tx)) {
++        if (!virtio_msg_linux_bridge_queue_pending_tx(s, msg_req)) {
++            VIRTIO_MSG_LOG("bridge",
++                           "must-deliver TX queueing failed for msg=%s(0x%x)",
++                           virtio_msg_debug_id_to_str(msg_req->type,
++                                                      msg_req->msg_id),
++                           msg_req->msg_id);
++            return VIRTIO_MSG_ERROR_MEMORY;
++        }
++        virtio_msg_linux_bridge_schedule_pending_tx_retry(s);
++        return VIRTIO_MSG_NO_ERROR;
++    }
++
++    ret = virtio_msg_linux_bridge_send(bd, msg_req);
++    if (ret != VIRTIO_MSG_ERROR_RETRY) {
++        return ret;
++    }
++
++    if (!virtio_msg_linux_bridge_queue_pending_tx(s, msg_req)) {
++        VIRTIO_MSG_LOG("bridge",
++                       "must-deliver TX retry queueing failed for msg=%s(0x%x)",
++                       virtio_msg_debug_id_to_str(msg_req->type,
++                                                  msg_req->msg_id),
++                       msg_req->msg_id);
++        return VIRTIO_MSG_ERROR_MEMORY;
++    }
++    virtio_msg_linux_bridge_schedule_pending_tx_retry(s);
++    return VIRTIO_MSG_NO_ERROR;
++}
++
++static const Property virtio_msg_linux_bridge_properties[] = {
++    DEFINE_PROP_STRING("endpoint", VirtIOMSGLinuxBridge, endpoint),
++    DEFINE_PROP_BOOL("create-endpoint", VirtIOMSGLinuxBridge,
++                     create_endpoint, false),
++    DEFINE_PROP_STRING("devnode", VirtIOMSGLinuxBridge, devnode),
++    DEFINE_PROP_UINT32("vmm-max-msg-size", VirtIOMSGLinuxBridge,
++                       vmm_max_msg_size,
++                       VIRTIO_MSG_MAX_SIZE),
++    DEFINE_PROP_UINT32("tx-ring-entries", VirtIOMSGLinuxBridge,
++                       tx_ring_entries,
++                       VIRTIO_MSG_LINUX_BRIDGE_RING_ENTRIES_DEFAULT),
++    DEFINE_PROP_UINT32("tx-ring-entry-size", VirtIOMSGLinuxBridge,
++                       tx_ring_entry_size,
++                       VIRTIO_MSG_LINUX_BRIDGE_RING_ENTRY_SIZE_DEFAULT),
++    DEFINE_PROP_UINT32("rx-ring-entries", VirtIOMSGLinuxBridge,
++                       rx_ring_entries,
++                       VIRTIO_MSG_LINUX_BRIDGE_RING_ENTRIES_DEFAULT),
++    DEFINE_PROP_UINT32("rx-ring-entry-size", VirtIOMSGLinuxBridge,
++                       rx_ring_entry_size,
++                       VIRTIO_MSG_LINUX_BRIDGE_RING_ENTRY_SIZE_DEFAULT),
++};
++
++static void virtio_msg_linux_bridge_finalize(Object *obj)
++{
++    VirtIOMSGLinuxBridge *s = VIRTIO_MSG_LINUX_BRIDGE(obj);
++
++    virtio_msg_linux_bridge_clear_pending_tx(s);
++    virtio_msg_linux_bridge_cancel_topology_retry(s);
++    timer_free(s->topology_retry_timer);
++    s->topology_retry_timer = NULL;
++    virtio_msg_linux_bridge_cancel_pending_tx_retry(s);
++    timer_free(s->pending_tx_retry_timer);
++    s->pending_tx_retry_timer = NULL;
++    qemu_mutex_destroy(&s->map_lock);
++    g_free(s->endpoint);
++    g_free(s->devnode);
++}
++
++static void virtio_msg_linux_bridge_init(Object *obj)
++{
++    VirtIOMSGLinuxBridge *s = VIRTIO_MSG_LINUX_BRIDGE(obj);
++
++    s->dev_fd = -1;
++    s->ring_fd = -1;
++    s->kick_fd = -1;
++    s->call_fd = -1;
++    s->machine_done.notify = NULL;
++    s->machine_ready = false;
++    s->dma_as_initialized = false;
++    qemu_mutex_init(&s->map_lock);
++    QTAILQ_INIT(&s->map_entries);
++    s->map_last_covering = NULL;
++    s->map_use_seq = 0;
++    s->migration_blocker = NULL;
++    s->endpoint_handle = 0;
++    s->endpoint_resolved = false;
++    s->map_ack_pending = false;
++    s->map_ack_seq = 0;
++    s->map_ack_type = 0;
++    s->map_ack_status = 0;
++    QTAILQ_INIT(&s->pending_tx);
++    s->topology_retry_delay_ms =
++        VIRTIO_MSG_LINUX_BRIDGE_TOPOLOGY_RETRY_DELAY_MIN_MS;
++    s->topology_retry_failures = 0;
++    s->topology_retry_timer =
++        timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                     virtio_msg_linux_bridge_topology_retry_cb, s);
++    s->pending_tx_retry_delay_ms = 1;
++    s->pending_tx_retry_timer =
++        timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                     virtio_msg_linux_bridge_pending_tx_retry_cb, s);
++    virtio_msg_linux_bridge_set_state(
++        s, VIRTIO_MSG_LINUX_BRIDGE_SESSION_STATE_DETACHED);
++    virtio_msg_linux_bridge_reset_transport_caps(s);
++}
++
++static void virtio_msg_linux_bridge_class_init(ObjectClass *klass,
++                                               const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    VirtIOMSGBusDeviceClass *bdc = VIRTIO_MSG_BUS_DEVICE_CLASS(klass);
++
++    device_class_set_props(dc, virtio_msg_linux_bridge_properties);
++    dc->desc = "virtio-msg Linux bridge backend";
++    dc->realize = virtio_msg_linux_bridge_realize;
++    dc->unrealize = virtio_msg_linux_bridge_unrealize;
++
++    bdc->process = virtio_msg_linux_bridge_process;
++    bdc->send = virtio_msg_linux_bridge_send;
++    bdc->send_must_deliver = virtio_msg_linux_bridge_send_must_deliver;
++    bdc->get_transport_caps = virtio_msg_linux_bridge_fill_transport_caps;
++}
++
++static const TypeInfo virtio_msg_linux_bridge_type_info = {
++    .name = TYPE_VIRTIO_MSG_LINUX_BRIDGE,
++    .parent = TYPE_VIRTIO_MSG_BUS_DEVICE,
++    .instance_size = sizeof(VirtIOMSGLinuxBridge),
++    .instance_init = virtio_msg_linux_bridge_init,
++    .instance_finalize = virtio_msg_linux_bridge_finalize,
++    .class_init = virtio_msg_linux_bridge_class_init,
++};
++
++static void virtio_msg_linux_bridge_register_types(void)
++{
++    type_register_static(&virtio_msg_linux_bridge_type_info);
++}
++
++type_init(virtio_msg_linux_bridge_register_types)
+diff --git a/include/hw/virtio/virtio-msg-prot.h b/include/hw/virtio/virtio-msg-prot.h
+index 26adc7aa6820..6fb18f2d0706 100644
+--- a/include/hw/virtio/virtio-msg-prot.h
++++ b/include/hw/virtio/virtio-msg-prot.h
+@@ -907,6 +907,8 @@ static inline const char *virtio_msg_id_to_str(uint8_t type, uint8_t msg_id)
+     };
+     static const char *bus_type2str[VIRTIO_MSG_MAX + 1] = {
+         VIRTIO_MSG_TYPE2STR(BUS_GET_DEVICES),
++        VIRTIO_MSG_TYPE2STR(BUS_PING),
++        VIRTIO_MSG_TYPE2STR(BUS_EVENT_DEVICE),
+     };
+ 
+     if (type & VIRTIO_MSG_TYPE_BUS) {
+diff --git a/include/hw/virtio/virtio-msg.h b/include/hw/virtio/virtio-msg.h
+index 9c855dd5690f..e57cc2d21c97 100644
+--- a/include/hw/virtio/virtio-msg.h
++++ b/include/hw/virtio/virtio-msg.h
+@@ -10,6 +10,7 @@
+ #ifndef HW_VIRTIO_MSG_H
+ #define HW_VIRTIO_MSG_H
+ 
++#include "qemu/log.h"
+ #include "hw/core/sysbus.h"
+ #include "hw/virtio/virtio-bus.h"
+ #include "hw/virtio/virtio-msg-bus.h"
+@@ -28,6 +29,133 @@ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMSGDev, VIRTIO_MSG_DEV)
+ #define TYPE_VIRTIO_MSG "virtio-msg"
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOMSGProxy, VIRTIO_MSG)
+ 
++/*
++ * Keep this enabled to route virtio-msg diagnostics through LOG_GUEST_ERROR,
++ * which makes them visible with "-d guest_errors". Comment it out while
++ * debugging to print the same diagnostics to stderr without requiring -d.
++ */
++#define VIRTIO_MSG_DEBUG_GUEST_ERRORS_ONLY 1
++
++/*
++ * Compile-time virtio-msg log subject switches.
++ */
++#define VIRTIO_MSG_LOG_EVENT 1
++#define VIRTIO_MSG_LOG_MAP_CTL 1
++#define VIRTIO_MSG_LOG_MAP_LIFE 1
++#define VIRTIO_MSG_LOG_DMA 0
++#define VIRTIO_MSG_LOG_FLOW 0
++#define VIRTIO_MSG_LOG_ERROR 1
++
++static inline const char *virtio_msg_result_to_str(int ret)
++{
++    switch (ret) {
++    case VIRTIO_MSG_NO_ERROR:
++        return "NO_ERROR";
++    case VIRTIO_MSG_ERROR_RETRY:
++        return "RETRY";
++    case VIRTIO_MSG_ERROR_TIMEOUT:
++        return "TIMEOUT";
++    case VIRTIO_MSG_ERROR_UNSUPPORTED_MESSAGE_ID:
++        return "UNSUPPORTED_MESSAGE_ID";
++    case VIRTIO_MSG_ERROR_BAD_MESSAGE:
++        return "BAD_MESSAGE";
++    case VIRTIO_MSG_ERROR_NO_DEVICE:
++        return "NO_DEVICE";
++    case VIRTIO_MSG_ERROR_MEMORY:
++        return "MEMORY";
++    default:
++        return "UNKNOWN";
++    }
++}
++
++static inline const char *virtio_msg_debug_id_to_str(uint8_t type,
++                                                      uint8_t msg_id)
++{
++    const char *name = NULL;
++
++    if (msg_id <= VIRTIO_MSG_MAX) {
++        name = virtio_msg_id_to_str(type, msg_id);
++    }
++
++    return name ? name : "UNKNOWN";
++}
++
++static inline G_GNUC_PRINTF(2, 3)
++void virtio_msg_debug_log_impl(const char *scope, const char *fmt, ...)
++{
++    va_list ap;
++    char *msg;
++
++    va_start(ap, fmt);
++    msg = g_strdup_vprintf(fmt, ap);
++    va_end(ap);
++
++#ifdef VIRTIO_MSG_DEBUG_GUEST_ERRORS_ONLY
++    qemu_log_mask(LOG_GUEST_ERROR, "virtio-msg/%s: %s\n", scope, msg);
++#else
++    fprintf(stderr, "virtio-msg/%s: %s\n", scope, msg);
++#endif
++
++    g_free(msg);
++}
++
++#define VIRTIO_MSG_LOG(_scope, _fmt, ...)                                    \
++    virtio_msg_debug_log_impl((_scope), "%s: " _fmt, __func__,               \
++                              ##__VA_ARGS__)
++
++#define VIRTIO_MSG_LOG_MSG(_scope, _dir, _msg)                               \
++    virtio_msg_debug_log_impl(                                                \
++        (_scope),                                                             \
++        "%s: %s msg=%s(0x%x) type=0x%x dev=%u token=%u size=%u",             \
++        __func__, (_dir),                                                     \
++        virtio_msg_debug_id_to_str((_msg)->type, (_msg)->msg_id),            \
++        (_msg)->msg_id, (_msg)->type, le16_to_cpu((_msg)->dev_num),          \
++        le16_to_cpu((_msg)->token), le16_to_cpu((_msg)->msg_size))
++
++#if VIRTIO_MSG_LOG_EVENT
++#define VIRTIO_MSG_EVENT_LOG(_scope, _fmt, ...)                              \
++    VIRTIO_MSG_LOG((_scope), "[event] " _fmt, ##__VA_ARGS__)
++#define VIRTIO_MSG_EVENT_LOG_MSG(_scope, _dir, _msg)                         \
++    VIRTIO_MSG_LOG_MSG((_scope), "[event] " _dir, (_msg))
++#else
++#define VIRTIO_MSG_EVENT_LOG(_scope, _fmt, ...) do { } while (0)
++#define VIRTIO_MSG_EVENT_LOG_MSG(_scope, _dir, _msg) do { } while (0)
++#endif
++
++#if VIRTIO_MSG_LOG_MAP_CTL
++#define VIRTIO_MSG_MAP_CTL_LOG(_scope, _fmt, ...)                            \
++    VIRTIO_MSG_LOG((_scope), "[map_ctl] " _fmt, ##__VA_ARGS__)
++#else
++#define VIRTIO_MSG_MAP_CTL_LOG(_scope, _fmt, ...) do { } while (0)
++#endif
++
++#if VIRTIO_MSG_LOG_MAP_LIFE
++#define VIRTIO_MSG_MAP_LIFE_LOG(_scope, _fmt, ...)                           \
++    VIRTIO_MSG_LOG((_scope), "[map_life] " _fmt, ##__VA_ARGS__)
++#else
++#define VIRTIO_MSG_MAP_LIFE_LOG(_scope, _fmt, ...) do { } while (0)
++#endif
++
++#if VIRTIO_MSG_LOG_DMA
++#define VIRTIO_MSG_DMA_LOG(_scope, _fmt, ...)                                \
++    VIRTIO_MSG_LOG((_scope), "[dma] " _fmt, ##__VA_ARGS__)
++#else
++#define VIRTIO_MSG_DMA_LOG(_scope, _fmt, ...) do { } while (0)
++#endif
++
++#if VIRTIO_MSG_LOG_FLOW
++#define VIRTIO_MSG_FLOW_LOG(_scope, _fmt, ...)                               \
++    VIRTIO_MSG_LOG((_scope), "[flow] " _fmt, ##__VA_ARGS__)
++#else
++#define VIRTIO_MSG_FLOW_LOG(_scope, _fmt, ...) do { } while (0)
++#endif
++
++#if VIRTIO_MSG_LOG_ERROR
++#define VIRTIO_MSG_ERROR_LOG(_scope, _fmt, ...)                              \
++    VIRTIO_MSG_LOG((_scope), "[error] " _fmt, ##__VA_ARGS__)
++#else
++#define VIRTIO_MSG_ERROR_LOG(_scope, _fmt, ...) do { } while (0)
++#endif
+ struct VirtIOMSGDev {
+     DeviceState parent_obj;
+ 
+-- 
+2.53.0
+

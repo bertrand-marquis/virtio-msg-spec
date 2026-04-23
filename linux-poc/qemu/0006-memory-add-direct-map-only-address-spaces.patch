@@ -1,0 +1,67 @@
+From ad357bfd3dd486e8c833863a918ad7099b21c49e Mon Sep 17 00:00:00 2001
+Message-ID: <ad357bfd3dd486e8c833863a918ad7099b21c49e.1776946505.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Wed, 8 Apr 2026 17:02:58 +0200
+Subject: [RFC PATCH 06/28] memory: add direct-map-only address spaces
+
+Add a direct-map-only flag to AddressSpace and provide a setter for
+callers that must reject bounce-buffer fallbacks.
+
+Initialize the flag to false so existing address spaces keep their
+current behavior until explicitly opted in.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ include/system/memory.h | 2 ++
+ system/memory.c         | 6 ++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/include/system/memory.h b/include/system/memory.h
+index 3a2bbe1cd53b..413c8cb51c79 100644
+--- a/include/system/memory.h
++++ b/include/system/memory.h
+@@ -1190,6 +1190,7 @@ struct AddressSpace {
+      * or concurrent DMA requests having claimed too much buffer space) will be
+      * rejected and left to the caller to handle.
+      */
++    bool direct_map_only;
+     size_t max_bounce_buffer_size;
+     /* Total size of bounce buffers currently allocated, atomically accessed */
+     size_t bounce_buffer_size;
+@@ -2713,6 +2714,7 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
+  *        output.
+  */
+ void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name);
++void address_space_set_direct_map_only(AddressSpace *as, bool direct_only);
+ 
+ /**
+  * address_space_destroy: destroy an address space
+diff --git a/system/memory.c b/system/memory.c
+index 9b4c5a7a48de..2484eeaf90b6 100644
+--- a/system/memory.c
++++ b/system/memory.c
+@@ -3257,6 +3257,7 @@ void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
+     as->ioeventfds = NULL;
+     QTAILQ_INIT(&as->listeners);
+     QTAILQ_INSERT_TAIL(&address_spaces, as, address_spaces_link);
++    as->direct_map_only = false;
+     as->max_bounce_buffer_size = DEFAULT_MAX_BOUNCE_BUFFER_SIZE;
+     as->bounce_buffer_size = 0;
+     qemu_mutex_init(&as->map_client_list_lock);
+@@ -3266,6 +3267,11 @@ void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
+     address_space_update_ioeventfds(as);
+ }
+ 
++void address_space_set_direct_map_only(AddressSpace *as, bool direct_only)
++{
++    as->direct_map_only = direct_only;
++}
++
+ static void do_address_space_destroy(AddressSpace *as)
+ {
+     assert(qatomic_read(&as->bounce_buffer_size) == 0);
+-- 
+2.53.0
+

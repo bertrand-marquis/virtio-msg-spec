@@ -1,0 +1,67 @@
+From 55d56a174a0f04520d4a1558630bb0b739074b13 Mon Sep 17 00:00:00 2001
+Message-ID: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From: "Edgar E. Iglesias" <edgar.iglesias@amd.com>
+Date: Tue, 26 Aug 2025 16:06:18 +0200
+Subject: [RFC PATCH 01/28] virtio: Add virtio_queue_get_rings
+
+Signed-off-by: Edgar E. Iglesias <edgar.iglesias@amd.com>
+---
+ hw/virtio/virtio.c         | 16 ++++++++++++++++
+ include/hw/virtio/virtio.h | 14 ++++++++++++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index e9d553295257..00d387ba05a0 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -2402,6 +2402,22 @@ void virtio_queue_set_rings(VirtIODevice *vdev, int n, hwaddr desc,
+     virtio_init_region_cache(vdev, n);
+ }
+ 
++void virtio_queue_get_rings(VirtIODevice *vdev, int n, hwaddr *desc,
++                            hwaddr *avail, hwaddr *used)
++{
++    assert(vdev->vq[n].vring.num);
++
++    if (desc) {
++        *desc = vdev->vq[n].vring.desc;
++    }
++    if (avail) {
++        *avail = vdev->vq[n].vring.avail;
++    }
++    if (used) {
++        *used = vdev->vq[n].vring.used;
++    }
++}
++
+ void virtio_queue_set_num(VirtIODevice *vdev, int n, int num)
+ {
+     /* Don't allow guest to flip queue between existent and
+diff --git a/include/hw/virtio/virtio.h b/include/hw/virtio/virtio.h
+index 9dd93cf965ae..3a24d109fb74 100644
+--- a/include/hw/virtio/virtio.h
++++ b/include/hw/virtio/virtio.h
+@@ -361,6 +361,20 @@ int virtio_queue_get_max_num(VirtIODevice *vdev, int n);
+ int virtio_get_num_queues(VirtIODevice *vdev);
+ void virtio_queue_set_rings(VirtIODevice *vdev, int n, hwaddr desc,
+                             hwaddr avail, hwaddr used);
++/**
++ * virtio_queue_get_rings() - read ring addresses for a virtqueue
++ * @vdev: the virtio device
++ * @n: queue index
++ * @desc: optional pointer for the descriptor ring address
++ * @avail: optional pointer for the available ring address
++ * @used: optional pointer for the used ring address
++ *
++ * Returns the ring addresses configured for queue @n. The queue must
++ * be initialized (non-zero size); passing NULL for any output argument
++ * skips that address.
++ */
++void virtio_queue_get_rings(VirtIODevice *vdev, int n, hwaddr *desc,
++                            hwaddr *avail, hwaddr *used);
+ void virtio_queue_update_rings(VirtIODevice *vdev, int n);
+ void virtio_init_region_cache(VirtIODevice *vdev, int n);
+ void virtio_queue_set_align(VirtIODevice *vdev, int n, int align);
+-- 
+2.53.0
+
