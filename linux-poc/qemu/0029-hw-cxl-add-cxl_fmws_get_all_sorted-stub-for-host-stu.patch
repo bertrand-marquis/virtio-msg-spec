@@ -1,10 +1,10 @@
-From a5a8cad34179f5eb399bd9e73d7b3be3b910e4c3 Mon Sep 17 00:00:00 2001
-Message-ID: <a5a8cad34179f5eb399bd9e73d7b3be3b910e4c3.1776946505.git.bertrand.marquis@arm.com>
-In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
-References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From 1b8012ee8389265ae4539b0573263f2f6f8ae632 Mon Sep 17 00:00:00 2001
+Message-ID: <1b8012ee8389265ae4539b0573263f2f6f8ae632.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
 From: Bertrand Marquis <bertrand.marquis@arm.com>
 Date: Thu, 16 Apr 2026 19:30:47 +0200
-Subject: [RFC PATCH 27/28] hw/cxl: add cxl_fmws_get_all_sorted() stub for host
+Subject: [PATCH 29/30] hw/cxl: add cxl_fmws_get_all_sorted() stub for host
  stubs build
 
 Add the host-stubs build helper needed in hw/cxl.

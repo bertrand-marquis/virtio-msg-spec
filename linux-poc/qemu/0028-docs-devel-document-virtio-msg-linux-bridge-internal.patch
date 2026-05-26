@@ -1,0 +1,632 @@
+From f7b49b9e3be3461a9666adc277eb1a4425ecd885 Mon Sep 17 00:00:00 2001
+Message-ID: <f7b49b9e3be3461a9666adc277eb1a4425ecd885.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Thu, 16 Apr 2026 19:30:47 +0200
+Subject: [PATCH 28/30] docs/devel: document virtio-msg linux bridge internals
+
+Add maintainer-facing documentation for the bridge internals.
+
+Keep the patch as pure devel documentation after the system docs step.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ docs/devel/index-internals.rst         |   1 +
+ docs/devel/virtio-msg-linux-bridge.rst | 593 +++++++++++++++++++++++++
+ 2 files changed, 594 insertions(+)
+ create mode 100644 docs/devel/virtio-msg-linux-bridge.rst
+
+diff --git a/docs/devel/index-internals.rst b/docs/devel/index-internals.rst
+index 7a0678cbdd3a..0a8ab597baaf 100644
+--- a/docs/devel/index-internals.rst
++++ b/docs/devel/index-internals.rst
+@@ -24,5 +24,6 @@ Details about QEMU's various subsystems including how to add features to them.
+    vfio-iommufd
+    writing-monitor-commands
+    virtio-backends
++   virtio-msg-linux-bridge
+    crypto
+    multiple-iothreads
+diff --git a/docs/devel/virtio-msg-linux-bridge.rst b/docs/devel/virtio-msg-linux-bridge.rst
+new file mode 100644
+index 000000000000..ea34848774d2
+--- /dev/null
++++ b/docs/devel/virtio-msg-linux-bridge.rst
+@@ -0,0 +1,593 @@
++.. SPDX-License-Identifier: GPL-2.0-or-later
++
++Virtio-msg Linux Bridge Internals
++=================================
++
++This document describes implementation details of the QEMU
++``virtio-msg-linux-bridge`` backend.
++
++For user-facing command-line usage, see:
++
++- :doc:`../system/devices/virtio/virtio-msg-linux-bridge`
++
++Scope
++-----
++
++The Linux bridge backend connects the ``virtio-msg`` transport core to the
++host kernel bridge UAPI (``/dev/virtio-msg-bridge``) using:
++
++- synchronous ioctls for endpoint resolution, attach, detach, and release
++- shared TX/RX rings for transport traffic and bridge-local runtime control
++- eventfds for kick/call notifications
++
++QOM Model
++---------
++
++The backend supports two compositions:
++
++- ``virtio-msg-linux-bridge-transport`` (recommended for CLI use)
++  A ``TYPE_SYS_BUS_DEVICE`` container that creates an outer bus, a
++  ``virtio-msg`` proxy, and an internal ``virtio-msg-linux-bridge``
++  backend. The transport parent fixes default ring geometry to
++  256 entries with 128-byte slots (the aligned ``VIRTIO_MSG_MAX_SIZE``
++  default) and passes that value as ``vmm-max-msg-size``.
++- ``virtio-msg-linux-bridge`` (standalone backend)
++  Attaches to an already existing ``virtio-msg`` object. Ring entry-size
++  validation is keyed to the backend's stored ``vmm-max-msg-size`` property.
++
++The backend itself derives from ``TYPE_VIRTIO_MSG_BUS_DEVICE`` and provides
++transport callbacks used by ``virtio-msg`` core.
++
++Realize and Attach Lifecycle
++----------------------------
++
++At realize time, the backend:
++
++1. Validates endpoint and ring geometry properties.
++2. Opens the bridge device node.
++3. Resolves endpoint string to a bridge endpoint handle
++   (``RESOLVE_F_CREATE`` only when ``create-endpoint=on``).
++4. Allocates shared ring backing and eventfds.
++5. Initializes the direct-map-only DMA address space and provisional transport
++   capabilities needed for command-line child device pre-plug.
++6. Marks the first host attach as pending.
++7. Installs a migration blocker.
++
++The first host attach is reset-exit work, after QEMU's initial cold reset. The
++backend issues ``ATTACH`` with ring/eventfd descriptors plus the attach-epoch
++``vmm_max_msg_size`` input, latches the attach snapshot (revision and feature
++bitmaps), seeds endpoint-scoped max-message state when the attach snapshot is
++online, registers the ``call_fd`` handler used to drain the RX ring and retry
++pending TX work, and, when the attached endpoint is already online, refreshes
++proxy transport capabilities and publishes topology.
++
++Unrealize performs the reverse sequence: unregister handlers, detach,
++release endpoint, unmap mapped areas, close fds, and remove the migration
++blocker.
++
++Teardown and Reset Rationale
++----------------------------
++
++Unrealize uses forced session teardown, not the ordinary deferred cleanup
++protocol. Runtime QEMU-initiated map release normally waits until the final map
++owner is gone, then sends ``MAP_RELEASED`` as a bridge-local event. Device
++unrealize cannot depend on that delayed protocol path: it must leave no live fd,
++handler, map object, or endpoint reference behind after the QOM object is torn
++down. The forced path therefore detaches the host session synchronously,
++invalidates delayed map-release completions, revokes all DMA-visible mappings,
++drops bridge-local protocol records, purges ring work, and then releases the
++endpoint and backing resources. ``MAP_RELEASED`` remains a runtime event, not a
++teardown fence.
++
++QEMU reset uses attach-epoch renewal semantics for the same ordering reason.
++The initial reset has no active host session yet: reset hold leaves the pending
++first attach in place, and reset exit issues the first ``ATTACH`` using the
++initialized rings and eventfds for the resolved endpoint. Later resets detach
++the active host bridge session during reset hold before dropping local ring,
++pending-TX, map, and bridge-local protocol state. Reset exit then reinitializes
++the rings, drains eventfds, and issues a new ``ATTACH``. This avoids keeping a
++host attach session active while QEMU has discarded the local state that
++describes that session, and it lets each attach epoch provide the authoritative
++online snapshot and topology publication state. This is QEMU backend policy
++layered above the Linux bridge UAPI; it does not add a Linux UAPI reset
++operation.
++
++Endpoint State Model
++--------------------
++
++Endpoint availability is driven by an explicit attach-session state machine:
++
++- ``DETACHED``: no active bridge attach
++- ``ATTACHED_OFFLINE``: attach succeeded, but endpoint-scoped topology, map,
++  RX, and TX work is quiesced for the current epoch
++- ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``: the endpoint is online for the current
++  attach epoch, but transport traffic stays blocked until the full topology
++  snapshot has been published on the TX ring
++- ``ATTACHED_ONLINE_ACTIVE``: topology has been published successfully for the
++  current online epoch, so RX, TX, map receive, map responses, and pending-TX
++  flush are allowed
++- ``ATTACHED_FAILED``: terminal failed-attach state entered after unrecoverable
++  attach-session errors; data, map, and topology work do not resume until the
++  bridge is re-realized
++
++State transitions for this step are:
++
++- ``ATTACH`` snapshot online -> ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- ``ATTACH`` snapshot offline -> ``ATTACHED_OFFLINE``
++- complete topology snapshot published -> ``ATTACHED_ONLINE_ACTIVE``
++- ``ENDPOINT_ONLINE`` -> ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- ``ENDPOINT_OFFLINE`` -> ``ATTACHED_OFFLINE``
++- unrecoverable protocol, validation, or delivery failure -> ``ATTACHED_FAILED``
++
++If ``ATTACH`` reports the endpoint online, QEMU uses the attach snapshot as the
++initial online state. Linux does not send a synthetic ``ENDPOINT_ONLINE`` for
++that epoch, so QEMU enters ``ATTACHED_ONLINE_NEEDS_TOPOLOGY`` directly and
++publishes topology for ``caps.online_epoch`` once the machine is ready.
++
++``ENDPOINT_ONLINE`` is a lifecycle refresh for a later online epoch: it updates
++endpoint-scoped fields (``bus_name`` and ``endpoint_max_msg_size``), clears
++old-epoch pending TX, pending bridge errors, map state, and live mappings, then
++requests topology republish. It is not a second attach-capability negotiation
++step.
++
++``ENDPOINT_OFFLINE`` is an attached-but-offline epoch transition. QEMU clears
++``caps.online_epoch`` to ``0``, clears pending TX and map operation state,
++revokes live bridge mappings, marks transport state offline, and resets
++attached child devices. The reset is QEMU transport policy, not a Linux bridge
++ABI requirement.
++
++Old-epoch lifecycle and map messages are stale and ignored. Apart from a valid
++later ``ENDPOINT_ONLINE`` that brings an offline session online, bridge-local
++messages whose epoch is ahead of the current online epoch are protocol
++violations and fail the attach. While offline or waiting for topology, the
++``call_fd`` handler still drains the RX ring so lifecycle messages can move the
++session forward, but endpoint-scoped transport, map, and pending
++required-delivery work remain blocked until ``ATTACHED_ONLINE_ACTIVE``.
++
++Bridge-Local Ring Contract
++--------------------------
++
++Runtime bridge control uses implementation-defined bus messages on the shared
++rings. There is no runtime ``dev_fd`` sideband control path.
++
++Allowed RX bridge-local messages are:
++
++- ``ENDPOINT_ONLINE``
++- ``ENDPOINT_OFFLINE``
++- ``MAP_ADD``
++- ``MAP_DEL``
++
++Allowed TX bridge-local messages are:
++
++- ``TOPOLOGY_RESET``
++- ``TOPOLOGY_DEV_ADD``
++- ``TOPOLOGY_COMMIT``
++- ``MAP_ADD``
++- ``MAP_DEL``
++- ``MAP_RELEASED``
++- ``BRIDGE_ERROR``
++
++Bridge-local messages use bus-class headers with ``dev_num == 0``. All
++bridge-local messages except map requests/responses and ``BRIDGE_ERROR`` use
++``token == 0``. Linux sends ``MAP_ADD`` and ``MAP_DEL`` as request-class bus
++messages with non-zero request tokens. QEMU copies each request token into the
++matching response-class ``MAP_ADD`` or ``MAP_DEL`` response. ``MAP_RELEASED``
++is a QEMU-to-Linux event, not a response, and uses ``token == 0``.
++``BRIDGE_ERROR`` is also a response-class bus message and copies the original
++transport request token for correlation.
++
++QEMU validates bridge-local direction, type bits, ``dev_num``, token, payload
++size, and current state before applying a message. Malformed bridge-local
++headers or payload sizes fault the attach. Standardized bus messages and
++reserved bus-message IDs are not part of the bridge ring protocol; QEMU
++discards them instead of forwarding them to generic ``virtio-msg`` provider
++paths.
++
++Data Path Contract
++------------------
++
++Data traffic uses shared TX/RX ring headers with monotonic ``u32`` cursors:
++
++- slot index: ``cursor % entries``
++- occupancy: ``prod - cons`` (unsigned arithmetic)
++- valid occupancy range: ``0..entries``
++
++Producer/consumer ordering follows acquire/release semantics:
++
++- producer publishes entry contents before advancing ``prod``
++- consumer reads ``prod`` with acquire semantics before reading payload
++- consumer advances ``cons`` only after processing is complete
++
++Occupancy above ``entries`` is treated as ring corruption and rejected.
++
++Copy-path behavior:
++
++- RX copies only the message header first, validates ``msg_size``, then copies
++  only validated payload bytes
++- TX copies only ``msg_size`` bytes to the ring slot (no full-slot clear)
++
++RX ring processing is strictly ordered, but the pinned slot depends on the
++pending output. ``MAP_ADD`` and ``MAP_DEL`` slots are consumed after QEMU
++records any deferred map work; if the matching response cannot be completed
++immediately, later map and transport RX work stays blocked while the deferred
++map state remains set. ``BRIDGE_ERROR`` backpressure pins the failed request
++slot only until the pending error report reaches the TX ring.
++
++Ring Geometry and Validation
++----------------------------
++
++Bridge-backed ring policy is split between transport defaults and backend
++validation:
++
++- transport parent defaults are fixed to 256 entries and 128-byte slots for
++  both TX and RX
++- backend validation requires exactly 256 entries on both rings and slot size
++  ``== ALIGN(vmm_max_msg_size, 128)``
++- realize-time ring validation uses the backend's stored
++  ``vmm-max-msg-size`` property for both TX and RX
++- for the current bridge UAPI this means transport-mode geometry is
++  effectively fixed to 256x128 rather than a generic runtime sizing knob
++- endpoint ``max_msg_size`` is learned per attach epoch from ``ATTACH`` and
++  later ``ENDPOINT_ONLINE`` lifecycle refresh payloads
++
++Required Delivery Contract
++--------------------------
++
++Required traffic uses ``send_must_deliver`` semantics:
++
++- synchronous responses and runtime notifications are queued when transient
++  TX-ring backpressure occurs
++- if a queued entry already exists, later required traffic is appended behind
++  it so transport-message order is preserved
++- queued traffic is retried via a bounded timer-backed backoff only while the
++  session is in ``ATTACHED_ONLINE_ACTIVE``
++- the retry delay starts at 1 ms, doubles after failed retries, and is capped
++  at 200 ms
++- each queued entry expires after 8 failed retry attempts
++- existing bridge progress points also attempt to flush queued traffic when the
++  session can make TX progress again
++- retry is canceled when the queue drains or the session leaves the active
++  online state
++- ``ENDPOINT_OFFLINE`` clears queued pending-TX entries for the old epoch
++- no busy-loop retry path is used
++
++Required-delivery expiry is message-class dependent:
++
++- queued responses and device runtime notifications
++  (``EVENT_CONFIG``, ``EVENT_AVAIL``, and ``EVENT_USED``) fail the attach when
++  they expire, because the bridge cannot preserve the required completion
++  contract after dropping them
++- bus-class traffic is never transmitted by the bridge backend; if such a
++  queued entry were encountered it would be dropped rather than used to fail
++  the attach
++- other queued entries that fail with non-retry errors are dropped after the
++  failure is logged
++
++Request errors before a required response is accepted are reported with a
++TX-ring ``BRIDGE_ERROR`` message. The report carries the original request
++``dev_num``, ``token``, ``msg_id``, and a signed negative errno value derived
++from the ``virtio-msg`` handler result. If TX-ring backpressure prevents
++immediate publication, QEMU records the pending error report and keeps the
++failed request slot pinned only until that report is published; the original
++request is not re-dispatched afterward. Terminal error-report failures fail the
++attach. Once a response has been accepted into the pending-TX queue, later
++bounded-delivery expiry is recovered by the attach-failure path rather than by
++synthesizing a second response.
++
++Runtime Notification Authority
++------------------------------
++
++Runtime notifications have exactly one authoritative transport-message
++occurrence:
++
++- QEMU device notifications are converted by the ``virtio-msg`` proxy into the
++  corresponding ``EVENT_USED`` or ``EVENT_CONFIG`` message
++- the Linux bridge backend forwards that message to the bridge TX ring and
++  does not synthesize an additional runtime notification from eventfds or
++  lifecycle messages
++- ``EVENT_AVAIL`` is received from the bridge RX ring and delivered to the
++  QEMU device model as the authoritative guest-available notification for that
++  queue
++
++Out-of-band fds are wakeup hints only:
++
++- ``call_fd`` wakes QEMU so it can drain RX ring work and retry pending TX;
++  draining an eventfd does not itself create a virtio-msg notification
++- ``kick_fd`` wakes the host side after QEMU publishes a TX-ring entry; the
++  TX-ring message is still the authoritative notification
++- polling paths remain transparent because polling only causes normal ring and
++  retry queues to be drained, and does not manufacture notifications outside
++  those queues
++
++Standard ioreq/ioeventfd notification acceleration is not reused here because
++virtio-msg queue notification is carried in-band as transport messages. There
++is no emulated MMIO or PIO notify access for KVM, Xen, or QEMU memory
++listeners to trap and bind to an ioeventfd.
++
++If bounded delivery expires for a required one-way runtime notification, the
++backend fails the attach. That recovery path moves the session to
++``ATTACHED_FAILED``, clears pending TX, purges queued RX, clears map operation
++state, revokes bridge mappings, detaches from the bridge, and releases the
++endpoint.
++
++Queue Address Preparation
++-------------------------
++
++``SET_VQUEUE`` configures queue size, vector, and ring addresses.
++
++Descriptor payload mappings, indirect descriptor caches, and vring caches use
++the bridge ``dma_as`` backed by bridge-map-installed RAM subregions.
++
++Bridge-driven cache lifecycle:
++
++- queue region caches are invalidated after successful map add/del, endpoint
++  offline, and bridge teardown/reset paths
++- ``EVENT_AVAIL`` rebuilds queue caches only when invalid
++- coverage misses while offline fail fast without polling ring progress
++
++DMA Mapping Model (Bridge-Local Map Messages + Pointer-Backed RAM)
++------------------------------------------------------------------
++
++The backend map table is populated by bridge-local ``MAP_ADD`` and
++``MAP_DEL`` request messages from the RX ring:
++
++The final DMA-sharing path is entirely bridge-managed: map messages publish and
++revoke generic DMA windows, and the transport does not use a ``GET_SHM`` bus
++message to publish them.
++The bridge DMA ``AddressSpace`` is private to the backend and configured
++direct-map-only; bridge ``MAP_ADD`` subregions are the only DMA-visible RAM
++windows in that address space.
++Because child virtio devices use this private DMA address space rather than
++the system memory address space, the bridge always exposes
++``VIRTIO_F_IOMMU_PLATFORM`` to make DMA translations go through the transport
++``AddressSpace``.
++
++1. ``MAP_ADD`` validates the bridge-local request payload, accepts
++   ``mmap_length >= length``, maps ``mmap_length`` bytes at ``mmap_offset``
++   from the attached bridge fd, creates one per-map QOM object for the
++   publication instance, and installs a pointer-backed RAM subregion into the
++   bridge ``dma_mr`` at ``bus_addr`` for exactly ``length`` bytes.
++2. The per-map object owns the map identity, lifecycle state, ``MemoryRegion``,
++   and host mapping. Generic DMA users see ordinary pointer-backed RAM through
++   the bridge ``dma_as``. The final ``munmap()`` is performed by the map
++   object's finalizer after the last owner reference is released.
++3. ``MAP_ADD`` response uses the same ``msg_id`` and token as the Linux
++   request and carries ``online_epoch``, ``map_seq``, ``map_id``, and a
++   signed negative errno status. A zero status is published only after
++   ``mmap()``, map-object creation, subregion installation, and map-cache
++   touch complete.
++4. ``MAP_DEL`` requests revoke-first teardown. QEMU first removes the
++   subregion from the bridge DMA ``AddressSpace`` so no new DMA lookup can
++   create a translation for that publication instance, then publishes the
++   matching ``MAP_DEL`` response. The response means DMA visibility has been
++   revoked; it does not wait for final map owner release or final
++   ``munmap()``.
++5. ``MAP_RELEASED`` is a QEMU-to-Linux event, not a response. QEMU sends it
++   after QEMU-initiated release has revoked DMA visibility and the final map
++   owner release has completed the final ``munmap()``. It carries
++   ``online_epoch``, ``map_seq``, ``map_id``, ``bus_addr``, and ``length`` with
++   ``token == 0``.
++
++Linux may publish multiple map requests before earlier responses have
++completed. QEMU consumes map requests in RX order and sends matching responses
++in that order. If QEMU cannot complete a map operation immediately, the RX
++slot is consumed after recording deferred map state, but later map RX slots and
++transport RX delivery are blocked until the delayed response or event is
++handled. Transport TX and required-delivery flush work are gated by the
++attach/data state and pending-TX queue state rather than by deferred map state.
++Map responses are sent through the same required-delivery TX path as other
++bridge-local completions.
++
++A non-zero ``MAP_ADD`` failure response is fatal to the QEMU attach after the
++response reaches Linux. A non-zero ``MAP_DEL`` status is reported in the
++matching response and consumes the request; QEMU fails the attach only if the
++required-delivery path cannot deliver that response. Transient ``MAP_ADD``
++setup failures are handled by a bounded internal timer-backed attempt loop
++before QEMU publishes a final response.
++
++``VIRTIO_MSG_BUS_BRIDGE_MAP_F_RETENTION_REQUESTED`` is a Linux hint that
++retaining an idle mapping may avoid later ``mmap()`` and setup cost. It is not
++a hard promise from QEMU. Non-retained temporary mappings are the normal
++candidates for QEMU-initiated proactive release. Retained mappings are
++protected from ordinary proactive reclaim, but explicit ``MAP_DEL`` and
++exceptional cleanup paths such as fault, reset, detach, teardown, or
++exceptional pressure may still release them. If QEMU releases a retained
++mapping while the affected virtio device is still active, Linux removes that
++device rather than treating ``MAP_RELEASED`` as ordinary retained-map cleanup.
++
++Ordinary proactive release of non-retained maps is a bridge-local policy. QEMU
++schedules a reclaim sweep after an actual transport-visible ``EVENT_USED``
++frame has been copied to the bridge TX ring and the producer cursor has been
++published. The sweep skips retained maps and maps already being deleted or
++released, then releases at most one eligible map: the candidate with the
++oldest ``last_use_seq``. Count and byte thresholds schedule the same sweep as
++additional bounds. The current pressure thresholds are 256 live non-retained
++maps or 64 MiB of non-retained mapped bytes; after one release, QEMU chains
++another reclaim BH only while one of those thresholds is still met. Endpoint
++reset, detach, and teardown paths revoke or release remaining mappings even if
++no ``EVENT_USED`` is emitted.
++
++When QEMU sends ``MAP_RELEASED`` before Linux's matching ``MAP_DEL`` crosses on
++the ring, QEMU keeps a tombstone for the released identity and span. The
++tombstone blocks overlapping replacement maps, lets the crossing ``MAP_DEL``
++retire the record with a successful response, and prevents ABA reuse of the
++same ``online_epoch``/``map_seq``/``map_id`` tuple.
++
++Map entry identity and ownership are bridge-local:
++
++- one QOM map object owns each accepted ``MAP_ADD`` publication instance
++- the map list records live, revoking, finalized, release-pending, and
++  tombstone states
++- the map object's owner references keep the host mapping alive until generic
++  memory users and delayed completion paths have dropped their references
++- final owner release runs the map finalizer, performs ``munmap()``, and
++  schedules the delayed ``MAP_RELEASED`` event when QEMU initiated the release
++- ``map_lock`` protects map-list lookup, overlap checks, lifecycle transitions,
++  tombstones, and reclaim counters; it is not a generic RAM access refcount
++- map add/del contracts require page-aligned exact spans and non-zero lengths
++  (zero bus addresses are accepted)
++- ``MAP_ADD`` with unsupported flags or nonzero reserved fields receives a
++  failed ``MAP_ADD`` response
++- ``MAP_DEL`` with nonzero reserved fields receives a failed ``MAP_DEL``
++  response
++
++Lookup optimization:
++
++- a single-entry covering-map cache is checked before QTAILQ scan
++- each hit/install updates ``last_use_seq`` through
++  ``virtio_msg_linux_bridge_map_touch_locked()``
++- cache is invalidated on entry removal, full unmap, and lifecycle resets
++- linear map-list lookup is acceptable for this backend because active
++  non-retained maps are expected to remain small and are currently bounded by
++  reclaim thresholds of 256 live non-retained maps or 64 MiB of non-retained
++  mapped bytes
++
++Lifetime rules:
++
++- no opportunistic release is performed for cache pressure
++- DMA visibility ends on ``MAP_DEL``, QEMU-initiated release of non-retained
++  temporary mappings, endpoint offline, detach, bridge teardown, exceptional
++  pressure, or other exceptional retained cleanup
++- final host mapping lifetime ends only after the map object finalizer runs and
++  performs ``munmap()``
++- teardown revokes any remaining live mappings and releases bridge metadata
++- ``ENDPOINT_OFFLINE`` also clears any pending map operation state for the old
++  epoch
++- stale old-epoch ``MAP_ADD`` messages are consumed without a response
++- stale old-epoch ``MAP_DEL`` messages are consumed without a response unless
++  they retire a matching tombstone, in which case QEMU sends the matching
++  ``MAP_DEL`` response
++- future-epoch map messages fault the attach
++
++Linux-side UAPI documentation follow-up: the imported
++``linux-headers/linux/virtio_msg_bus_bridge.h`` interface does not require a
++structure change for this model. Linux-side comments or companion
++documentation should define successful ``MAP_DEL`` completion as DMA
++visibility revocation with no new translations for the publication instance,
++not as proof that userspace has already called ``munmap()``. They should also
++describe ``MAP_RELEASED`` as delayed until final owner release and final
++``munmap()``.
++
++Capability Latching
++-------------------
++
++Transport capability selection is latched from the attach snapshot:
++
++- the bridge backend accepts only transport revision ``1`` (the
++  ``VIRTIO_MSG_TRANSPORT_REVISION`` constant)
++- the attach snapshot provides the authoritative transport and bridge feature
++  bitmaps for the attach epoch
++- advertised transport features are carried from the attach snapshot, except
++  that ``VIRTIO_MSG_F_STRICT_CONFIG_GENERATION`` is masked out during this
++  phase
++- ``VIRTIO_F_NOTIF_CONFIG_DATA`` and ``VIRTIO_F_NOTIFICATION_DATA`` are also
++  masked because the current event encoding cannot preserve notification-data
++  semantics; support requires a future event encoding that carries those
++  semantics explicitly
++- extra features exported to child devices are fixed when the transport caps
++  are latched and include ``VIRTIO_F_IOMMU_PLATFORM``
++- child pre-plug observes the current latched transport caps; later lifecycle
++  refreshes do not renegotiate attach-snapshot revision or feature ownership
++
++Capability validation and max-size derivation are split by source:
++
++- ``ATTACH`` validates the attach ``revision`` and normalizes
++  ``max_msg_size`` with ``0 -> VIRTIO_MSG_MAX_SIZE``
++- attach ``max_msg_size`` must be in the implemented v2 transport range
++  ``VIRTIO_MSG_MIN_SIZE..VIRTIO_MSG_MAX_SIZE`` (currently ``52..128`` bytes)
++- attach snapshots are the only source for revision, transport features, and
++  bridge features
++- attach snapshots seed endpoint-scoped max-message state only when the
++  endpoint is already online at attach time
++- ``ENDPOINT_ONLINE`` is a lifecycle refresh for endpoint data only: it
++  updates ``bus_name`` and endpoint ``max_msg_size`` after applying the same
++  ``0 -> VIRTIO_MSG_MAX_SIZE`` normalization and ``52..128`` validation
++- ``ENDPOINT_ONLINE`` does not update revision, transport features, or bridge
++  features
++- effective transport max is recomputed as
++  ``min(vmm_max_msg_size, endpoint_max_msg_size_when_online)``, with the
++  endpoint term absent while offline
++
++Topology Publication Model
++--------------------------
++
++Topology publication uses a full-snapshot TX ring model:
++
++- attach-online snapshots and later ``ENDPOINT_ONLINE`` transitions enter
++  ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- ``machine_done`` and ``ENDPOINT_ONLINE`` may publish topology only from
++  ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++- QEMU publishes ``TOPOLOGY_RESET`` for ``caps.online_epoch``
++- QEMU publishes one ``TOPOLOGY_DEV_ADD`` for each populated external device
++  number, in ascending device-number order
++- QEMU publishes ``TOPOLOGY_COMMIT`` with the final device count
++- successful publication of the complete ordered snapshot is the only
++  transition into ``ATTACHED_ONLINE_ACTIVE``
++- TX-ring full conditions queue the unsent topology message and later topology
++  messages behind it; the session stays in ``ATTACHED_ONLINE_NEEDS_TOPOLOGY``
++  until the queued ``TOPOLOGY_COMMIT`` reaches the TX ring
++- terminal topology publication failures fail the attach
++- the published range is external device number ``0`` through
++  ``VIRTIO_MSG_MAX_DEVS - 1``
++- runtime child hotplug and unplug are unsupported
++- no runtime ``DEV_NUM_ADD``/``DEV_NUM_REMOVE`` publication path is kept
++- the ``virtio-msg`` proxy bus is intentionally not hotpluggable
++
++``ENDPOINT_OFFLINE`` is treated as an attached-but-offline epoch transition,
++not as an implicit detach. QEMU keeps the bridge session attached, clears
++pending-TX entries and retry state, clears pending map operation state, unmaps
++all bridge mappings, invalidates proxy caches, and resets attached child
++devices. The device reset is retained QEMU transport policy layered on top of
++the Linux bridge ABI rather than an ABI requirement.
++
++Concurrency Notes
++-----------------
++
++The backend's runtime wakeup path is intentionally narrow:
++
++- ``call_fd`` is the kernel-to-QEMU runtime progress notification
++- the callback drains the eventfd, tries to flush pending TX, processes the RX
++  ring, and tries another TX flush after RX work has produced response/error
++  output
++- the ``virtio-msg`` transport ``process`` callback follows the same
++  flush-RX-flush shape for polling-driven progress
++- the pending-TX retry timer also retries queued required traffic and pending
++  ``BRIDGE_ERROR`` reports
++
++The bridge device fd is retained for synchronous ioctls and ``mmap()`` only. It
++is not a runtime readiness or control channel.
++
++Migration
++---------
++
++Migration is explicitly blocked for this backend.
++
++Reason: bridge session state (resolved endpoint handle, attached fd state,
++map tokens, and host bridge lifecycle) is host-local and cannot be
++transparently reconstructed on destination.
++
++Tracing and Debugging
++---------------------
++
++Relevant diagnostics include:
++
++- guest-error logs for malformed bridge-local payloads, malformed ring state,
++  or endpoint mismatch
++- warning logs for short/failed eventfd writes and fd read errors
++- tracepoints covering RX/TX message flow, bridge-local RX/TX, endpoint
++  resolve/release, fd events, lifecycle transitions, and pending-TX
++  retries/drops
++- map lifecycle traces:
++  ``virtio_msg_linux_bridge_map_add_rx``,
++  ``virtio_msg_linux_bridge_map_del_rx``,
++  ``virtio_msg_linux_bridge_map_add_resp_tx``,
++  ``virtio_msg_linux_bridge_map_del_resp_tx``,
++  ``virtio_msg_linux_bridge_map_released_tx``,
++  ``virtio_msg_linux_bridge_map_event_install``,
++  ``virtio_msg_linux_bridge_map_event_remove``,
++  ``virtio_msg_linux_bridge_map_revoke``,
++  ``virtio_msg_linux_bridge_map_finalize``,
++  ``virtio_msg_linux_bridge_map_release_pending``,
++  ``virtio_msg_linux_bridge_map_tombstone``,
++  ``virtio_msg_linux_bridge_map_tombstone_del``,
++  ``virtio_msg_linux_bridge_map_event_stale``
+-- 
+2.53.0
+

@@ -1,0 +1,242 @@
+From 19663b35aeead8b2e4fab1f45cb30bca9fe754ac Mon Sep 17 00:00:00 2001
+Message-ID: <19663b35aeead8b2e4fab1f45cb30bca9fe754ac.1779811422.git.bertrand.marquis@arm.com>
+In-Reply-To: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+References: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Mon, 27 Apr 2026 14:10:46 +0200
+Subject: [PATCH 08/12] virtio_msg: ffa: add indirect transfer common code
+
+Add the shared FF-A indirect transfer framing helpers used by virtio message FF-A endpoints.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ drivers/virtio/Kconfig                        |  9 ++
+ drivers/virtio/Makefile                       |  2 +
+ drivers/virtio/virtio_msg_bus_ffa_xfer.h      |  6 +-
+ .../virtio/virtio_msg_bus_ffa_xfer_indirect.c | 99 +++++++++++++++++++
+ .../virtio/virtio_msg_bus_ffa_xfer_indirect.h | 50 ++++++++++
+ 5 files changed, 161 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_xfer_indirect.c
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_xfer_indirect.h
+
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index f791e36d3c7c..8aa80c557c30 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -225,6 +225,15 @@ config VIRTIO_MSG_FFA_COMMON
+ 	  This enables role-neutral FF-A helpers shared by the virtio
+ 	  message bus driver-binding and device-binding modules.
+ 
++config VIRTIO_MSG_FFA_XFER_INDIRECT
++	bool "Virtio message bus FF-A indirect transfer support"
++	default y
++	help
++	  Enable indirect FF-A messaging support for the virtio message
++	  bus bindings.
++
++	  Indirect transfer is the shared bootstrap path.
++
+ endif
+ 
+ config VIRTIO_DMA_SHARED_BUFFER
+diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+index 16e9ebc1734a..60e3aeac3473 100644
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -13,6 +13,8 @@ obj-$(CONFIG_VIRTIO_MSG_LOOPBACK) += virtio_msg_loopback.o
+ virtio_msg_loopback-y := virtio_msg_loopback_transport.o \
+ 			 virtio_msg_loopback_bridge.o
+ virtio_msg_bus_ffa_common-y := virtio_msg_bus_ffa_common.o
++virtio_msg_bus_ffa_common-$(CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT) += \
++			 virtio_msg_bus_ffa_xfer_indirect.o
+ obj-$(CONFIG_VIRTIO_MSG_FFA_COMMON) += virtio_msg_bus_ffa_common_module.o
+ virtio_msg_bus_ffa_common_module-y := $(virtio_msg_bus_ffa_common-y)
+ 
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_xfer.h b/drivers/virtio/virtio_msg_bus_ffa_xfer.h
+index 61b16a7809b7..d4b9dfc82167 100644
+--- a/drivers/virtio/virtio_msg_bus_ffa_xfer.h
++++ b/drivers/virtio/virtio_msg_bus_ffa_xfer.h
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/arm_ffa.h>
+ #include <linux/bits.h>
++#include <linux/errno.h>
+ #include <linux/kconfig.h>
+ #include <linux/types.h>
+ 
+@@ -82,11 +83,6 @@ struct virtio_msg_ffa_xfer_method_ops {
+ 			      size_t *resp_len);
+ };
+ 
+-#if IS_ENABLED(CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT)
+-extern const struct virtio_msg_ffa_xfer_method_ops
+-	virtio_msg_ffa_indirect_method_ops;
+-#endif
+-
+ static inline unsigned long
+ virtio_msg_ffa_xfer_methods(u8 role_mask, u32 bus_features, bool negotiated)
+ {
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect.c b/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect.c
+new file mode 100644
+index 000000000000..cfc40bed32a7
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect.c
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio message bus over FF-A indirect-method framing helpers.
++ *
++ * Copyright (C) 2026 Google LLC and Linaro.
++ * Viresh Kumar <viresh.kumar@linaro.org>
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#include <linux/byteorder/little_endian.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/string.h>
++
++#include "virtio_msg_bus_ffa_xfer_indirect.h"
++
++static int virtio_msg_ffa_indirect_prepare_request
++			(struct virtio_msg_ffa_xfer_ctx *ctx,
++			 const struct virtio_msg *req, size_t req_len,
++			 void *wire_req, size_t wire_req_len,
++			 size_t *wire_req_used)
++{
++	int ret;
++
++	if (!ctx || !ctx->ep || !req || !wire_req)
++		return -EINVAL;
++
++	ret = virtio_msg_ffa_validate_inbound_msg(req, req_len);
++	if (ret)
++		return ret;
++	if (wire_req_len < req_len)
++		return -EMSGSIZE;
++
++	memcpy(wire_req, req, req_len);
++
++	if (wire_req_used)
++		*wire_req_used = req_len;
++
++	return 0;
++}
++
++static int virtio_msg_ffa_indirect_parse_frame
++			(struct virtio_msg_ffa_xfer_ctx *ctx,
++			 const void *wire_resp, size_t wire_resp_len,
++			 struct virtio_msg *resp, size_t resp_buf_len,
++			 size_t *resp_len)
++{
++	struct virtio_msg hdr;
++	u16 msg_size;
++	int ret;
++
++	if (!ctx || !ctx->ep || !wire_resp || !resp || !resp_len)
++		return -EINVAL;
++	if (wire_resp_len < sizeof(hdr))
++		return -EMSGSIZE;
++
++	memcpy(&hdr, wire_resp, sizeof(hdr));
++	msg_size = le16_to_cpu(hdr.msg_size);
++	if (msg_size < sizeof(hdr) || msg_size > FFA_BUS_MAX_MSG_SIZE)
++		return -EMSGSIZE;
++	if (wire_resp_len < msg_size || msg_size > resp_buf_len)
++		return -EMSGSIZE;
++
++	memcpy(resp, wire_resp, msg_size);
++	ret = virtio_msg_ffa_validate_inbound_msg(resp, msg_size);
++	if (ret)
++		return ret;
++
++	*resp_len = msg_size;
++
++	return 0;
++}
++
++static int virtio_msg_ffa_indirect_prepare_wire_request_cb
++			(struct virtio_msg_ffa_xfer_ctx *ctx,
++			 const struct virtio_msg *req, size_t req_len,
++			 void *wire_req, size_t wire_req_len)
++{
++	return virtio_msg_ffa_indirect_prepare_request(ctx, req, req_len, wire_req,
++						       wire_req_len, NULL);
++}
++
++static int virtio_msg_ffa_indirect_parse_wire_response_cb
++			(struct virtio_msg_ffa_xfer_ctx *ctx,
++			 const void *wire_resp, size_t wire_resp_len,
++			 struct virtio_msg *resp, size_t resp_buf_len,
++			 size_t *resp_len)
++{
++	return virtio_msg_ffa_indirect_parse_frame(ctx, wire_resp, wire_resp_len,
++						   resp, resp_buf_len, resp_len);
++}
++
++const struct virtio_msg_ffa_xfer_method_ops
++virtio_msg_ffa_indirect_method_ops = {
++	.prepare_request = virtio_msg_ffa_indirect_prepare_wire_request_cb,
++	.parse_response = virtio_msg_ffa_indirect_parse_wire_response_cb,
++};
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_indirect_method_ops);
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect.h b/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect.h
+new file mode 100644
+index 000000000000..58d8b9b08913
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Virtio message bus over FF-A indirect transfer helper contracts.
++ *
++ * Copyright (C) 2026 Google LLC and Linaro.
++ * Viresh Kumar <viresh.kumar@linaro.org>
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#ifndef _VIRTIO_MSG_BUS_FFA_XFER_INDIRECT_H
++#define _VIRTIO_MSG_BUS_FFA_XFER_INDIRECT_H
++
++#include "virtio_msg_bus_ffa_xfer.h"
++
++#ifdef CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT
++extern const struct virtio_msg_ffa_xfer_method_ops
++	virtio_msg_ffa_indirect_method_ops;
++
++static inline int
++virtio_msg_ffa_indirect_prepare_wire_request(struct virtio_msg_ffa_xfer_ctx *ctx,
++					     const struct virtio_msg *req,
++					     size_t req_len, void *wire_req,
++					     size_t wire_req_len)
++{
++	if (!virtio_msg_ffa_indirect_method_ops.prepare_request)
++		return -EOPNOTSUPP;
++
++	return virtio_msg_ffa_indirect_method_ops.prepare_request
++			(ctx, req, req_len, wire_req, wire_req_len);
++}
++
++static inline int
++virtio_msg_ffa_indirect_parse_wire_response(struct virtio_msg_ffa_xfer_ctx *ctx,
++					    const void *wire_resp,
++					    size_t wire_resp_len,
++					    struct virtio_msg *resp,
++					    size_t resp_buf_len,
++					    size_t *resp_len)
++{
++	if (!virtio_msg_ffa_indirect_method_ops.parse_response)
++		return -EOPNOTSUPP;
++
++	return virtio_msg_ffa_indirect_method_ops.parse_response
++			(ctx, wire_resp, wire_resp_len, resp, resp_buf_len,
++			 resp_len);
++}
++#endif
++
++#endif /* _VIRTIO_MSG_BUS_FFA_XFER_INDIRECT_H */
+-- 
+2.53.0
+

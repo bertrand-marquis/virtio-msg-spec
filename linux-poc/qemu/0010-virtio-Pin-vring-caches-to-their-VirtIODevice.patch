@@ -1,0 +1,90 @@
+From e08a8593379a88c92812147abb48aa6a7a3f02e1 Mon Sep 17 00:00:00 2001
+Message-ID: <e08a8593379a88c92812147abb48aa6a7a3f02e1.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 10:57:23 +0200
+Subject: [PATCH 10/30] virtio: Pin vring caches to their VirtIODevice
+
+Vring memory caches are released through RCU and can outlive cache
+replacement. Store a VirtIODevice reference in each cache object so cache
+teardown remains safe after the queue installs a replacement cache.
+
+Export a minimal helper for later virtio-msg code to query whether a
+queue currently has valid region caches. Do not add any public queue
+mutation API in this prerequisite patch.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/virtio.c         | 14 ++++++++++++++
+ include/hw/virtio/virtio.h |  1 +
+ 2 files changed, 15 insertions(+)
+
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 00d387ba05a0..400a80e26c99 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -99,6 +99,7 @@ typedef struct VRingUsed
+ 
+ typedef struct VRingMemoryRegionCaches {
+     struct rcu_head rcu;
++    VirtIODevice *vdev;
+     MemoryRegionCache desc;
+     MemoryRegionCache avail;
+     MemoryRegionCache used;
+@@ -246,6 +247,7 @@ static void virtio_free_region_cache(VRingMemoryRegionCaches *caches)
+     address_space_cache_destroy(&caches->desc);
+     address_space_cache_destroy(&caches->avail);
+     address_space_cache_destroy(&caches->used);
++    object_unref(OBJECT(caches->vdev));
+     g_free(caches);
+ }
+ 
+@@ -260,6 +262,13 @@ static void virtio_virtqueue_reset_region_cache(struct VirtQueue *vq)
+     }
+ }
+ 
++bool virtio_queue_region_cache_valid(VirtIODevice *vdev, int n)
++{
++    VirtQueue *vq = &vdev->vq[n];
++
++    return qatomic_read(&vq->vring.caches) != NULL;
++}
++
+ void virtio_init_region_cache(VirtIODevice *vdev, int n)
+ {
+     VirtQueue *vq = &vdev->vq[n];
+@@ -275,6 +284,9 @@ void virtio_init_region_cache(VirtIODevice *vdev, int n)
+         goto out_no_cache;
+     }
+     new = g_new0(VRingMemoryRegionCaches, 1);
++    new->vdev = vdev;
++    object_ref(OBJECT(vdev));
++
+     size = virtio_queue_get_desc_size(vdev, n);
+     packed = virtio_vdev_has_feature(vq->vdev, VIRTIO_F_RING_PACKED) ?
+                                    true : false;
+@@ -322,6 +334,8 @@ err_used:
+     address_space_cache_destroy(&new->used);
+ err_desc:
+     address_space_cache_destroy(&new->desc);
++    object_unref(OBJECT(new->vdev));
++    new->vdev = NULL;
+ out_no_cache:
+     g_free(new);
+     virtio_virtqueue_reset_region_cache(vq);
+diff --git a/include/hw/virtio/virtio.h b/include/hw/virtio/virtio.h
+index 3a24d109fb74..ae8477569865 100644
+--- a/include/hw/virtio/virtio.h
++++ b/include/hw/virtio/virtio.h
+@@ -377,6 +377,7 @@ void virtio_queue_get_rings(VirtIODevice *vdev, int n, hwaddr *desc,
+                             hwaddr *avail, hwaddr *used);
+ void virtio_queue_update_rings(VirtIODevice *vdev, int n);
+ void virtio_init_region_cache(VirtIODevice *vdev, int n);
++bool virtio_queue_region_cache_valid(VirtIODevice *vdev, int n);
+ void virtio_queue_set_align(VirtIODevice *vdev, int n, int align);
+ void virtio_queue_notify(VirtIODevice *vdev, int n);
+ uint16_t virtio_queue_vector(VirtIODevice *vdev, int n);
+-- 
+2.53.0
+

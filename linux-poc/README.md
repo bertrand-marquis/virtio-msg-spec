@@ -1,26 +1,29 @@
-This a virtio message POC using linux and qemu
+This is a virtio message PoC using Linux and QEMU.
 
 # Disclaimer
 
-ChatGPT was heavily used to generate this PoC. Even if i did some review and
+ChatGPT was heavily used to generate this PoC. Even if I did some review and
 modifications on the generated code, it is still at PoC status and not ready
 yet for upstreaming.
 
-# Qemu patches and compilation
+# QEMU patches and compilation
 
-qemu patches in qemu sub-directory must be applied in qemu master status.
+QEMU patches in the qemu sub-directory must be applied on QEMU master.
 Current development was done on top of Edgar patches that can be found
-in https://github.com/edgarigl/qemu.git and i started from his branch
-edgar/virtio-msg-rfc that i rebased on top of master from qemu
+in https://github.com/edgarigl/qemu.git and I started from his branch
+edgar/virtio-msg-rfc that I rebased on top of QEMU master
 (hash 314ff2e07ddc6163554077d68aed5d76a50b8e3d).
 
-First 4 patches are Edgar original patches and then there are modifications
-in standard qemu code and Edgar virtio-msg code and then a bridge
-implementation with a transport parent.
-At the end of the serie there are 2 patches to create a minimal qemu
-and to fix a qemu compilation error with that configuration.
+The QEMU series currently contains 30 patches:
+- patches 0001 to 0004 are Edgar's original virtio-msg/AMP PCI base
+- patches 0005 to 0023 update QEMU memory, virtio and virtio-msg behavior for
+  the current protocol and bridge requirements
+- patches 0024 to 0028 add the Linux bridge backend, the transport parent, the
+  imported Linux bridge UAPI header and the documentation
+- patches 0029 and 0030 add build support for the minimal aarch64
+  vmsg-bridge-min profile
 
-I am using the following command to compile qemu:
+I am using the following command to compile QEMU:
 ```
 make docker-image-debian-arm64-cross && \
   docker run --rm -it \
@@ -46,15 +49,27 @@ make docker-image-debian-arm64-cross && \
 
 # Linux patches and compilation
 
-linux patches in linux sub-directory are introducing:
+Linux patches in the linux sub-directory are introducing:
 - virtio message transport
-- a virtio message bridge interface
-- a virtio message dma helper
-- a virtio message loopback for local validation without VM
+- a virtio message userspace bridge interface
+- virtio message DMA helpers for driver and device roles
+- a shared bus queue helper
+- a virtio message loopback transport and bridge provider for local validation
+- FF-A bus support:
+  - common FF-A bus/protocol code
+  - indirect, FIFO and direct transfer support
+  - FF-A driver-role binding
+  - FF-A device-role binding
 
-Patches have been tested and apply on linux v6.19.3 tree.
+The FF-A bus support is included in this PoC patch drop, but it currently
+depends on Arm FF-A kernel changes that are not included in this directory.
+Those Arm FF-A patches will be provided in a later PoC update. Until then, the
+FF-A bus driver will not compile at this stage.
 
-You must activate the following symbols in your linux configuration:
+Patches have been tested and apply on Linux v6.19.3 tree.
+
+For the loopback-based QEMU validation path, you must activate the following
+symbols in your Linux configuration:
 ```
 CONFIG_VIRTIO_MSG_TRANSPORT=y
 CONFIG_VIRTIO_MSG_BRIDGE=y
@@ -63,15 +78,18 @@ CONFIG_VIRTIO_MSG_LOOPBACK=y
 
 # Reproduce the POC
 
-From linux with a root filesystem containing the modified Qemu, run the
-following command to start Qemu with a block and entropy device:
+The following reproduces the loopback-based QEMU bridge validation path. It
+does not validate the FF-A bus bindings.
+
+From Linux with a root filesystem containing the modified QEMU, run the
+following command to start QEMU with a block and entropy device:
 
 - Create a fake disk file:
 ```
 dd if=/dev/zero of=/tmp/disk.img bs=1M count=32
 ```
 
-- Run qemu:
+- Run QEMU:
 ```
 qemu-system-aarch64 -M virt -m 128 -nographic -nodefaults \
     -device virtio-msg-linux-bridge-transport,id=vmsgw0,endpoint=loopback \
@@ -102,12 +120,12 @@ and /sys/bus/virtio/devices should show 2 devices.
 mkfs.ext2 /dev/vda
 mkdir /mnt
 mount /dev/vda /mnt
-dd if=/dev/hwrng of=/mnt/test1 bs=256 count=4096 (can take some time)
-cp /mnt/test1 /mnt/test2
+dd if=/dev/hwrng of=/mnt/test1 bs=256 count=256
+dd if=/dev/urandom of=/mnt/test2 bs=1024 count=4096
+cp /mnt/test2 /mnt/test3
 sync
 md5sum /mnt/test*
 umount /mnt
 mount /dev/vda /mnt
 md5sum /mnt/test*
 ```
-

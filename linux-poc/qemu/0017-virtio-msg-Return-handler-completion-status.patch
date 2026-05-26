@@ -1,0 +1,384 @@
+From 398919cbfd40f848d71ec2feb7198cb0116d31d2 Mon Sep 17 00:00:00 2001
+Message-ID: <398919cbfd40f848d71ec2feb7198cb0116d31d2.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 12:02:56 +0200
+Subject: [PATCH 17/30] virtio-msg: Return handler completion status
+
+Convert virtio-msg request handlers to return the internal transport
+status they get from must-deliver response sends. This lets the bus
+receive path observe local send failures instead of treating every
+handled request as successful.
+
+Keep malformed or ignored peer input local by continuing to return
+VIRTIO_MSG_NO_ERROR for those drop paths.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/virtio-msg.c | 135 ++++++++++++++++++++++-------------------
+ 1 file changed, 72 insertions(+), 63 deletions(-)
+
+diff --git a/hw/virtio/virtio-msg.c b/hw/virtio/virtio-msg.c
+index 7ccec966b826..9ae0d0e042a8 100644
+--- a/hw/virtio/virtio-msg.c
++++ b/hw/virtio/virtio-msg.c
+@@ -24,17 +24,6 @@
+ #define VIRTIO_MSG_SUPPORTED_EXTRA_FEATURES BIT_ULL(VIRTIO_F_IOMMU_PLATFORM)
+ #define VIRTIO_MSG_SUPPORTED_TRANSPORT_FEATURES 0ULL
+ 
+-static void virtio_msg_send_must_deliver(VirtIOMSGProxy *s, VirtIOMSG *msg)
+-{
+-    int ret = virtio_msg_bus_send_must_deliver(&s->msg_bus, msg);
+-
+-    if (ret != VIRTIO_MSG_NO_ERROR) {
+-        qemu_log_mask(LOG_GUEST_ERROR,
+-                      "%s: failed to send required message id %u: ret=%d\n",
+-                      __func__, msg->msg_id, ret);
+-    }
+-}
+-
+ static uint16_t virtio_msg_active_max_msg_size(VirtIOMSGProxy *s)
+ {
+     if (!s->latched_caps_valid || !s->latched_caps.ready ||
+@@ -45,6 +34,26 @@ static uint16_t virtio_msg_active_max_msg_size(VirtIOMSGProxy *s)
+     return s->latched_caps.max_msg_size;
+ }
+ 
++static int virtio_msg_send_must_deliver_checked(VirtIOMSGProxy *s,
++                                                VirtIOMSG *msg)
++{
++    uint16_t msg_size = le16_to_cpu(msg->msg_size);
++    int ret;
++
++    if (msg_size > virtio_msg_active_max_msg_size(s)) {
++        return VIRTIO_MSG_ERROR_BAD_MESSAGE;
++    }
++
++    ret = virtio_msg_bus_send_must_deliver(&s->msg_bus, msg);
++    if (ret != VIRTIO_MSG_NO_ERROR) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: failed to send required message id %u: ret=%d\n",
++                      __func__, msg->msg_id, ret);
++    }
++
++    return ret;
++}
++
+ static bool virtio_msg_dev_num_to_slot(VirtIOMSGProxy *s, uint16_t dev_num,
+                                        uint16_t *slot)
+ {
+@@ -178,8 +187,8 @@ static VirtIODevice *virtio_msg_lookup_vdev(VirtIOMSGProxy *s, uint16_t dev_num,
+     return vdev;
+ }
+ 
+-static void virtio_msg_bus_get_devices(VirtIOMSGProxy *s,
+-                                       VirtIOMSG *msg)
++static int virtio_msg_bus_get_devices(VirtIOMSGProxy *s,
++                                      VirtIOMSG *msg)
+ {
+     VirtIOMSG msg_resp;
+     uint8_t data[VIRTIO_MSG_MAX_DEVS / 8] = {0};
+@@ -203,19 +212,19 @@ static void virtio_msg_bus_get_devices(VirtIOMSGProxy *s,
+                                          offset, next_offset, num,
+                                          msg->token,
+                                          data);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_bus_ping(VirtIOMSGProxy *s, VirtIOMSG *msg)
++static int virtio_msg_bus_ping(VirtIOMSGProxy *s, VirtIOMSG *msg)
+ {
+     VirtIOMSG msg_resp;
+ 
+     virtio_msg_pack_bus_ping_resp(&msg_resp, msg->token, msg->bus_ping.data);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_device_info(VirtIOMSGProxy *s,
+-                                   VirtIOMSG *msg)
++static int virtio_msg_device_info(VirtIOMSGProxy *s,
++                                  VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_vdev(s, msg->dev_num);
+     uint32_t config_len = 0;
+@@ -241,11 +250,11 @@ static void virtio_msg_device_info(VirtIOMSGProxy *s,
+                                          config_len,
+                                          max_virtqueues,
+                                          0, 0);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_get_features(VirtIOMSGProxy *s,
+-                                    VirtIOMSG *msg)
++static int virtio_msg_get_features(VirtIOMSGProxy *s,
++                                   VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_lookup_vdev(s, msg->dev_num, __func__);
+     VirtIOMSG msg_resp;
+@@ -271,11 +280,11 @@ static void virtio_msg_get_features(VirtIOMSGProxy *s,
+     /* If index is out of bounds, we respond with num=0, f=0.  */
+     virtio_msg_pack_get_features_resp(&msg_resp, msg->dev_num, msg->token,
+                                       index, num, f);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_set_features(VirtIOMSGProxy *s,
+-                                    VirtIOMSG *msg)
++static int virtio_msg_set_features(VirtIOMSGProxy *s,
++                                   VirtIOMSG *msg)
+ {
+     VirtIOMSG msg_resp;
+     unsigned int i;
+@@ -298,7 +307,7 @@ static void virtio_msg_set_features(VirtIOMSGProxy *s,
+     s->devs[msg->dev_num].guest_features = f;
+ 
+     virtio_msg_pack_set_features_resp(&msg_resp, msg->dev_num, msg->token);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+ static void virtio_msg_soft_reset(VirtIOMSGProxy *s, uint16_t dev_num)
+@@ -309,15 +318,15 @@ static void virtio_msg_soft_reset(VirtIOMSGProxy *s, uint16_t dev_num)
+     s->devs[dev_num].guest_features = 0;
+ }
+ 
+-static void virtio_msg_set_device_status(VirtIOMSGProxy *s,
+-                                         VirtIOMSG *msg)
++static int virtio_msg_set_device_status(VirtIOMSGProxy *s,
++                                        VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_vdev(s, msg->dev_num);
+     uint32_t status = msg->set_device_status.status;
+     VirtIOMSG msg_resp;
+ 
+     if (!vdev) {
+-        return;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     if (!(status & VIRTIO_CONFIG_S_DRIVER_OK)) {
+@@ -341,11 +350,11 @@ static void virtio_msg_set_device_status(VirtIOMSGProxy *s,
+ 
+     virtio_msg_pack_set_device_status_resp(&msg_resp, msg->dev_num, msg->token,
+                                            vdev->status);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_get_device_status(VirtIOMSGProxy *s,
+-                                         VirtIOMSG *msg)
++static int virtio_msg_get_device_status(VirtIOMSGProxy *s,
++                                        VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_lookup_vdev(s, msg->dev_num, __func__);
+     VirtIOMSG msg_resp;
+@@ -353,11 +362,11 @@ static void virtio_msg_get_device_status(VirtIOMSGProxy *s,
+ 
+     virtio_msg_pack_get_device_status_resp(&msg_resp, msg->dev_num, msg->token,
+                                            status);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_get_config(VirtIOMSGProxy *s,
+-                                  VirtIOMSG *msg)
++static int virtio_msg_get_config(VirtIOMSGProxy *s,
++                                 VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_lookup_vdev(s, msg->dev_num, __func__);
+     uint32_t size = msg->get_config.size;
+@@ -368,7 +377,7 @@ static void virtio_msg_get_config(VirtIOMSGProxy *s,
+     unsigned int i;
+ 
+     if (size > VIRTIO_MSG_MAX_CONFIG_BYTES) {
+-        return;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     memset(data, 0, size);
+@@ -383,11 +392,11 @@ static void virtio_msg_get_config(VirtIOMSGProxy *s,
+     virtio_msg_pack_get_config_resp(&msg_resp, msg->dev_num, msg->token,
+                                     size, offset,
+                                     generation, data);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_set_config(VirtIOMSGProxy *s,
+-                                  VirtIOMSG *msg)
++static int virtio_msg_set_config(VirtIOMSGProxy *s,
++                                 VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_lookup_vdev(s, msg->dev_num, __func__);
+     uint32_t offset = msg->set_config.offset;
+@@ -407,11 +416,11 @@ static void virtio_msg_set_config(VirtIOMSGProxy *s,
+     virtio_msg_pack_set_config_resp(&msg_resp, msg->dev_num, msg->token,
+                                     size, offset,
+                                     generation, data);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_get_vqueue(VirtIOMSGProxy *s,
+-                                  VirtIOMSG *msg)
++static int virtio_msg_get_vqueue(VirtIOMSGProxy *s,
++                                 VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_lookup_vdev(s, msg->dev_num, __func__);
+     uint32_t max_size = 0;
+@@ -435,10 +444,10 @@ static void virtio_msg_get_vqueue(VirtIOMSGProxy *s,
+                                         index, 0, 0, 0, 0, 0, 0);
+     }
+ 
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_set_vqueue(VirtIOMSGProxy *s, VirtIOMSG *msg)
++static int virtio_msg_set_vqueue(VirtIOMSGProxy *s, VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_lookup_vdev(s, msg->dev_num, __func__);
+     uint32_t index = msg->set_vqueue.index;
+@@ -446,7 +455,7 @@ static void virtio_msg_set_vqueue(VirtIOMSGProxy *s, VirtIOMSG *msg)
+ 
+     if (!vdev || index >= VIRTIO_QUEUE_MAX) {
+         /* Missing device or OOB index, ignore. */
+-        return;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     virtio_queue_set_vector(vdev, index, index);
+@@ -458,33 +467,33 @@ static void virtio_msg_set_vqueue(VirtIOMSGProxy *s, VirtIOMSG *msg)
+     virtio_queue_enable(vdev, index);
+ 
+     virtio_msg_pack_set_vqueue_resp(&msg_resp, msg->dev_num, msg->token);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_reset_vqueue(VirtIOMSGProxy *s, VirtIOMSG *msg)
++static int virtio_msg_reset_vqueue(VirtIOMSGProxy *s, VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_lookup_vdev(s, msg->dev_num, __func__);
+     VirtIOMSG msg_resp;
+ 
+     if (!vdev) {
+-        return;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     virtio_queue_reset(vdev, msg->reset_vqueue.index);
+ 
+     virtio_msg_pack_reset_vqueue_resp(&msg_resp, msg->dev_num, msg->token);
+-    virtio_msg_send_must_deliver(s, &msg_resp);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+-static void virtio_msg_event_avail(VirtIOMSGProxy *s,
+-                                   VirtIOMSG *msg)
++static int virtio_msg_event_avail(VirtIOMSGProxy *s,
++                                  VirtIOMSG *msg)
+ {
+     VirtIODevice *vdev = virtio_msg_lookup_vdev(s, msg->dev_num, __func__);
+     uint16_t vq_idx = msg->event_avail.index;
+     VirtQueue *vq;
+ 
+     if (!vdev) {
+-        return;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
+@@ -494,18 +503,17 @@ static void virtio_msg_event_avail(VirtIOMSGProxy *s,
+         virtio_msg_pack_event_config(&msg_ev, msg->dev_num,
+                                      vdev->status, vdev->generation,
+                                      0, 0, NULL);
+-        virtio_msg_send_must_deliver(s, &msg_ev);
+-        return;
++        return virtio_msg_send_must_deliver_checked(s, &msg_ev);
+     }
+ 
+     if (vq_idx >= VIRTIO_QUEUE_MAX) {
+         virtio_error(vdev, "Notification to bad VQ!");
+-        return;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     if (!virtio_queue_get_num(vdev, vq_idx)) {
+         virtio_error(vdev, "Notification to unconfigured VQ!");
+-        return;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     vq = virtio_get_queue(vdev, vq_idx);
+@@ -519,7 +527,7 @@ static void virtio_msg_event_avail(VirtIOMSGProxy *s,
+         if (offset > 0x7fff || offset >= qsize) {
+             virtio_error(vdev, "Next offset to large!");
+             /* Bail out without notification???  */
+-            return;
++            return VIRTIO_MSG_NO_ERROR;
+         }
+ 
+         data = wrap << 15;
+@@ -528,10 +536,11 @@ static void virtio_msg_event_avail(VirtIOMSGProxy *s,
+         virtio_queue_set_shadow_avail_idx(vq, data);
+     }
+     virtio_queue_notify(vdev, msg->event_avail.index);
++    return VIRTIO_MSG_NO_ERROR;
+ }
+ 
+-typedef void (*VirtIOMSGHandler)(VirtIOMSGProxy *s,
+-                                 VirtIOMSG *msg);
++typedef int (*VirtIOMSGHandler)(VirtIOMSGProxy *s,
++                                VirtIOMSG *msg);
+ 
+ static const VirtIOMSGHandler msg_handlers[] = {
+     [VIRTIO_MSG_DEVICE_INFO] = virtio_msg_device_info,
+@@ -559,10 +568,10 @@ static int virtio_msg_receive_msg(VirtIOMSGBusDevice *bd, VirtIOMSG *msg)
+             return VIRTIO_MSG_NO_ERROR;
+         }
+         if (msg->msg_id == VIRTIO_MSG_BUS_GET_DEVICES) {
+-            virtio_msg_bus_get_devices(s, msg);
++            return virtio_msg_bus_get_devices(s, msg);
+         }
+         if (msg->msg_id == VIRTIO_MSG_BUS_PING) {
+-            virtio_msg_bus_ping(s, msg);
++            return virtio_msg_bus_ping(s, msg);
+         }
+         return VIRTIO_MSG_NO_ERROR;
+     }
+@@ -580,7 +589,7 @@ static int virtio_msg_receive_msg(VirtIOMSGBusDevice *bd, VirtIOMSG *msg)
+     }
+ 
+     if (handler) {
+-        handler(s, msg);
++        return handler(s, msg);
+     }
+ 
+     return VIRTIO_MSG_NO_ERROR;
+@@ -604,7 +613,7 @@ static void virtio_msg_notify(DeviceState *opaque, uint16_t vector)
+ 
+     if (vector < VIRTIO_QUEUE_MAX) {
+         virtio_msg_pack_event_used(&msg, mdev->dev_num, vector);
+-        virtio_msg_send_must_deliver(s, &msg);
++        virtio_msg_send_must_deliver_checked(s, &msg);
+         return;
+     }
+ 
+@@ -612,7 +621,7 @@ static void virtio_msg_notify(DeviceState *opaque, uint16_t vector)
+         virtio_msg_pack_event_config(&msg, mdev->dev_num,
+                                      vdev->status, vdev->generation,
+                                      0, 0, NULL);
+-        virtio_msg_send_must_deliver(s, &msg);
++        virtio_msg_send_must_deliver_checked(s, &msg);
+         return;
+     }
+ }
+-- 
+2.53.0
+

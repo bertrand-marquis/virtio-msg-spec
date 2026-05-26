@@ -1,0 +1,48 @@
+From 9349cebf1a844d89e14846ee1ded68d040df4b6f Mon Sep 17 00:00:00 2001
+Message-ID: <9349cebf1a844d89e14846ee1ded68d040df4b6f.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 10:32:32 +0200
+Subject: [PATCH 08/30] physmem: Hold RCU while resolving RAMBlocks from host
+ pointers
+
+Cover both the Xen mapcache lookup and the normal RAMBlock lookup path with
+the same RCU read-side critical section in qemu_ram_block_from_host().
+
+This is a small lifetime cleanup for host-pointer resolution. It does not
+add provider-backed RAMBlock support or change how RAMBlocks are matched.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ system/physmem.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/system/physmem.c b/system/physmem.c
+index 41da613a201f..7dd0e416fee8 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -2784,10 +2784,11 @@ RAMBlock *qemu_ram_block_from_host(void *ptr, bool round_offset,
+ {
+     RAMBlock *block;
+     uint8_t *host = ptr;
++    RCU_READ_LOCK_GUARD();
+ 
+     if (xen_enabled()) {
+         ram_addr_t ram_addr;
+-        RCU_READ_LOCK_GUARD();
++
+         ram_addr = xen_ram_addr_from_mapcache(ptr);
+         if (ram_addr == RAM_ADDR_INVALID) {
+             return NULL;
+@@ -2800,7 +2801,6 @@ RAMBlock *qemu_ram_block_from_host(void *ptr, bool round_offset,
+         return block;
+     }
+ 
+-    RCU_READ_LOCK_GUARD();
+     block = qatomic_rcu_read(&ram_list.mru_block);
+     if (block && block->host && host - block->host < block->max_length) {
+         goto found;
+-- 
+2.53.0
+

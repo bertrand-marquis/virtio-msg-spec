@@ -1,0 +1,496 @@
+From 838d1dddab649e275cf236b4665a55efe5ea4f9e Mon Sep 17 00:00:00 2001
+Message-ID: <838d1dddab649e275cf236b4665a55efe5ea4f9e.1779811422.git.bertrand.marquis@arm.com>
+In-Reply-To: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+References: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 1 May 2026 11:47:20 +0200
+Subject: [PATCH 05/12] virtio_msg: add bus queue helper
+
+Add a generic virtio message bus queue helper that providers can opt into
+when they need FIFO handoff from non-sleepable paths to sleepable bus
+submission context.
+
+The helper is intentionally bus-owned: it copies complete messages,
+enforces caller-provided depth and head timeout bounds, and invokes only a
+bus-supplied submit callback. It does not allocate or validate tokens,
+manage request completion, call provider operations directly, or coalesce
+events.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ drivers/virtio/Kconfig                       |   3 +
+ drivers/virtio/Makefile                      |   1 +
+ drivers/virtio/virtio_msg_bus_queue_helper.c | 312 +++++++++++++++++++
+ drivers/virtio/virtio_msg_bus_queue_helper.h | 115 +++++++
+ 4 files changed, 431 insertions(+)
+ create mode 100644 drivers/virtio/virtio_msg_bus_queue_helper.c
+ create mode 100644 drivers/virtio/virtio_msg_bus_queue_helper.h
+
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index e88183f536db..fd4bce22cd6e 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -193,6 +193,9 @@ config VIRTIO_MSG_BUS_DMA_DRIVER_HELPER
+ 	depends on VIRTIO_MSG_TRANSPORT
+ 	depends on HAS_DMA
+ 
++config VIRTIO_MSG_BUS_QUEUE_HELPER
++	tristate
++
+ config VIRTIO_MSG_BUS_DMA_DEVICE_HELPER
+ 	tristate
+ 	depends on VIRTIO_MSG_BRIDGE
+diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+index bee8b23198a6..011b557f04ac 100644
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -5,6 +5,7 @@ obj-$(CONFIG_VIRTIO_PCI_LIB) += virtio_pci_modern_dev.o
+ obj-$(CONFIG_VIRTIO_PCI_LIB_LEGACY) += virtio_pci_legacy_dev.o
+ obj-$(CONFIG_VIRTIO_MMIO) += virtio_mmio.o
+ obj-$(CONFIG_VIRTIO_MSG_TRANSPORT) += virtio_msg_transport.o
++obj-$(CONFIG_VIRTIO_MSG_BUS_QUEUE_HELPER) += virtio_msg_bus_queue_helper.o
+ obj-$(CONFIG_VIRTIO_MSG_BUS_DMA_DRIVER_HELPER) += virtio_msg_bus_dma_driver_helper.o
+ obj-$(CONFIG_VIRTIO_MSG_BRIDGE) += virtio_msg_bus_bridge_device.o
+ obj-$(CONFIG_VIRTIO_MSG_BUS_DMA_DEVICE_HELPER) += virtio_msg_bus_dma_device_helper.o
+diff --git a/drivers/virtio/virtio_msg_bus_queue_helper.c b/drivers/virtio/virtio_msg_bus_queue_helper.c
+new file mode 100644
+index 000000000000..1fe22bba5b97
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_queue_helper.c
+@@ -0,0 +1,312 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio message bus queue helper.
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#define pr_fmt(fmt) "virtio-msg-bus-queue-helper: " fmt
++
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/virtio_msg_protocol.h>
++
++#include "virtio_msg_bus_queue_helper.h"
++
++struct virtio_msg_bus_queue_entry {
++	struct list_head node;
++	struct virtio_msg_bus_queue_helper_item item;
++	unsigned long retention_deadline;
++	u8 msg[];
++};
++
++static const char *
++virtio_msg_bus_queue_helper_item_name
++		(const struct virtio_msg_bus_queue_helper_item *item)
++{
++	if (!item)
++		return "unknown";
++
++	switch (item->type) {
++	case VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG:
++		return "message";
++	case VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_OPAQUE:
++		return "opaque";
++	default:
++		return "unknown";
++	}
++}
++
++static void
++virtio_msg_bus_queue_helper_release_entry
++		(struct virtio_msg_bus_queue_helper *queue,
++		 struct virtio_msg_bus_queue_entry *entry, int status)
++{
++	if (!entry)
++		return;
++
++	if (queue->release)
++		queue->release(queue->context, &entry->item, status);
++	kfree(entry);
++}
++
++static void virtio_msg_bus_queue_helper_drop_entries
++		(struct virtio_msg_bus_queue_helper *queue, struct list_head *entries,
++		 int status)
++{
++	struct virtio_msg_bus_queue_entry *entry, *tmp;
++
++	list_for_each_entry_safe(entry, tmp, entries, node) {
++		list_del(&entry->node);
++		if (queue->dev) {
++			if (entry->item.type ==
++			    VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG) {
++				dev_warn_ratelimited(queue->dev,
++						     "drop queued message: msg_id=0x%02x status=%d\n",
++						     entry->item.vmsg->msg_id,
++						     status);
++			} else {
++				dev_warn_ratelimited(queue->dev,
++						     "drop queued %s item: status=%d\n",
++						     virtio_msg_bus_queue_helper_item_name
++							(&entry->item),
++						     status);
++			}
++		}
++		virtio_msg_bus_queue_helper_release_entry(queue, entry, status);
++	}
++}
++
++static struct virtio_msg_bus_queue_entry *
++virtio_msg_bus_queue_helper_pop_locked(struct virtio_msg_bus_queue_helper *queue)
++{
++	struct virtio_msg_bus_queue_entry *entry;
++
++	lockdep_assert_held(&queue->lock);
++
++	if (list_empty(&queue->entries))
++		return NULL;
++
++	entry = list_first_entry(&queue->entries,
++				 struct virtio_msg_bus_queue_entry, node);
++	list_del(&entry->node);
++	queue->depth--;
++	return entry;
++}
++
++static void virtio_msg_bus_queue_helper_workfn(struct work_struct *work)
++{
++	struct virtio_msg_bus_queue_helper *queue;
++	struct virtio_msg_bus_queue_entry *entry;
++	struct delayed_work *dwork;
++	LIST_HEAD(dropped);
++	unsigned long flags;
++	int ret;
++
++	dwork = to_delayed_work(work);
++	queue = container_of(dwork, struct virtio_msg_bus_queue_helper, work);
++
++	for (;;) {
++		spin_lock_irqsave(&queue->lock, flags);
++		if (queue->stopped) {
++			list_splice_init(&queue->entries, &dropped);
++			queue->depth = 0;
++			spin_unlock_irqrestore(&queue->lock, flags);
++			virtio_msg_bus_queue_helper_drop_entries(queue, &dropped,
++								 -ECANCELED);
++			return;
++		}
++
++		entry = virtio_msg_bus_queue_helper_pop_locked(queue);
++		spin_unlock_irqrestore(&queue->lock, flags);
++		if (!entry)
++			return;
++
++		if (queue->retention_timeout_jiffies &&
++		    time_after(jiffies, entry->retention_deadline)) {
++			if (queue->dev) {
++				if (entry->item.type ==
++				    VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG) {
++					dev_warn_ratelimited(queue->dev,
++							     "drop expired message: msg_id=0x%02x\n",
++							     entry->item.vmsg->msg_id);
++				} else {
++					dev_warn_ratelimited(queue->dev,
++							     "drop expired %s item\n",
++							     virtio_msg_bus_queue_helper_item_name
++								(&entry->item));
++				}
++			}
++			virtio_msg_bus_queue_helper_release_entry(queue, entry,
++								  -ETIMEDOUT);
++			continue;
++		}
++
++		ret = queue->submit(queue->context, &entry->item);
++		if (ret && queue->dev) {
++			if (entry->item.type ==
++			    VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG) {
++				dev_warn_ratelimited(queue->dev,
++						     "queued message failed: msg_id=0x%02x ret=%d\n",
++						     entry->item.vmsg->msg_id,
++						     ret);
++			} else {
++				dev_warn_ratelimited(queue->dev,
++						     "queued %s item failed: ret=%d\n",
++						     virtio_msg_bus_queue_helper_item_name
++							(&entry->item),
++						     ret);
++			}
++		}
++		virtio_msg_bus_queue_helper_release_entry(queue, entry, ret);
++	}
++}
++
++int
++virtio_msg_bus_queue_helper_init(struct virtio_msg_bus_queue_helper *queue,
++				 struct device *dev, u32 max_msg_size,
++				 u32 max_depth,
++				 unsigned int retention_timeout_ms,
++				 virtio_msg_bus_queue_helper_submit_fn submit,
++				 virtio_msg_bus_queue_helper_release_fn release,
++				 void *context)
++{
++	if (!queue || !submit || !max_msg_size || !max_depth)
++		return -EINVAL;
++
++	spin_lock_init(&queue->lock);
++	INIT_DELAYED_WORK(&queue->work, virtio_msg_bus_queue_helper_workfn);
++	INIT_LIST_HEAD(&queue->entries);
++	queue->dev = dev;
++	queue->submit = submit;
++	queue->release = release;
++	queue->context = context;
++	queue->max_msg_size = max_msg_size;
++	queue->max_depth = max_depth;
++	queue->retention_timeout_jiffies =
++		msecs_to_jiffies(retention_timeout_ms);
++	queue->depth = 0;
++	queue->stopped = false;
++	queue->initialized = true;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_bus_queue_helper_init);
++
++int
++virtio_msg_bus_queue_helper_enqueue(struct virtio_msg_bus_queue_helper *queue,
++				    const struct virtio_msg *vmsg, gfp_t gfp)
++{
++	struct virtio_msg_bus_queue_entry *entry;
++	unsigned long flags;
++	u16 msg_size;
++	int ret = 0;
++
++	if (!queue || !vmsg)
++		return -EINVAL;
++	if (!queue->initialized)
++		return -ENODEV;
++
++	msg_size = le16_to_cpu(vmsg->msg_size);
++	if (msg_size < sizeof(*vmsg) || msg_size > queue->max_msg_size)
++		return -EMSGSIZE;
++
++	entry = kzalloc(sizeof(*entry) + msg_size, gfp);
++	if (!entry)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&entry->node);
++	if (queue->retention_timeout_jiffies)
++		entry->retention_deadline =
++			jiffies + queue->retention_timeout_jiffies;
++	entry->item.type = VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG;
++	entry->item.msg_size = msg_size;
++	entry->item.vmsg = (const struct virtio_msg *)entry->msg;
++	memcpy(entry->msg, vmsg, msg_size);
++
++	spin_lock_irqsave(&queue->lock, flags);
++	if (queue->stopped) {
++		ret = -ESHUTDOWN;
++	} else if (queue->depth >= queue->max_depth) {
++		ret = -ENOSPC;
++	} else {
++		list_add_tail(&entry->node, &queue->entries);
++		queue->depth++;
++		entry = NULL;
++		queue_delayed_work(system_wq, &queue->work, 0);
++	}
++	spin_unlock_irqrestore(&queue->lock, flags);
++
++	kfree(entry);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_bus_queue_helper_enqueue);
++
++int
++virtio_msg_bus_queue_helper_enqueue_opaque(struct virtio_msg_bus_queue_helper
++					   *queue, void *opaque, gfp_t gfp)
++{
++	struct virtio_msg_bus_queue_entry *entry;
++	unsigned long flags;
++	int ret = 0;
++
++	if (!queue || !opaque)
++		return -EINVAL;
++	if (!queue->initialized)
++		return -ENODEV;
++
++	entry = kzalloc(sizeof(*entry), gfp);
++	if (!entry)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&entry->node);
++	if (queue->retention_timeout_jiffies)
++		entry->retention_deadline =
++			jiffies + queue->retention_timeout_jiffies;
++	entry->item.type = VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_OPAQUE;
++	entry->item.opaque = opaque;
++
++	spin_lock_irqsave(&queue->lock, flags);
++	if (queue->stopped) {
++		ret = -ESHUTDOWN;
++	} else if (queue->depth >= queue->max_depth) {
++		ret = -ENOSPC;
++	} else {
++		list_add_tail(&entry->node, &queue->entries);
++		queue->depth++;
++		entry = NULL;
++		queue_delayed_work(system_wq, &queue->work, 0);
++	}
++	spin_unlock_irqrestore(&queue->lock, flags);
++
++	kfree(entry);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_bus_queue_helper_enqueue_opaque);
++
++void virtio_msg_bus_queue_helper_stop(struct virtio_msg_bus_queue_helper *queue)
++{
++	LIST_HEAD(dropped);
++	unsigned long flags;
++
++	if (!queue || !queue->initialized)
++		return;
++
++	spin_lock_irqsave(&queue->lock, flags);
++	queue->stopped = true;
++	list_splice_init(&queue->entries, &dropped);
++	queue->depth = 0;
++	spin_unlock_irqrestore(&queue->lock, flags);
++
++	cancel_delayed_work_sync(&queue->work);
++	virtio_msg_bus_queue_helper_drop_entries(queue, &dropped, -ECANCELED);
++	queue->initialized = false;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_bus_queue_helper_stop);
++
++MODULE_DESCRIPTION("Virtio message bus queue helper");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/virtio/virtio_msg_bus_queue_helper.h b/drivers/virtio/virtio_msg_bus_queue_helper.h
+new file mode 100644
+index 000000000000..9060d44ab5e3
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_queue_helper.h
+@@ -0,0 +1,115 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Virtio message bus queue helper.
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#ifndef _VIRTIO_MSG_BUS_QUEUE_HELPER_H
++#define _VIRTIO_MSG_BUS_QUEUE_HELPER_H
++
++#include <linux/gfp.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include <linux/workqueue.h>
++
++struct device;
++struct virtio_msg;
++
++enum virtio_msg_bus_queue_helper_item_type {
++	VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG = 1,
++	VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_OPAQUE,
++};
++
++/**
++ * struct virtio_msg_bus_queue_helper_item - queued bus work item
++ * @type: Item payload type.
++ * @msg_size: Size of @vmsg when @type is
++ *	%VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG.
++ * @vmsg: Copied virtio message, valid for message items.
++ * @opaque: Bus-owned pointer, valid for opaque items.
++ *
++ * Callback users must treat this object as borrowed storage.  The helper owns
++ * the backing entry and releases it after the submit/release callbacks return.
++ */
++struct virtio_msg_bus_queue_helper_item {
++	enum virtio_msg_bus_queue_helper_item_type type;
++	u16 msg_size;
++	union {
++		const struct virtio_msg *vmsg;
++		void *opaque;
++	};
++};
++
++typedef int (*virtio_msg_bus_queue_helper_submit_fn)(void *context,
++		const struct virtio_msg_bus_queue_helper_item *item);
++typedef void (*virtio_msg_bus_queue_helper_release_fn)(void *context,
++		const struct virtio_msg_bus_queue_helper_item *item, int status);
++
++/**
++ * struct virtio_msg_bus_queue_helper - ordered sleepable submit queue
++ * @lock: Protects @entries, @depth, and @stopped.
++ * @work: Worker that drains entries in FIFO order.
++ * @entries: Pending copied messages and opaque entries.
++ * @dev: Device used for diagnostics.
++ * @submit: Sleepable submit callback.
++ * @release: Optional callback invoked when helper ownership ends.
++ * @context: Callback context.
++ * @max_msg_size: Largest accepted message copy.
++ * @max_depth: Maximum number of queued entries.
++ * @retention_timeout_jiffies: Maximum age of a queued entry, or zero to
++ *	disable age-based expiration.
++ * @depth: Current number of queued entries.
++ * @stopped: Reject new entries and make the worker drop queued entries.
++ * @initialized: True once the queue has been initialized.
++ */
++struct virtio_msg_bus_queue_helper {
++	spinlock_t lock; /* Protects queued entries and stop state. */
++	struct delayed_work work;
++	struct list_head entries;
++	struct device *dev;
++	virtio_msg_bus_queue_helper_submit_fn submit;
++	virtio_msg_bus_queue_helper_release_fn release;
++	void *context;
++	u32 max_msg_size;
++	u32 max_depth;
++	unsigned long retention_timeout_jiffies;
++	u32 depth;
++	bool stopped;
++	bool initialized;
++};
++
++/**
++ * virtio_msg_bus_queue_helper_init() - initialize an ordered submit queue
++ * @queue: Queue helper to initialize.
++ * @dev: Device used for diagnostics.
++ * @max_msg_size: Largest accepted message copy.
++ * @max_depth: Maximum number of queued entries.
++ * @retention_timeout_ms: Maximum age of a queued entry in milliseconds. Zero
++ *	disables age-based expiration.
++ * @submit: Sleepable submit callback.
++ * @release: Optional callback invoked when helper ownership ends.
++ * @context: Callback context.
++ *
++ * Nonzero retention timeouts are measured from enqueue time. The helper drops
++ * an entry if it is still queued after its retention deadline. Submit failures
++ * are reported once through @release and are not retried by the helper.
++ */
++int
++virtio_msg_bus_queue_helper_init(struct virtio_msg_bus_queue_helper *queue,
++				 struct device *dev, u32 max_msg_size,
++				 u32 max_depth,
++				 unsigned int retention_timeout_ms,
++				 virtio_msg_bus_queue_helper_submit_fn submit,
++				 virtio_msg_bus_queue_helper_release_fn release,
++				 void *context);
++int
++virtio_msg_bus_queue_helper_enqueue(struct virtio_msg_bus_queue_helper *queue,
++				    const struct virtio_msg *vmsg, gfp_t gfp);
++int
++virtio_msg_bus_queue_helper_enqueue_opaque(struct virtio_msg_bus_queue_helper
++					   *queue, void *opaque, gfp_t gfp);
++void virtio_msg_bus_queue_helper_stop(struct virtio_msg_bus_queue_helper *queue);
++
++#endif /* _VIRTIO_MSG_BUS_QUEUE_HELPER_H */
+-- 
+2.53.0
+

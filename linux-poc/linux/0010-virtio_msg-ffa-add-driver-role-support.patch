@@ -1,0 +1,5638 @@
+From abe6cae624a5f1f071641fdfb6bd847e21257252 Mon Sep 17 00:00:00 2001
+Message-ID: <abe6cae624a5f1f071641fdfb6bd847e21257252.1779811422.git.bertrand.marquis@arm.com>
+In-Reply-To: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+References: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Mon, 27 Apr 2026 14:11:01 +0200
+Subject: [PATCH 10/12] virtio_msg: ffa: add driver role support
+
+Add the FF-A driver-role binding for virtio message devices, including topology discovery, bus request handling, area sharing, indirect and FIFO transfer support, deferred event handling, and inbound response classification.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ drivers/virtio/Kconfig                        |   20 +
+ drivers/virtio/Makefile                       |   10 +
+ drivers/virtio/virtio_msg_bus_ffa_driver.c    | 2194 +++++++++++++++++
+ .../virtio/virtio_msg_bus_ffa_driver_area.c   |  828 +++++++
+ .../virtio/virtio_msg_bus_ffa_driver_priv.h   |  214 ++
+ .../virtio_msg_bus_ffa_driver_topology.c      |  971 ++++++++
+ .../virtio_msg_bus_ffa_xfer_fifo_driver.c     |  827 +++++++
+ .../virtio_msg_bus_ffa_xfer_indirect_driver.c |  485 ++++
+ 8 files changed, 5549 insertions(+)
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_driver.c
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_driver_area.c
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_driver_priv.h
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_driver_topology.c
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_xfer_fifo_driver.c
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_xfer_indirect_driver.c
+
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index ec6620d61661..9374f89ea4e1 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -225,6 +225,26 @@ config VIRTIO_MSG_FFA_COMMON
+ 	  This enables role-neutral FF-A helpers shared by the virtio
+ 	  message bus driver-binding and device-binding modules.
+ 
++config VIRTIO_MSG_FFA_DRIVER_BINDING
++	tristate "Virtio message bus FF-A driver binding"
++	depends on VIRTIO_MSG_TRANSPORT
++	depends on HAS_DMA
++	select VIRTIO_MSG_FFA_COMMON
++	select VIRTIO_MSG_BUS_QUEUE_HELPER
++	select VIRTIO_MSG_BUS_DMA_DRIVER_HELPER
++	select VIRTIO_MSG_FFA_XFER_DIRECT if !VIRTIO_MSG_FFA_XFER_INDIRECT
++	help
++	  This enables the FF-A driver binding for the virtio message
++	  bus.
++
++	  The driver discovers virtio message bus services over FF-A and
++	  exposes the resulting devices through the virtio message transport
++	  core.
++
++	  At least one bootstrap-capable transfer method must be enabled.
++
++	  If unsure, say M.
++
+ config VIRTIO_MSG_FFA_XFER_INDIRECT
+ 	bool "Virtio message bus FF-A indirect transfer support"
+ 	default y
+diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+index a1e6821e79c1..bbe571dced9e 100644
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -20,6 +20,16 @@ virtio_msg_bus_ffa_common-$(CONFIG_VIRTIO_MSG_FFA_XFER_FIFO) += \
+ obj-$(CONFIG_VIRTIO_MSG_FFA_COMMON) += virtio_msg_bus_ffa_common_module.o
+ virtio_msg_bus_ffa_common_module-y := $(virtio_msg_bus_ffa_common-y)
+ 
++virtio_msg_bus_ffa_driver-y := virtio_msg_bus_ffa_driver.o \
++			 virtio_msg_bus_ffa_driver_area.o \
++			 virtio_msg_bus_ffa_driver_topology.o
++virtio_msg_bus_ffa_driver-$(CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT) += \
++			 virtio_msg_bus_ffa_xfer_indirect_driver.o
++virtio_msg_bus_ffa_driver-$(CONFIG_VIRTIO_MSG_FFA_XFER_FIFO) += \
++			 virtio_msg_bus_ffa_xfer_fifo_driver.o
++obj-$(CONFIG_VIRTIO_MSG_FFA_DRIVER_BINDING) += virtio_msg_bus_ffa_driver_module.o
++virtio_msg_bus_ffa_driver_module-y := $(virtio_msg_bus_ffa_driver-y)
++
+ obj-$(CONFIG_VIRTIO_PCI) += virtio_pci.o
+ virtio_pci-y := virtio_pci_modern.o virtio_pci_common.o
+ virtio_pci-$(CONFIG_VIRTIO_PCI_LEGACY) += virtio_pci_legacy.o
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_driver.c b/drivers/virtio/virtio_msg_bus_ffa_driver.c
+new file mode 100644
+index 000000000000..405bf685cdd6
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_driver.c
+@@ -0,0 +1,2194 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio message bus over FF-A driver binding shell.
++ *
++ * Copyright (C) 2026 Google LLC and Linaro.
++ * Viresh Kumar <viresh.kumar@linaro.org>
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#define pr_fmt(fmt) "virtio-msg-ffa: " fmt
++
++#include <asm/barrier.h>
++#include <linux/arm_ffa.h>
++#include <linux/bitops.h>
++#include <linux/byteorder/generic.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/errno.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/mm.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/overflow.h>
++#include <linux/rcupdate.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uuid.h>
++#include <linux/vmalloc.h>
++#include <linux/virtio_msg_bus_provider.h>
++#include <linux/virtio_msg_transport.h>
++#include <linux/workqueue.h>
++
++#include "virtio_msg_bus_ffa.h"
++#include "virtio_msg_bus_ffa_driver_priv.h"
++#include "virtio_msg_bus_ffa_xfer.h"
++
++#define VIRTIO_MSG_FFA_RESET_RETRY_BUDGET	3
++#define VIRTIO_MSG_FFA_ASYNC_TIMEOUT_MS			5000
++
++static bool virtio_msg_ffa_type_match_masked(u8 type, u8 expected_type)
++{
++	const u8 type_mask = VIRTIO_MSG_TYPE_RESPONSE | VIRTIO_MSG_TYPE_BUS;
++
++	return (type & type_mask) == (expected_type & type_mask);
++}
++
++static const char *
++virtio_msg_ffa_xfer_method_name(enum virtio_msg_ffa_transfer_method method)
++{
++	switch (method) {
++	case VIRTIO_MSG_FFA_XFER_DIRECT:
++		return "direct";
++	case VIRTIO_MSG_FFA_XFER_INDIRECT:
++		return "indirect";
++	case VIRTIO_MSG_FFA_XFER_FIFO:
++		return "fifo";
++	default:
++		return "none";
++	}
++}
++
++static const char *
++virtio_msg_ffa_event_delivery_name(enum virtio_msg_ffa_bus_event_delivery method)
++{
++	switch (method) {
++	case VIRTIO_MSG_FFA_BUS_EVENT_DELIV_POLL:
++		return "poll";
++	case VIRTIO_MSG_FFA_BUS_EVENT_DELIV_NOTIF:
++		return "notify";
++	case VIRTIO_MSG_FFA_BUS_EVENT_DELIV_INDIRECT:
++		return "indirect";
++	case VIRTIO_MSG_FFA_BUS_EVENT_DELIV_FIFO:
++		return "fifo";
++	default:
++		return "unknown";
++	}
++}
++
++void virtio_msg_ffa_driver_trace_msg(struct virtio_msg_ffa_driver *drv,
++				     const char *dir, const char *path,
++				     const struct virtio_msg *msg,
++				     size_t len)
++{
++	struct device *dev;
++	u16 peer_vm;
++
++	if (!drv || !msg)
++		return;
++
++	dev = drv->fdev ? &drv->fdev->dev : NULL;
++	peer_vm = drv->fdev ? (u16)drv->fdev->vm_id : 0;
++	virtio_msg_ffa_trace_msg(dev, peer_vm, dir, path, msg, len);
++}
++
++static const uuid_t virtio_msg_ffa_device_uuid = VIRTIO_MSG_FFA_DEVICE_UUID;
++static const uuid_t virtio_msg_ffa_driver_uuid = VIRTIO_MSG_FFA_DRIVER_UUID;
++
++static const struct ffa_device_id virtio_msg_ffa_local_uuid_ids[] = {
++	{ .uuid = virtio_msg_ffa_driver_uuid },
++	{}
++};
++
++bool virtio_msg_ffa_driver_uuid_match(const uuid_t *uuid)
++{
++	return uuid && uuid_equal(uuid, &virtio_msg_ffa_driver_uuid);
++}
++
++struct virtio_msg_ffa_service_user {
++	struct list_head node;
++	struct virtio_msg_ffa_driver *drv;
++};
++
++static DEFINE_MUTEX(virtio_msg_ffa_service_lock);
++static int virtio_msg_ffa_service_users;
++static LIST_HEAD(virtio_msg_ffa_service_list);
++static struct ffa_driver virtio_msg_ffa_driver;
++
++static int virtio_msg_ffa_prepare_runtime_locked
++					(struct virtio_msg_ffa_driver *drv);
++static int virtio_msg_ffa_send_by_selected_method_locked
++					(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer,
++				 const struct virtio_msg *req, size_t req_len,
++				 struct virtio_msg *resp, size_t resp_buf_len,
++				 size_t *resp_len);
++static int virtio_msg_ffa_send_request_by_method_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 struct virtio_msg_ffa_xfer_engine *xfer,
++			 const struct virtio_msg *req, size_t req_len,
++			 u8 expected_type, u8 expected_msg_id,
++			 struct virtio_msg *resp, size_t resp_buf_len,
++			 size_t *resp_len);
++static u32 virtio_msg_ffa_driver_local_bus_features_locked
++			(struct virtio_msg_ffa_driver *drv);
++static void
++virtio_msg_ffa_driver_store_effective_features_locked
++			(struct virtio_msg_ffa_driver *drv);
++static int virtio_msg_ffa_send_bus_request_locked(struct virtio_msg_ffa_driver *drv,
++						  u8 msg_id,
++						  const void *payload,
++						  size_t payload_len,
++						  struct virtio_msg *resp,
++						  size_t resp_buf_len,
++						  size_t *resp_len);
++struct virtio_msg_ffa_driver_xfer_method {
++	const struct virtio_msg_ffa_xfer_method_desc *desc;
++	const struct virtio_msg_ffa_xfer_ops *ops;
++	bool (*capable)(struct virtio_msg_ffa_driver *drv);
++};
++
++static const struct virtio_msg_ffa_driver_xfer_method *
++virtio_msg_ffa_driver_xfer_method_find
++				(enum virtio_msg_ffa_transfer_method method);
++static int virtio_msg_ffa_xfer_engine_init
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer,
++				 const struct virtio_msg_ffa_driver_xfer_method *method);
++static int virtio_msg_ffa_xfer_setup_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer);
++static void virtio_msg_ffa_xfer_teardown_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer);
++static void
++virtio_msg_ffa_xfer_priv_release_all(struct virtio_msg_ffa_driver *drv);
++static int
++virtio_msg_ffa_local_services_publish_locked(struct virtio_msg_ffa_driver *drv);
++static void
++virtio_msg_ffa_local_services_unpublish_locked(struct virtio_msg_ffa_driver *drv);
++
++static const struct virtio_msg_ffa_driver_xfer_method
++virtio_msg_ffa_driver_xfer_methods[] = {
++#if IS_ENABLED(CONFIG_VIRTIO_MSG_FFA_XFER_FIFO)
++	{
++		.desc = &virtio_msg_ffa_fifo_driver_method_desc,
++		.ops = &virtio_msg_ffa_fifo_xfer_ops,
++		.capable = virtio_msg_ffa_fifo_available,
++	},
++#endif
++#if IS_ENABLED(CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT)
++	{
++		.desc = &virtio_msg_ffa_indirect_driver_method_desc,
++		.ops = &virtio_msg_ffa_indirect_xfer_ops,
++		.capable = virtio_msg_ffa_indirect_available,
++	},
++#endif
++};
++
++static bool virtio_msg_ffa_xfer_priv_method_valid
++			(enum virtio_msg_ffa_transfer_method method)
++{
++	return method > VIRTIO_MSG_FFA_XFER_NONE && method < 4;
++}
++
++static void *virtio_msg_ffa_xfer_priv_get
++			(struct virtio_msg_ffa_driver *drv,
++			 enum virtio_msg_ffa_transfer_method method)
++{
++	if (!drv || !virtio_msg_ffa_xfer_priv_method_valid(method))
++		return NULL;
++
++	return drv->xfer_priv[method];
++}
++
++static int virtio_msg_ffa_xfer_priv_set
++			(struct virtio_msg_ffa_driver *drv,
++			 enum virtio_msg_ffa_transfer_method method, void *priv)
++{
++	if (!drv || !virtio_msg_ffa_xfer_priv_method_valid(method))
++		return -EINVAL;
++
++	drv->xfer_priv[method] = priv;
++	return 0;
++}
++
++static void *virtio_msg_ffa_xfer_priv_take
++			(struct virtio_msg_ffa_driver *drv,
++			 enum virtio_msg_ffa_transfer_method method)
++{
++	void *priv;
++
++	if (!drv || !virtio_msg_ffa_xfer_priv_method_valid(method))
++		return NULL;
++
++	priv = drv->xfer_priv[method];
++	drv->xfer_priv[method] = NULL;
++	return priv;
++}
++
++static void virtio_msg_ffa_bus_request_begin_locked
++					(struct virtio_msg_ffa_driver *drv,
++					 u8 msg_id)
++{
++	lockdep_assert_held(&drv->lock);
++
++	for (;;) {
++		spin_lock(&drv->bus_req_lock);
++		if (!test_and_set_bit(msg_id, drv->bus_req_inflight)) {
++			spin_unlock(&drv->bus_req_lock);
++			return;
++		}
++		spin_unlock(&drv->bus_req_lock);
++
++		mutex_unlock(&drv->lock);
++		wait_event(drv->bus_req_wait,
++			   !test_bit(msg_id, drv->bus_req_inflight));
++		mutex_lock(&drv->lock);
++	}
++}
++
++static void virtio_msg_ffa_bus_request_end_locked
++					(struct virtio_msg_ffa_driver *drv,
++					 u8 msg_id)
++{
++	lockdep_assert_held(&drv->lock);
++
++	spin_lock(&drv->bus_req_lock);
++	clear_bit(msg_id, drv->bus_req_inflight);
++	spin_unlock(&drv->bus_req_lock);
++	wake_up_all(&drv->bus_req_wait);
++}
++
++static bool virtio_msg_ffa_xfer_engine_valid
++			(const struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	return xfer && xfer->method != VIRTIO_MSG_FFA_XFER_NONE && xfer->ops;
++}
++
++static void virtio_msg_ffa_xfer_engine_reset(struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	if (!xfer)
++		return;
++
++	xfer->method = VIRTIO_MSG_FFA_XFER_NONE;
++	xfer->ops = NULL;
++	xfer->priv = NULL;
++}
++
++bool virtio_msg_ffa_driver_event_runtime_ready_locked(struct virtio_msg_ffa_driver *drv)
++{
++	enum virtio_msg_ffa_transfer_method event_method;
++
++	if (!drv || !drv->event_configured || virtio_msg_ffa_endpoint_disabled(drv))
++		return false;
++	if (!virtio_msg_ffa_xfer_engine_valid(&drv->active_xfer))
++		return false;
++
++	event_method = virtio_msg_ffa_xfer_target_method
++			(&drv->ep, VIRTIO_MSG_FFA_XFER_ROLE_DRIVER,
++			 VIRTIO_MSG_FFA_RUNTIME_TARGET_EVENT);
++	if (event_method == VIRTIO_MSG_FFA_XFER_NONE)
++		return false;
++
++	return drv->active_xfer.method == event_method;
++}
++
++bool
++virtio_msg_ffa_driver_indirect_rx_ready_locked(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv || virtio_msg_ffa_endpoint_disabled(drv))
++		return false;
++
++	if (virtio_msg_ffa_driver_event_runtime_ready_locked(drv))
++		return true;
++
++	if (virtio_msg_ffa_xfer_engine_valid(&drv->bootstrap_xfer) &&
++	    drv->bootstrap_xfer.method == VIRTIO_MSG_FFA_XFER_INDIRECT)
++		return true;
++
++	if (virtio_msg_ffa_xfer_engine_valid(&drv->active_xfer) &&
++	    drv->active_xfer.method == VIRTIO_MSG_FFA_XFER_INDIRECT)
++		return true;
++
++	return false;
++}
++
++static int
++virtio_msg_ffa_local_services_publish_locked(struct virtio_msg_ffa_driver *drv)
++{
++	struct virtio_msg_ffa_service_user *user;
++	int ret = 0;
++
++	if (!drv)
++		return 0;
++
++	mutex_lock(&virtio_msg_ffa_service_lock);
++	list_for_each_entry(user, &virtio_msg_ffa_service_list, node) {
++		if (user->drv == drv)
++			goto out_unlock;
++	}
++
++	user = kzalloc(sizeof(*user), GFP_KERNEL);
++	if (!user) {
++		ret = -ENOMEM;
++		goto out_unlock;
++	}
++	user->drv = drv;
++
++	if (!virtio_msg_ffa_service_users) {
++		ret = ffa_driver_services_publish(&virtio_msg_ffa_driver);
++		if (ret) {
++			kfree(user);
++			goto out_unlock;
++		}
++	}
++
++	list_add(&user->node, &virtio_msg_ffa_service_list);
++	virtio_msg_ffa_service_users++;
++
++out_unlock:
++	mutex_unlock(&virtio_msg_ffa_service_lock);
++	if (ret && drv->fdev)
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "local service publish failed: %d\n", ret);
++
++	return ret;
++}
++
++static int virtio_msg_ffa_local_services_module_publish(void)
++{
++	int ret = 0;
++
++	mutex_lock(&virtio_msg_ffa_service_lock);
++	if (!virtio_msg_ffa_service_users)
++		ret = ffa_driver_services_publish(&virtio_msg_ffa_driver);
++	if (!ret)
++		virtio_msg_ffa_service_users++;
++	mutex_unlock(&virtio_msg_ffa_service_lock);
++
++	if (ret)
++		pr_debug("driver local service publish failed: %d\n", ret);
++	else
++		pr_debug("driver local service published\n");
++
++	return ret;
++}
++
++static void virtio_msg_ffa_local_services_module_unpublish(void)
++{
++	int ret = 0;
++
++	mutex_lock(&virtio_msg_ffa_service_lock);
++	if (virtio_msg_ffa_service_users) {
++		virtio_msg_ffa_service_users--;
++		if (!virtio_msg_ffa_service_users)
++			ret = ffa_driver_services_unpublish(&virtio_msg_ffa_driver);
++	}
++	mutex_unlock(&virtio_msg_ffa_service_lock);
++
++	if (ret)
++		pr_debug("driver local service unpublish failed: %d\n", ret);
++}
++
++static void
++virtio_msg_ffa_local_services_unpublish_locked(struct virtio_msg_ffa_driver *drv)
++{
++	struct virtio_msg_ffa_service_user *user, *tmp;
++	int ret = 0;
++	bool found = false;
++
++	if (!drv)
++		return;
++
++	mutex_lock(&virtio_msg_ffa_service_lock);
++	list_for_each_entry_safe(user, tmp, &virtio_msg_ffa_service_list, node) {
++		if (user->drv != drv)
++			continue;
++
++		list_del(&user->node);
++		kfree(user);
++		found = true;
++		break;
++	}
++	if (!found)
++		goto out_unlock;
++
++	virtio_msg_ffa_service_users--;
++	if (!virtio_msg_ffa_service_users)
++		ret = ffa_driver_services_unpublish(&virtio_msg_ffa_driver);
++
++out_unlock:
++	mutex_unlock(&virtio_msg_ffa_service_lock);
++	if (ret && drv->fdev)
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "local service unpublish failed: %d\n",
++				     ret);
++}
++
++static void virtio_msg_ffa_method_teardown_locked(struct virtio_msg_ffa_driver *drv)
++{
++	const struct virtio_msg_ffa_driver_xfer_method *method;
++	struct virtio_msg_ffa_xfer_engine xfer;
++	struct virtio_msg_ffa_xfer_engine active_xfer;
++	struct virtio_msg_ffa_xfer_engine bootstrap_xfer;
++	unsigned int i;
++
++	if (!drv)
++		return;
++
++	/*
++	 * Teardown active/bootstrap engines first so method-private state owned
++	 * by engine handles is cleaned up before shell fallback cleanup.
++	 */
++	active_xfer = drv->active_xfer;
++	bootstrap_xfer = drv->bootstrap_xfer;
++	virtio_msg_ffa_xfer_teardown_locked(drv, &active_xfer);
++	if (bootstrap_xfer.method != active_xfer.method ||
++	    bootstrap_xfer.priv != active_xfer.priv)
++		virtio_msg_ffa_xfer_teardown_locked(drv, &bootstrap_xfer);
++
++	/*
++	 * Teardown non-selected methods that may still hold setup state.
++	 */
++	for (i = 0; i < ARRAY_SIZE(virtio_msg_ffa_driver_xfer_methods); i++) {
++		method = &virtio_msg_ffa_driver_xfer_methods[i];
++		if (!method->desc)
++			continue;
++		if (method->desc->method == active_xfer.method ||
++		    method->desc->method == bootstrap_xfer.method)
++			continue;
++		if (!virtio_msg_ffa_xfer_engine_init(drv, &xfer, method))
++			virtio_msg_ffa_xfer_teardown_locked(drv, &xfer);
++	}
++
++	virtio_msg_ffa_xfer_engine_reset(&drv->active_xfer);
++	virtio_msg_ffa_xfer_engine_reset(&drv->bootstrap_xfer);
++}
++
++static int virtio_msg_ffa_endpoint_teardown_locked(struct virtio_msg_ffa_driver *drv,
++						   bool reset_success)
++{
++	struct virtio_msg_ffa_topology *topo;
++	int ret = 0;
++
++	if (!drv)
++		return -EINVAL;
++
++	WRITE_ONCE(drv->indirect_rx_generation,
++		   READ_ONCE(drv->indirect_rx_generation) + 1);
++
++	/* Teardown order is fixed, see plan-handle-review.md Step 4. */
++
++	/* Unpublish local services before endpoint shutdown. */
++	virtio_msg_ffa_local_services_unpublish_locked(drv);
++
++	/* 1-2) Quiesce and teardown transfer-method-specific runtime state. */
++	virtio_msg_ffa_method_teardown_locked(drv);
++
++	/* 3) Stop topology publication / unpublish devices. */
++	virtio_msg_ffa_endpoint_disable(drv);
++	rcu_read_lock();
++	topo = virtio_msg_ffa_driver_topology_get(drv);
++	rcu_read_unlock();
++	virtio_msg_ffa_driver_topology_set(drv, NULL);
++
++	mutex_unlock(&drv->lock);
++	synchronize_rcu();
++	virtio_msg_ffa_topology_destroy(topo);
++	mutex_lock(&drv->lock);
++
++	/* 4) Abort exchanges with -ESHUTDOWN. */
++	virtio_msg_ffa_exchange_abort_all(&drv->ep, -ESHUTDOWN);
++
++	/* 5) Reclaim and untrack FF-A area exports for the endpoint. */
++	virtio_msg_ffa_area_endpoint_cleanup(&drv->area_ctx);
++
++	/* 6) Runtime method state already torn down above. */
++
++	/* 7) Reset-success only: clear negotiation/selected-method state. */
++	if (reset_success) {
++		mutex_lock(&drv->ep.exchange_lock);
++		drv->ep.exchange_shutdown = false;
++		mutex_unlock(&drv->ep.exchange_lock);
++
++		drv->ep.negotiation_done = false;
++		drv->event_configured = false;
++		virtio_msg_ffa_select_transfer_method(&drv->ep,
++						      VIRTIO_MSG_FFA_XFER_NONE);
++		virtio_msg_ffa_xfer_engine_reset(&drv->bootstrap_xfer);
++		virtio_msg_ffa_xfer_engine_reset(&drv->active_xfer);
++		drv->endpoint_disabled = false;
++
++		ret = virtio_msg_ffa_topology_init(drv);
++		if (ret)
++			virtio_msg_ffa_endpoint_disable(drv);
++	}
++
++	return ret;
++}
++
++static void virtio_msg_ffa_handle_endpoint_failure_locked
++				(struct virtio_msg_ffa_driver *drv, int err)
++{
++	if (!drv)
++		return;
++
++	if (drv->fdev)
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "endpoint failure after FIFO notify retries: %d\n",
++				     err);
++
++	(void)virtio_msg_ffa_endpoint_teardown_locked(drv, false);
++}
++
++void virtio_msg_ffa_driver_handle_endpoint_failure_locked(struct virtio_msg_ffa_driver *drv,
++							  int err)
++{
++	virtio_msg_ffa_handle_endpoint_failure_locked(drv, err);
++}
++
++static int
++virtio_msg_ffa_driver_route_event_locked(struct virtio_msg_ffa_driver *drv,
++					 const struct virtio_msg *msg,
++					 size_t msg_len, u8 type_bits)
++{
++	if (!drv || !msg)
++		return -EINVAL;
++	if (!drv->event_configured)
++		return 0;
++
++	if (type_bits == VIRTIO_MSG_TYPE_TRANSPORT)
++		return virtio_msg_ffa_topology_handle_transport_event(drv, msg);
++
++	if (type_bits == VIRTIO_MSG_TYPE_BUS &&
++	    msg->msg_id == VIRTIO_MSG_BUS_EVENT_DEVICE) {
++		const struct virtio_msg_bus_event_device *event;
++
++		if (msg_len < sizeof(*msg) + sizeof(*event))
++			return -EMSGSIZE;
++
++		event = (const struct virtio_msg_bus_event_device *)msg->payload;
++		return virtio_msg_ffa_topology_handle_event(drv, event);
++	}
++
++	if (type_bits == VIRTIO_MSG_TYPE_BUS &&
++	    msg->msg_id == FFA_BUS_EVENT_AREA_RELEASE) {
++		const struct virtio_msg_ffa_area_release_event *event;
++		u16 area_id;
++
++		if (msg_len < sizeof(*msg) + sizeof(*event))
++			return -EMSGSIZE;
++
++		event = (const struct virtio_msg_ffa_area_release_event *)msg->payload;
++		area_id = le16_to_cpu(event->area_id);
++		return virtio_msg_ffa_area_handle_release(&drv->area_ctx, area_id);
++	}
++
++	return 0;
++}
++
++static int
++virtio_msg_ffa_driver_route_response_locked
++		(struct virtio_msg_ffa_driver *drv,
++		 const struct virtio_msg *msg, size_t msg_len,
++		 const struct virtio_msg_ffa_exchange *exchange,
++		 int match_status,
++		 const struct virtio_msg_ffa_error_result *error)
++{
++	u16 dev_num;
++	u16 token;
++
++	if (!drv || !msg || !exchange)
++		return -EINVAL;
++
++	(void)error;
++	dev_num = le16_to_cpu(msg->dev_num);
++	token = le16_to_cpu(msg->token);
++	if (match_status == -EPROTO) {
++		if (drv->fdev)
++			dev_dbg(&drv->fdev->dev,
++				"bus rx response match failed: dev=%u tok=%u status=%d\n",
++				dev_num, token, match_status);
++		else
++			pr_debug("bus rx response match failed: dev=%u tok=%u status=%d\n",
++				 dev_num, token, match_status);
++		return virtio_msg_ffa_exchange_complete(&drv->ep, dev_num, token,
++							NULL, 0, match_status);
++	}
++
++	return virtio_msg_ffa_exchange_complete(&drv->ep, dev_num, token, msg,
++						msg_len, 0);
++}
++
++int virtio_msg_ffa_driver_dispatch_inbound_locked(struct virtio_msg_ffa_driver *drv,
++						  const struct virtio_msg *msg,
++						  size_t msg_len)
++{
++	struct virtio_msg_ffa_inbound_result result;
++	int ret;
++
++	if (!drv || !msg)
++		return -EINVAL;
++
++	ret = virtio_msg_ffa_classify_inbound(&drv->ep, msg, msg_len, &result);
++	if (ret) {
++		if (drv->fdev)
++			dev_dbg(&drv->fdev->dev,
++				"bus rx dispatch classify failed: ret=%d\n", ret);
++		else
++			pr_debug("bus rx dispatch classify failed: ret=%d\n",
++				 ret);
++		return ret;
++	}
++
++	switch (result.class) {
++	case VIRTIO_MSG_FFA_INBOUND_EVENT:
++		return virtio_msg_ffa_driver_route_event_locked(drv, msg, msg_len,
++								result.type_bits);
++	case VIRTIO_MSG_FFA_INBOUND_RESPONSE:
++		return virtio_msg_ffa_driver_route_response_locked
++				(drv, msg, msg_len, &result.exchange,
++				 result.match_status, &result.error);
++	case VIRTIO_MSG_FFA_INBOUND_DROP:
++	case VIRTIO_MSG_FFA_INBOUND_BUS_REQUEST:
++	case VIRTIO_MSG_FFA_INBOUND_TRANSPORT_REQUEST:
++	case VIRTIO_MSG_FFA_INBOUND_PRENEG_ERROR_RESPONSE:
++	default:
++		return 0;
++	}
++}
++
++static void virtio_msg_ffa_handle_device_failure_locked
++				(struct virtio_msg_ffa_driver *drv, u16 dev_num)
++{
++	struct virtio_msg_bus_event_device event;
++
++	if (!drv)
++		return;
++
++	if (drv->fdev)
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "device %u failure; scheduling removal\n",
++				     dev_num);
++
++	event.dev_num = cpu_to_le16(dev_num);
++	event.dev_state = cpu_to_le16(VIRTIO_MSG_BUS_EVENT_DEV_STATE_REMOVED);
++	virtio_msg_ffa_topology_handle_event(drv, &event);
++}
++
++void virtio_msg_ffa_driver_handle_device_failure_locked(struct virtio_msg_ffa_driver *drv,
++							u16 dev_num)
++{
++	virtio_msg_ffa_handle_device_failure_locked(drv, dev_num);
++}
++
++static const struct virtio_msg_ffa_driver_xfer_method *
++virtio_msg_ffa_driver_xfer_method_find(enum virtio_msg_ffa_transfer_method method)
++{
++	const struct virtio_msg_ffa_driver_xfer_method *entry;
++	unsigned int i;
++
++	if (method == VIRTIO_MSG_FFA_XFER_NONE)
++		return NULL;
++
++	for (i = 0; i < ARRAY_SIZE(virtio_msg_ffa_driver_xfer_methods); i++) {
++		entry = &virtio_msg_ffa_driver_xfer_methods[i];
++		if (entry->desc && entry->desc->method == method)
++			return entry;
++	}
++
++	return NULL;
++}
++
++static int virtio_msg_ffa_xfer_engine_init
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer,
++				 const struct virtio_msg_ffa_driver_xfer_method *method)
++{
++	const struct virtio_msg_ffa_xfer_method_desc *desc;
++
++	if (!drv || !xfer || !method || !method->desc || !method->ops)
++		return -EINVAL;
++	desc = method->desc;
++	if (!(desc->role_mask & VIRTIO_MSG_FFA_XFER_ROLE_DRIVER))
++		return -EOPNOTSUPP;
++
++	xfer->method = desc->method;
++	xfer->ops = method->ops;
++	xfer->priv = virtio_msg_ffa_xfer_priv_get(drv, desc->method);
++
++	return 0;
++}
++
++static void virtio_msg_ffa_xfer_release_priv(struct virtio_msg_ffa_driver *drv,
++					     enum virtio_msg_ffa_transfer_method method,
++					     void *priv)
++{
++	struct virtio_msg_ffa_xfer_engine xfer;
++	const struct virtio_msg_ffa_driver_xfer_method *entry;
++	const struct virtio_msg_ffa_xfer_ops *ops;
++
++	if (!drv || !priv || method == VIRTIO_MSG_FFA_XFER_NONE)
++		return;
++
++	entry = virtio_msg_ffa_driver_xfer_method_find(method);
++	ops = entry ? entry->ops : NULL;
++	if (!ops || !ops->release_priv)
++		return;
++
++	xfer.method = method;
++	xfer.ops = ops;
++	xfer.priv = priv;
++	ops->release_priv(drv, &xfer);
++}
++
++static void
++virtio_msg_ffa_xfer_priv_release_all(struct virtio_msg_ffa_driver *drv)
++{
++	const struct virtio_msg_ffa_driver_xfer_method *method;
++	void *priv;
++	unsigned int i;
++
++	if (!drv)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(virtio_msg_ffa_driver_xfer_methods); i++) {
++		method = &virtio_msg_ffa_driver_xfer_methods[i];
++		if (!method->desc)
++			continue;
++
++		priv = virtio_msg_ffa_xfer_priv_take(drv, method->desc->method);
++		virtio_msg_ffa_xfer_release_priv(drv, method->desc->method, priv);
++	}
++}
++
++static int virtio_msg_ffa_xfer_setup_locked(struct virtio_msg_ffa_driver *drv,
++					    struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	void *old_priv;
++	int ret, state_ret;
++
++	if (!drv || !virtio_msg_ffa_xfer_engine_valid(xfer))
++		return -EINVAL;
++	if (!xfer->ops->setup_locked)
++		return -EOPNOTSUPP;
++
++	old_priv = xfer->priv;
++	ret = xfer->ops->setup_locked(drv, xfer);
++	if (ret)
++		goto out_err;
++	if (!xfer->priv)
++		return 0;
++
++	state_ret = virtio_msg_ffa_xfer_priv_set(drv, xfer->method,
++						 xfer->priv);
++	if (state_ret) {
++		/*
++		 * Roll back method setup if state registration fails so no
++		 * live method state remains untracked.
++		 */
++		if (xfer->ops->teardown_locked)
++			xfer->ops->teardown_locked(drv, xfer);
++		if (xfer->priv != old_priv)
++			virtio_msg_ffa_xfer_release_priv(drv, xfer->method,
++							 xfer->priv);
++		xfer->priv = old_priv;
++		return state_ret;
++	}
++
++	return 0;
++
++out_err:
++	if (xfer->priv != old_priv) {
++		if (xfer->ops->teardown_locked)
++			xfer->ops->teardown_locked(drv, xfer);
++		virtio_msg_ffa_xfer_release_priv(drv, xfer->method, xfer->priv);
++		xfer->priv = old_priv;
++	}
++
++	return ret;
++}
++
++static void virtio_msg_ffa_xfer_teardown_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	if (!drv || !virtio_msg_ffa_xfer_engine_valid(xfer))
++		return;
++	if (!xfer->ops->teardown_locked)
++		return;
++
++	xfer->ops->teardown_locked(drv, xfer);
++}
++
++static void virtio_msg_ffa_xfer_quiesce_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	if (!drv || !virtio_msg_ffa_xfer_engine_valid(xfer))
++		return;
++	if (!xfer->ops->quiesce_locked)
++		return;
++
++	xfer->ops->quiesce_locked(drv, xfer);
++}
++
++/*
++ * Runtime event setup first prepares transfer-method state. For FIFO this
++ * includes sharing the FIFO ring with FFA_MEM_SHARE and sending
++ * FIFO_CONFIGURE. The method event_configure_locked() hook then sends
++ * EVENT_CONFIGURE. Only after EVENT_CONFIGURE succeeds does the driver mark
++ * events configured, copy active_xfer, select the endpoint runtime transfer
++ * method, and publish local services.
++ */
++static int virtio_msg_ffa_event_configure_active_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	int ret;
++
++	if (!virtio_msg_ffa_xfer_engine_valid(xfer))
++		return -EINVAL;
++
++	if (!xfer->ops->event_configure_locked)
++		return -EOPNOTSUPP;
++
++	ret = virtio_msg_ffa_xfer_setup_locked(drv, xfer);
++	if (ret)
++		return ret;
++
++	drv->event_configured = false;
++	ret = xfer->ops->event_configure_locked(drv, xfer);
++	if (ret)
++		return ret;
++
++	drv->event_configured = true;
++	drv->active_xfer = *xfer;
++	virtio_msg_ffa_select_transfer_method(&drv->ep, xfer->method);
++	if (drv->fdev) {
++		dev_info(&drv->fdev->dev,
++			 "runtime method selected: peer_vm=%u xfer=%s event=%s\n",
++			 (u16)drv->fdev->vm_id,
++			 virtio_msg_ffa_xfer_method_name(xfer->method),
++			 virtio_msg_ffa_event_delivery_name(drv->ep.event_delivery));
++	}
++
++	return virtio_msg_ffa_local_services_publish_locked(drv);
++}
++
++static int virtio_msg_ffa_send_by_selected_method_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer,
++				 const struct virtio_msg *req, size_t req_len,
++				 struct virtio_msg *resp, size_t resp_buf_len,
++				 size_t *resp_len)
++{
++	u8 expected_type;
++
++	if (!req)
++		return -EINVAL;
++
++	expected_type = req->type | VIRTIO_MSG_TYPE_RESPONSE;
++	return virtio_msg_ffa_send_request_by_method_locked
++				(drv, xfer, req, req_len, expected_type,
++				 req->msg_id, resp, resp_buf_len, resp_len);
++}
++
++static int virtio_msg_ffa_exchange_complete_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 const struct virtio_msg *req,
++			 const struct virtio_msg *resp, size_t resp_len,
++			 u8 expected_type, u8 expected_msg_id,
++			 bool release_exchange)
++{
++	struct virtio_msg_ffa_error_result error_result;
++	u16 dev_num, token;
++	int ret;
++
++	dev_num = le16_to_cpu(req->dev_num);
++	token = le16_to_cpu(req->token);
++
++	if (virtio_msg_ffa_msg_is_event(resp->msg_id)) {
++		const u8 type_mask = VIRTIO_MSG_TYPE_RESPONSE | VIRTIO_MSG_TYPE_BUS;
++
++		/* Route the event so it is not lost, but fail the request. */
++		(void)virtio_msg_ffa_driver_route_event_locked
++			(drv, resp, resp_len, resp->type & type_mask);
++		ret = -EPROTO;
++		goto out_release;
++	}
++
++	if (resp->msg_id == FFA_BUS_MSG_ERROR) {
++		ret = virtio_msg_ffa_handle_error_resp(&drv->ep, resp, resp_len,
++						       &error_result);
++		if (ret == 1)
++			ret = -EIO;
++		else if (!ret)
++			ret = -EPROTO;
++		goto out_release;
++	}
++
++	if (!virtio_msg_ffa_type_match_masked(resp->type, expected_type) ||
++	    resp->msg_id != expected_msg_id) {
++		ret = -EPROTO;
++		goto out_release;
++	}
++
++	if (le16_to_cpu(resp->dev_num) != le16_to_cpu(req->dev_num) ||
++	    le16_to_cpu(resp->token) != le16_to_cpu(req->token)) {
++		ret = -EPROTO;
++		goto out_release;
++	}
++
++	ret = 0;
++
++out_release:
++	if (ret) {
++		if (drv->fdev)
++			dev_dbg(&drv->fdev->dev,
++				"bus rx complete failed: ret=%d expected_type=0x%x expected_msg_id=0x%02x dev=%u tok=%u\n",
++				ret, expected_type, expected_msg_id, dev_num, token);
++		else
++			pr_debug("bus rx complete failed: ret=%d expected_type=0x%x expected_msg_id=0x%02x dev=%u tok=%u\n",
++				 ret, expected_type, expected_msg_id, dev_num, token);
++	}
++	if (release_exchange)
++		virtio_msg_ffa_exchange_release(&drv->ep, dev_num, token, NULL);
++	return ret;
++}
++
++static int virtio_msg_ffa_direct_event_ack_validate
++				(const struct virtio_msg *req,
++				 const struct virtio_msg *resp,
++				 size_t resp_len)
++{
++	if (!req || !resp)
++		return -EINVAL;
++
++	if (resp->type != (VIRTIO_MSG_TYPE_BUS | VIRTIO_MSG_TYPE_RESPONSE))
++		return -EPROTO;
++	if (resp->msg_id)
++		return -EPROTO;
++	if (le16_to_cpu(resp->dev_num))
++		return -EPROTO;
++	if (le16_to_cpu(resp->token) != le16_to_cpu(req->token))
++		return -EPROTO;
++	if (le16_to_cpu(resp->msg_size) != sizeof(*resp) ||
++	    resp_len != sizeof(*resp))
++		return -EPROTO;
++
++	return 0;
++}
++
++static int virtio_msg_ffa_driver_wait_exchange_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 u16 dev_num, u16 token,
++				 struct virtio_msg *resp, size_t resp_buf_len,
++				 size_t *resp_len)
++{
++	int ret;
++
++	if (!drv || !resp || !resp_len)
++		return -EINVAL;
++
++	mutex_unlock(&drv->lock);
++	ret = virtio_msg_ffa_exchange_wait(&drv->ep, dev_num, token, resp,
++					   resp_buf_len, resp_len,
++					   VIRTIO_MSG_FFA_ASYNC_TIMEOUT_MS);
++	mutex_lock(&drv->lock);
++
++	return ret;
++}
++
++static int virtio_msg_ffa_send_request_by_method_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 struct virtio_msg_ffa_xfer_engine *xfer,
++			 const struct virtio_msg *req, size_t req_len,
++			 u8 expected_type, u8 expected_msg_id,
++			 struct virtio_msg *resp, size_t resp_buf_len,
++			 size_t *resp_len)
++{
++	enum virtio_msg_ffa_preneg_action preneg_action;
++	u16 dev_num, token;
++	bool need_response;
++	bool ack_only = false;
++	bool exchange_stored = false;
++	struct virtio_msg *submit_resp = resp;
++	const char *method_name;
++	size_t submit_resp_buf_len = resp_buf_len;
++	size_t *submit_resp_len = resp_len;
++	u8 local_resp_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *local_resp = (struct virtio_msg *)local_resp_buf;
++	size_t local_resp_len = 0;
++	int ret;
++
++	if (!drv || !req)
++		return -EINVAL;
++	if (resp && !resp_len)
++		return -EINVAL;
++	if (!resp && resp_len)
++		return -EINVAL;
++
++	ret = virtio_msg_ffa_validate_inbound_msg(req, req_len);
++	if (ret)
++		return ret;
++
++	preneg_action = virtio_msg_ffa_classify_preneg_msg(&drv->ep, req);
++	if (preneg_action == VIRTIO_MSG_FFA_PRENEG_REJECT_LOCAL_DROP)
++		return -EACCES;
++	if (preneg_action == VIRTIO_MSG_FFA_PRENEG_REJECT_DEVICE_ERROR)
++		return -EPROTO;
++
++	if (!virtio_msg_ffa_xfer_engine_valid(xfer) || !xfer->ops->submit_locked)
++		return -EOPNOTSUPP;
++
++	dev_num = le16_to_cpu(req->dev_num);
++	token = le16_to_cpu(req->token);
++	method_name = virtio_msg_ffa_xfer_method_name(xfer->method);
++	virtio_msg_ffa_driver_trace_msg(drv, "tx", method_name, req, req_len);
++
++	need_response = !!resp;
++	if (need_response) {
++		ret = virtio_msg_ffa_exchange_store(&drv->ep, dev_num, token,
++						    expected_msg_id,
++						    expected_type);
++		if (ret)
++			return ret;
++		exchange_stored = true;
++	} else if (!xfer->ops->async_response) {
++		memset(local_resp_buf, 0, sizeof(local_resp_buf));
++		submit_resp = local_resp;
++		submit_resp_buf_len = sizeof(local_resp_buf);
++		submit_resp_len = &local_resp_len;
++		need_response = true;
++		ack_only = true;
++	}
++
++	ret = xfer->ops->submit_locked(drv, xfer, req, req_len, submit_resp,
++				       submit_resp_buf_len, submit_resp_len);
++	if (ret) {
++		if (drv->fdev)
++			dev_dbg(&drv->fdev->dev,
++				"bus tx submit failed: method=%s dev=%u tok=%u ret=%d\n",
++				method_name, dev_num, token, ret);
++		else
++			pr_debug("bus tx submit failed: method=%s dev=%u tok=%u ret=%d\n",
++				 method_name, dev_num, token, ret);
++		goto out_release;
++	}
++
++	if (exchange_stored && xfer->ops->async_response) {
++		ret = virtio_msg_ffa_driver_wait_exchange_locked
++				(drv, dev_num, token, resp, resp_buf_len,
++				 resp_len);
++		if (ret) {
++			if (drv->fdev)
++				dev_dbg(&drv->fdev->dev,
++					"bus rx wait failed: method=%s dev=%u tok=%u ret=%d\n",
++					method_name, dev_num, token, ret);
++			else
++				pr_debug("bus rx wait failed: method=%s dev=%u tok=%u ret=%d\n",
++					 method_name, dev_num, token, ret);
++			goto out_release;
++		}
++	}
++
++	if (!need_response)
++		return 0;
++
++	if (!xfer->ops->async_response)
++		virtio_msg_ffa_driver_trace_msg(drv, "rx", method_name, submit_resp,
++						*submit_resp_len);
++	if (ack_only && virtio_msg_ffa_msg_is_event(req->msg_id))
++		return virtio_msg_ffa_direct_event_ack_validate
++				(req, submit_resp, *submit_resp_len);
++
++	ret = virtio_msg_ffa_exchange_complete_locked
++			(drv, req, submit_resp, *submit_resp_len,
++			 expected_type, expected_msg_id, exchange_stored);
++	if (!ret && ack_only &&
++	    (le16_to_cpu(submit_resp->msg_size) != sizeof(*submit_resp) ||
++	     *submit_resp_len != sizeof(*submit_resp)))
++		ret = -EPROTO;
++	return ret;
++
++out_release:
++	if (exchange_stored)
++		virtio_msg_ffa_exchange_release(&drv->ep, dev_num, token, NULL);
++	return ret;
++}
++
++static int virtio_msg_ffa_send_request_locked(struct virtio_msg_ffa_driver *drv,
++					      const struct virtio_msg *req,
++					      size_t req_len, u8 expected_type,
++					      u8 expected_msg_id,
++					      struct virtio_msg *resp,
++					      size_t resp_buf_len,
++					      size_t *resp_len)
++{
++	return virtio_msg_ffa_send_request_by_method_locked
++				(drv, &drv->active_xfer, req, req_len,
++				 expected_type, expected_msg_id, resp,
++				 resp_buf_len, resp_len);
++}
++
++static bool virtio_msg_ffa_bus_msg_needs_bootstrap(u8 msg_id)
++{
++	switch (msg_id) {
++	case FFA_BUS_MSG_VERSION:
++	case FFA_BUS_MSG_RESET:
++	case FFA_BUS_MSG_EVENT_CONFIGURE:
++	case FFA_BUS_MSG_FIFO_CONFIGURE:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static int virtio_msg_ffa_send_bus_request_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 u8 msg_id, const void *payload, size_t payload_len,
++				 struct virtio_msg *resp, size_t resp_buf_len,
++				 size_t *resp_len)
++{
++	u8 req_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *req = (struct virtio_msg *)req_buf;
++	struct virtio_msg_ffa_xfer_engine *xfer;
++	size_t req_len;
++	u16 token;
++	int ret;
++
++	if (!drv || !resp || !resp_len)
++		return -EINVAL;
++
++	virtio_msg_ffa_bus_request_begin_locked(drv, msg_id);
++	ret = virtio_msg_ffa_next_token_locked(&drv->ep, &token);
++	if (ret)
++		goto out_request_end;
++	ret = virtio_msg_ffa_prepare_frame(req, sizeof(req_buf), msg_id,
++					   VIRTIO_MSG_TYPE_BUS |
++					   VIRTIO_MSG_TYPE_REQUEST,
++					   0, token, payload,
++					   payload_len, &req_len);
++	if (ret)
++		goto out_request_end;
++
++	xfer = &drv->active_xfer;
++	if (virtio_msg_ffa_bus_msg_needs_bootstrap(msg_id))
++		xfer = &drv->bootstrap_xfer;
++
++	ret = virtio_msg_ffa_send_request_by_method_locked
++				(drv, xfer, req, req_len,
++				 VIRTIO_MSG_TYPE_BUS | VIRTIO_MSG_TYPE_RESPONSE,
++				 msg_id, resp, resp_buf_len, resp_len);
++
++out_request_end:
++	virtio_msg_ffa_bus_request_end_locked(drv, msg_id);
++	return ret;
++}
++
++int virtio_msg_ffa_driver_send_bus_request_locked(struct virtio_msg_ffa_driver *drv,
++						  u8 msg_id,
++						  const void *payload,
++						  size_t payload_len,
++						  struct virtio_msg *resp,
++						  size_t resp_buf_len,
++						  size_t *resp_len)
++{
++	return virtio_msg_ffa_send_bus_request_locked(drv, msg_id, payload,
++						      payload_len, resp,
++						      resp_buf_len, resp_len);
++}
++
++int virtio_msg_ffa_area_ctx_send_bus_req(struct virtio_msg_ffa_area_ctx *ctx,
++					 u8 msg_id, const void *payload,
++					 size_t payload_len,
++					 struct virtio_msg *resp,
++					 size_t resp_buf_len,
++					 size_t *resp_len)
++{
++	struct virtio_msg_ffa_driver *drv;
++	int ret;
++
++	if (!ctx || !ctx->fdev || !ctx->ep)
++		return -EINVAL;
++
++	drv = container_of(ctx, struct virtio_msg_ffa_driver, area_ctx);
++	mutex_lock(&drv->lock);
++	ret = virtio_msg_ffa_prepare_runtime_locked(drv);
++	if (ret)
++		goto out_unlock;
++
++	ret = virtio_msg_ffa_send_bus_request_locked(drv, msg_id, payload,
++						     payload_len, resp,
++						     resp_buf_len, resp_len);
++
++out_unlock:
++	mutex_unlock(&drv->lock);
++	return ret;
++}
++
++struct virtio_msg_ffa_area_ctx *
++virtio_msg_ffa_area_ctx_alloc(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv)
++		return NULL;
++
++	drv->area_ctx.fdev = drv->fdev;
++	drv->area_ctx.ep = &drv->ep;
++	drv->area_ctx.send_bus_req = virtio_msg_ffa_area_ctx_send_bus_req;
++
++	return &drv->area_ctx;
++}
++
++void virtio_msg_ffa_area_ctx_free(struct virtio_msg_ffa_area_ctx *ctx)
++{
++	if (!ctx)
++		return;
++
++	ctx->fdev = NULL;
++	ctx->ep = NULL;
++	ctx->send_bus_req = NULL;
++}
++
++int virtio_msg_ffa_topology_send_bus_request(struct virtio_msg_ffa_driver *drv,
++					     u8 msg_id, const void *payload,
++					     size_t payload_len,
++					     struct virtio_msg *resp,
++					     size_t resp_buf_len,
++					     size_t *resp_len)
++{
++	int ret;
++
++	if (!drv)
++		return -EINVAL;
++
++	mutex_lock(&drv->lock);
++	ret = virtio_msg_ffa_send_bus_request_locked(drv, msg_id, payload,
++						     payload_len, resp,
++						     resp_buf_len, resp_len);
++	mutex_unlock(&drv->lock);
++	return ret;
++}
++
++int virtio_msg_ffa_driver_prepare_runtime(struct virtio_msg_ffa_driver *drv)
++{
++	int ret;
++
++	if (!drv)
++		return -EINVAL;
++
++	mutex_lock(&drv->lock);
++	ret = virtio_msg_ffa_prepare_runtime_locked(drv);
++	mutex_unlock(&drv->lock);
++
++	return ret;
++}
++
++int virtio_msg_ffa_driver_event_configure(struct virtio_msg_ffa_driver *drv)
++{
++	int ret;
++
++	if (!drv)
++		return -EINVAL;
++
++	mutex_lock(&drv->lock);
++	if (drv->event_configured &&
++	    virtio_msg_ffa_xfer_engine_valid(&drv->active_xfer)) {
++		ret = 0;
++		goto out_unlock;
++	}
++
++	if (!virtio_msg_ffa_xfer_engine_valid(&drv->active_xfer)) {
++		ret = -EOPNOTSUPP;
++		goto out_unlock;
++	}
++
++	ret = virtio_msg_ffa_event_configure_active_locked(drv,
++							   &drv->active_xfer);
++out_unlock:
++	mutex_unlock(&drv->lock);
++
++	return ret;
++}
++
++struct device *virtio_msg_ffa_driver_parent(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv || !drv->fdev)
++		return NULL;
++
++	return &drv->fdev->dev;
++}
++
++struct virtio_msg_ffa_area_ctx *
++virtio_msg_ffa_driver_area_ctx(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv)
++		return NULL;
++
++	return &drv->area_ctx;
++}
++
++int virtio_msg_ffa_driver_area_add(struct virtio_msg_ffa_driver *drv,
++				   const struct virtio_msg_ffa_area *area)
++{
++	if (!drv)
++		return -EINVAL;
++
++	return virtio_msg_ffa_area_add(&drv->ep, area);
++}
++
++int virtio_msg_ffa_driver_area_lookup(struct virtio_msg_ffa_driver *drv,
++				      u16 area_id,
++				      struct virtio_msg_ffa_area *out)
++{
++	if (!drv)
++		return -EINVAL;
++
++	return virtio_msg_ffa_area_lookup(&drv->ep, area_id, out);
++}
++
++int virtio_msg_ffa_driver_area_mark_released(struct virtio_msg_ffa_driver *drv,
++					     u16 area_id)
++{
++	if (!drv)
++		return -EINVAL;
++
++	return virtio_msg_ffa_area_mark_released(&drv->ep, area_id);
++}
++
++int virtio_msg_ffa_driver_area_remove(struct virtio_msg_ffa_driver *drv,
++				      u16 area_id,
++				      struct virtio_msg_ffa_area *removed)
++{
++	if (!drv)
++		return -EINVAL;
++
++	return virtio_msg_ffa_area_remove(&drv->ep, area_id, removed);
++}
++
++struct virtio_msg_ffa_topology *
++virtio_msg_ffa_driver_topology_get(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv)
++		return NULL;
++
++	return rcu_dereference(drv->topology);
++}
++
++void virtio_msg_ffa_driver_topology_set(struct virtio_msg_ffa_driver *drv,
++					struct virtio_msg_ffa_topology *topo)
++{
++	if (!drv)
++		return;
++
++	rcu_assign_pointer(drv->topology, topo);
++}
++
++void virtio_msg_ffa_endpoint_disable(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv)
++		return;
++
++	WRITE_ONCE(drv->endpoint_disabled, true);
++}
++
++bool virtio_msg_ffa_endpoint_disabled(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv)
++		return true;
++
++	return READ_ONCE(drv->endpoint_disabled);
++}
++
++static int virtio_msg_ffa_version_negotiate_locked
++			(struct virtio_msg_ffa_driver *drv)
++{
++	struct virtio_msg_ffa_version_req version_req;
++	struct virtio_msg_ffa_version_resp *version_resp;
++	u8 version_msg_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *version_msg =
++		(struct virtio_msg *)version_msg_buf;
++	size_t version_len;
++	u32 peer_ffa_version;
++	int ret;
++
++	virtio_msg_ffa_version_begin(&drv->ep);
++	virtio_msg_ffa_version_prepare_probe(&version_req, drv->local_ffa_version);
++	memset(version_msg_buf, 0, sizeof(version_msg_buf));
++	ret = virtio_msg_ffa_send_bus_request_locked(drv, FFA_BUS_MSG_VERSION,
++						     &version_req,
++						     sizeof(version_req),
++						     version_msg,
++						     sizeof(version_msg_buf),
++						     &version_len);
++	if (ret)
++		return ret;
++
++	if (version_len != sizeof(*version_msg) + sizeof(*version_resp))
++		return -EPROTO;
++	version_resp = (struct virtio_msg_ffa_version_resp *)version_msg->payload;
++	ret = virtio_msg_ffa_version_accept_resp(&drv->ep, &version_req,
++						 version_resp);
++	if (ret < 0)
++		return ret;
++	virtio_msg_ffa_driver_store_effective_features_locked(drv);
++	if (!drv->ep.bus_version)
++		return -EOPNOTSUPP;
++	peer_ffa_version = le32_to_cpu(version_resp->ffa_version);
++	if (peer_ffa_version < FFA_VERSION_1_2)
++		return -EOPNOTSUPP;
++	drv->ep.ffa_version = min(drv->local_ffa_version, peer_ffa_version);
++
++	virtio_msg_ffa_version_prepare_echo(&version_req, version_resp);
++	memset(version_msg_buf, 0, sizeof(version_msg_buf));
++	ret = virtio_msg_ffa_send_bus_request_locked(drv, FFA_BUS_MSG_VERSION,
++						     &version_req,
++						     sizeof(version_req),
++						     version_msg,
++						     sizeof(version_msg_buf),
++						     &version_len);
++	if (ret)
++		return ret;
++
++	if (version_len != sizeof(*version_msg) + sizeof(*version_resp))
++		return -EPROTO;
++	version_resp = (struct virtio_msg_ffa_version_resp *)version_msg->payload;
++	ret = virtio_msg_ffa_version_accept_resp(&drv->ep, &version_req,
++						 version_resp);
++	if (ret != 1)
++		return -EPROTO;
++	virtio_msg_ffa_driver_store_effective_features_locked(drv);
++	if (!drv->ep.bus_version)
++		return -EOPNOTSUPP;
++	peer_ffa_version = le32_to_cpu(version_resp->ffa_version);
++	if (peer_ffa_version < FFA_VERSION_1_2)
++		return -EOPNOTSUPP;
++	drv->ep.ffa_version = min(drv->local_ffa_version, peer_ffa_version);
++
++	return 0;
++}
++
++static int virtio_msg_ffa_reset_locked(struct virtio_msg_ffa_driver *drv)
++{
++	u8 reset_msg_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *reset_msg = (struct virtio_msg *)reset_msg_buf;
++	struct virtio_msg_ffa_reset_resp *reset_resp;
++	size_t reset_len;
++	u16 result;
++	int ret;
++
++	virtio_msg_ffa_xfer_quiesce_locked(drv, &drv->active_xfer);
++	virtio_msg_ffa_xfer_quiesce_locked(drv, &drv->bootstrap_xfer);
++	memset(reset_msg_buf, 0, sizeof(reset_msg_buf));
++	ret = virtio_msg_ffa_send_bus_request_locked(drv, FFA_BUS_MSG_RESET, NULL,
++						     0, reset_msg,
++						     sizeof(reset_msg_buf),
++						     &reset_len);
++	if (ret)
++		return ret;
++
++	if (reset_len != sizeof(*reset_msg) + sizeof(*reset_resp))
++		return -EPROTO;
++	reset_resp = (struct virtio_msg_ffa_reset_resp *)reset_msg->payload;
++	result = le16_to_cpu(reset_resp->result);
++	if (result == VIRTIO_MSG_FFA_BUS_BUSY) {
++		drv->ep.reset_in_progress = true;
++		return -EBUSY;
++	}
++	if (result != VIRTIO_MSG_FFA_BUS_SUCCESS)
++		return -EIO;
++
++	drv->ep.reset_in_progress = false;
++
++	return virtio_msg_ffa_endpoint_teardown_locked(drv, true);
++}
++
++static int virtio_msg_ffa_reset_poll_locked(struct virtio_msg_ffa_driver *drv)
++{
++	int retries = VIRTIO_MSG_FFA_RESET_RETRY_BUDGET;
++	int ret;
++
++	while (retries--) {
++		ret = virtio_msg_ffa_reset_locked(drv);
++		if (ret != -EBUSY)
++			return ret;
++
++		if (!retries)
++			break;
++		usleep_range(1000, 2000);
++	}
++
++	if (drv->fdev)
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "reset remained busy after %d attempts\n",
++				     VIRTIO_MSG_FFA_RESET_RETRY_BUDGET);
++
++	return -ETIMEDOUT;
++}
++
++static void
++virtio_msg_ffa_driver_store_effective_features_locked
++					(struct virtio_msg_ffa_driver *drv)
++{
++	lockdep_assert_held(&drv->lock);
++
++	drv->ep.bus_features &= drv->ep.local_bus_features;
++	drv->ep.feature_bits &= VIRTIO_MSG_TRANSPORT_F_SUPPORTED;
++}
++
++static bool virtio_msg_ffa_driver_method_supports
++			(const struct virtio_msg_ffa_driver_xfer_method *method,
++			 u8 phase_flags, u32 bus_features, bool negotiated)
++{
++	const struct virtio_msg_ffa_xfer_method_desc *desc;
++
++	if (!method || !method->desc)
++		return false;
++	desc = method->desc;
++	if (desc->method == VIRTIO_MSG_FFA_XFER_NONE)
++		return false;
++	if (!(desc->role_mask & VIRTIO_MSG_FFA_XFER_ROLE_DRIVER))
++		return false;
++	if (phase_flags && !(desc->phase_flags & phase_flags))
++		return false;
++	if (negotiated &&
++	    ((bus_features & desc->bus_feature_mask) != desc->bus_feature_mask))
++		return false;
++
++	return true;
++}
++
++static bool virtio_msg_ffa_driver_method_capable
++			(struct virtio_msg_ffa_driver *drv,
++			 const struct virtio_msg_ffa_driver_xfer_method *method)
++{
++	return drv && method && method->capable && method->capable(drv);
++}
++
++static bool
++virtio_msg_ffa_driver_xfer_capable(void *data,
++				   enum virtio_msg_ffa_transfer_method method)
++{
++	const struct virtio_msg_ffa_driver_xfer_method *entry;
++
++	entry = virtio_msg_ffa_driver_xfer_method_find(method);
++	return virtio_msg_ffa_driver_method_capable(data, entry);
++}
++
++static u32 virtio_msg_ffa_driver_local_bus_features_locked
++			(struct virtio_msg_ffa_driver *drv)
++{
++	const struct virtio_msg_ffa_driver_xfer_method *method;
++	u32 deferred_features = 0;
++	u32 bus_features = 0;
++	bool bootstrap_capable = false;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(virtio_msg_ffa_driver_xfer_methods); i++) {
++		method = &virtio_msg_ffa_driver_xfer_methods[i];
++		if (!virtio_msg_ffa_driver_method_supports
++				(method, VIRTIO_MSG_FFA_XFER_PHASE_RUNTIME,
++				 0, false))
++			continue;
++		if (!virtio_msg_ffa_driver_xfer_capable(drv,
++							method->desc->method))
++			continue;
++
++		if (method->desc->phase_flags &
++		    VIRTIO_MSG_FFA_XFER_PHASE_BOOTSTRAP) {
++			bus_features |= method->desc->bus_feature_mask;
++			bootstrap_capable = true;
++		} else {
++			deferred_features |= method->desc->bus_feature_mask;
++		}
++	}
++
++	if (bootstrap_capable)
++		bus_features |= deferred_features;
++
++	return bus_features;
++}
++
++static int virtio_msg_ffa_pick_bootstrap_xfer_locked
++			(struct virtio_msg_ffa_driver *drv)
++{
++	const struct virtio_msg_ffa_driver_xfer_method *method;
++	unsigned int i;
++
++	if (!drv->fdev)
++		return -EINVAL;
++
++	for (i = 0; i < ARRAY_SIZE(virtio_msg_ffa_driver_xfer_methods); i++) {
++		method = &virtio_msg_ffa_driver_xfer_methods[i];
++		if (!virtio_msg_ffa_driver_method_supports
++				(method, VIRTIO_MSG_FFA_XFER_PHASE_BOOTSTRAP,
++				 0, false))
++			continue;
++		if (!virtio_msg_ffa_driver_method_capable(drv, method))
++			continue;
++
++		return virtio_msg_ffa_xfer_engine_init(drv, &drv->bootstrap_xfer,
++						       method);
++	}
++
++	return -EOPNOTSUPP;
++}
++
++static void virtio_msg_ffa_runtime_candidate_cleanup_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 const struct virtio_msg_ffa_driver_xfer_method *method)
++{
++	struct virtio_msg_ffa_xfer_engine xfer;
++	enum virtio_msg_ffa_transfer_method xfer_method;
++	void *priv;
++	bool shared_bootstrap;
++
++	if (!drv || !method || !method->desc)
++		return;
++
++	xfer_method = method->desc->method;
++	drv->event_configured = false;
++	if (drv->ep.transfer_method == xfer_method)
++		virtio_msg_ffa_select_transfer_method(&drv->ep,
++						      VIRTIO_MSG_FFA_XFER_NONE);
++
++	if (!virtio_msg_ffa_xfer_engine_valid(&drv->active_xfer) ||
++	    drv->active_xfer.method != xfer_method)
++		return;
++
++	xfer = drv->active_xfer;
++	virtio_msg_ffa_xfer_engine_reset(&drv->active_xfer);
++
++	priv = virtio_msg_ffa_xfer_priv_get(drv, xfer_method);
++	if (!priv || xfer.priv != priv)
++		return;
++
++	shared_bootstrap =
++		drv->bootstrap_xfer.method == xfer.method &&
++		drv->bootstrap_xfer.priv == xfer.priv;
++	if (shared_bootstrap)
++		return;
++
++	virtio_msg_ffa_xfer_teardown_locked(drv, &xfer);
++}
++
++static int virtio_msg_ffa_event_configure_preferred_locked
++					(struct virtio_msg_ffa_driver *drv)
++{
++	const struct virtio_msg_ffa_driver_xfer_method *method;
++	int first_ret = 0;
++	unsigned int i;
++	int ret;
++
++	for (i = 0; i < ARRAY_SIZE(virtio_msg_ffa_driver_xfer_methods); i++) {
++		method = &virtio_msg_ffa_driver_xfer_methods[i];
++		if (!virtio_msg_ffa_driver_method_supports
++				(method, VIRTIO_MSG_FFA_XFER_PHASE_RUNTIME,
++				 drv->ep.bus_features, true))
++			continue;
++		if (!virtio_msg_ffa_driver_method_capable(drv, method))
++			continue;
++		if (!method->desc->driver_ops ||
++		    !method->desc->driver_ops->init_runtime)
++			continue;
++
++		ret = method->desc->driver_ops->init_runtime(drv, method->desc);
++		if (!ret)
++			return virtio_msg_ffa_local_services_publish_locked(drv);
++
++		if (!first_ret)
++			first_ret = ret;
++		if (drv->fdev)
++			dev_warn_ratelimited(&drv->fdev->dev,
++					     "runtime %s init failed ret=%d, trying next method\n",
++					     method->desc->name, ret);
++		virtio_msg_ffa_runtime_candidate_cleanup_locked(drv, method);
++	}
++
++	return first_ret ?: -EOPNOTSUPP;
++}
++
++int virtio_msg_ffa_driver_event_configure_send_locked(struct virtio_msg_ffa_driver *drv,
++						      enum virtio_msg_ffa_bus_event_delivery method,
++						      u16 notif_id)
++{
++	struct virtio_msg_ffa_event_configure_req req = { 0 };
++	u8 resp_msg_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *resp_msg = (struct virtio_msg *)resp_msg_buf;
++	size_t resp_len;
++	__le16 result_le;
++	u16 result;
++	int ret;
++
++	req.event_method = method;
++	req.notif_id = cpu_to_le16(notif_id);
++
++	memset(resp_msg_buf, 0, sizeof(resp_msg_buf));
++	ret = virtio_msg_ffa_send_bus_request_locked(drv, FFA_BUS_MSG_EVENT_CONFIGURE,
++						     &req, sizeof(req),
++						     resp_msg,
++						     sizeof(resp_msg_buf),
++						     &resp_len);
++	if (ret)
++		return ret;
++	if (resp_len != sizeof(*resp_msg) + sizeof(result_le))
++		return -EPROTO;
++
++	memcpy(&result_le, resp_msg->payload, sizeof(result_le));
++	result = le16_to_cpu(result_le);
++	if (result == VIRTIO_MSG_FFA_BUS_BUSY)
++		return -EBUSY;
++	if (result != VIRTIO_MSG_FFA_BUS_SUCCESS)
++		return -EIO;
++
++	return 0;
++}
++
++/*
++ * Runtime setup starts by preparing a bootstrap transfer method so VERSION,
++ * RESET, EVENT_CONFIGURE, and FIFO_CONFIGURE can be exchanged. If indirect is
++ * selected for bootstrap, local services are published so the peer can deliver
++ * indirect RX payloads while negotiation is still in progress. A pending RESET
++ * is recovered before VERSION negotiation, then VERSION runs its probe/echo
++ * sequence and stores the negotiated feature set. Event delivery is configured
++ * last; the runtime transfer method is selected only after EVENT_CONFIGURE
++ * succeeds. AREA_SHARE is not part of runtime negotiation and is sent later by
++ * DMA area mapping.
++ */
++static int virtio_msg_ffa_prepare_runtime_locked
++			(struct virtio_msg_ffa_driver *drv)
++{
++	int ret;
++
++	if (drv->endpoint_disabled)
++		return -EACCES;
++	drv->ep.local_bus_features =
++		virtio_msg_ffa_driver_local_bus_features_locked(drv);
++	/*
++	 * Runtime setup is ordered as bootstrap transport setup, reset recovery,
++	 * VERSION negotiation, then event delivery configuration. The selected
++	 * request path is not advertised as usable until event setup succeeds.
++	 */
++	if (drv->ep.negotiation_done && drv->event_configured &&
++	    virtio_msg_ffa_xfer_engine_valid(&drv->active_xfer))
++		return virtio_msg_ffa_local_services_publish_locked(drv);
++	if (!virtio_msg_ffa_xfer_engine_valid(&drv->bootstrap_xfer)) {
++		ret = virtio_msg_ffa_pick_bootstrap_xfer_locked(drv);
++		if (ret)
++			return ret;
++	}
++	ret = virtio_msg_ffa_xfer_setup_locked(drv, &drv->bootstrap_xfer);
++	if (ret)
++		return ret;
++	if (drv->bootstrap_xfer.method == VIRTIO_MSG_FFA_XFER_INDIRECT) {
++		ret = virtio_msg_ffa_local_services_publish_locked(drv);
++		if (ret)
++			return ret;
++	}
++	if (drv->ep.reset_in_progress) {
++		ret = virtio_msg_ffa_reset_poll_locked(drv);
++		if (ret) {
++			if (ret == -ETIMEDOUT)
++				virtio_msg_ffa_handle_endpoint_failure_locked
++								(drv, ret);
++			return ret;
++		}
++		if (!virtio_msg_ffa_xfer_engine_valid(&drv->bootstrap_xfer)) {
++			ret = virtio_msg_ffa_pick_bootstrap_xfer_locked(drv);
++			if (ret)
++				return ret;
++		}
++		ret = virtio_msg_ffa_xfer_setup_locked(drv, &drv->bootstrap_xfer);
++		if (ret)
++			return ret;
++		if (drv->bootstrap_xfer.method == VIRTIO_MSG_FFA_XFER_INDIRECT) {
++			ret = virtio_msg_ffa_local_services_publish_locked(drv);
++			if (ret)
++				return ret;
++		}
++	}
++
++	if (!drv->ep.negotiation_done) {
++		ret = virtio_msg_ffa_version_negotiate_locked(drv);
++		if (ret)
++			return ret;
++		if (drv->fdev) {
++			dev_info(&drv->fdev->dev,
++				 "runtime negotiated: peer_vm=%u bus=%u rev=%u feat=%#x bus_feat=%#x\n",
++				 (u16)drv->fdev->vm_id,
++				 drv->ep.bus_version,
++				 drv->ep.transport_revision,
++				 drv->ep.feature_bits,
++				 drv->ep.bus_features);
++		}
++	}
++
++	/*
++	 * The current driver binding depends on event delivery to make forward
++	 * progress, so missing EVENT_CONFIG support is treated as endpoint-
++	 * fatal instead of degrading into a non-event-capable mode.
++	 */
++	return virtio_msg_ffa_event_configure_preferred_locked(drv);
++}
++
++static struct virtio_msg_ffa_driver *
++virtio_msg_ffa_provider_callback_begin(struct virtio_msg_transport_device *vmdev)
++{
++	return virtio_msg_ffa_vmdev_callback_begin(vmdev);
++}
++
++static void
++virtio_msg_ffa_provider_callback_end(struct virtio_msg_transport_device *vmdev)
++{
++	virtio_msg_ffa_vmdev_callback_end(vmdev);
++}
++
++static int virtio_msg_ffa_get_caps(struct virtio_msg_transport_device *vmdev,
++				   struct virtio_msg_provider_caps *caps)
++{
++	struct virtio_msg_ffa_driver *drv;
++	int ret = 0;
++
++	if (!vmdev)
++		return -EINVAL;
++
++	drv = virtio_msg_ffa_provider_callback_begin(vmdev);
++	if (!drv)
++		return -ENODEV;
++	if (!caps) {
++		ret = -EINVAL;
++		goto out_cb_end;
++	}
++
++	mutex_lock(&drv->lock);
++	ret = virtio_msg_ffa_prepare_runtime_locked(drv);
++	if (ret)
++		goto out_unlock;
++
++	memset(caps, 0, sizeof(*caps));
++	caps->name = VIRTIO_MSG_FFA_BUS_NAME;
++	caps->msg_size = FFA_BUS_MAX_MSG_SIZE;
++	caps->revision = drv->ep.transport_revision;
++	caps->transport_features =
++		drv->ep.feature_bits & VIRTIO_MSG_TRANSPORT_F_SUPPORTED;
++
++out_unlock:
++	mutex_unlock(&drv->lock);
++out_cb_end:
++	virtio_msg_ffa_provider_callback_end(vmdev);
++	return ret;
++}
++
++static int virtio_msg_ffa_send_request(struct virtio_msg_transport_device *vmdev,
++				       const struct virtio_msg *request,
++				       struct virtio_msg *response)
++{
++	struct virtio_msg_ffa_driver *drv;
++	struct virtio_msg *request_local;
++	u8 request_buf[FFA_BUS_MAX_MSG_SIZE];
++	u16 token;
++	size_t req_len, resp_len = 0;
++	int ret = 0;
++
++	if (!vmdev)
++		return -EINVAL;
++
++	drv = virtio_msg_ffa_provider_callback_begin(vmdev);
++	if (!drv)
++		return -ENODEV;
++	if (!request || !response) {
++		ret = -EINVAL;
++		goto out_cb_end;
++	}
++
++	req_len = le16_to_cpu(request->msg_size);
++	if (req_len > FFA_BUS_MAX_MSG_SIZE) {
++		ret = -EMSGSIZE;
++		goto out_cb_end;
++	}
++
++	mutex_lock(&drv->lock);
++	ret = virtio_msg_ffa_prepare_runtime_locked(drv);
++	if (ret)
++		goto out_unlock;
++
++	request_local = (struct virtio_msg *)request_buf;
++	memcpy(request_local, request, req_len);
++	ret = virtio_msg_ffa_next_token_locked(&drv->ep, &token);
++	if (ret)
++		goto out_unlock;
++	request_local->token = cpu_to_le16(token);
++
++	ret = virtio_msg_ffa_send_request_locked(drv, request_local, req_len,
++						 VIRTIO_MSG_TYPE_RESPONSE,
++						 request_local->msg_id,
++						 response,
++						 FFA_BUS_MAX_MSG_SIZE,
++						 &resp_len);
++
++out_unlock:
++	mutex_unlock(&drv->lock);
++out_cb_end:
++	virtio_msg_ffa_provider_callback_end(vmdev);
++	return ret;
++}
++
++int virtio_msg_ffa_driver_submit_event(struct virtio_msg_ffa_driver *drv,
++				       const struct virtio_msg *request)
++{
++	u8 request_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *request_local = (struct virtio_msg *)request_buf;
++	size_t req_len;
++	u16 token;
++	int ret;
++
++	if (!drv || !request)
++		return -EINVAL;
++
++	req_len = le16_to_cpu(request->msg_size);
++	if (req_len < sizeof(*request) || req_len > FFA_BUS_MAX_MSG_SIZE)
++		return -EMSGSIZE;
++
++	mutex_lock(&drv->lock);
++	ret = virtio_msg_ffa_prepare_runtime_locked(drv);
++	if (ret)
++		goto out_unlock;
++	if (!virtio_msg_ffa_driver_event_runtime_ready_locked(drv)) {
++		ret = -EAGAIN;
++		goto out_unlock;
++	}
++
++	memcpy(request_local, request, req_len);
++	ret = virtio_msg_ffa_next_token_locked(&drv->ep, &token);
++	if (ret)
++		goto out_unlock;
++	request_local->token = cpu_to_le16(token);
++
++	ret = virtio_msg_ffa_send_by_selected_method_locked
++			(drv, &drv->active_xfer, request_local, req_len, NULL, 0,
++			 NULL);
++
++out_unlock:
++	mutex_unlock(&drv->lock);
++	return ret;
++}
++
++static int virtio_msg_ffa_send_event(struct virtio_msg_transport_device *vmdev,
++				     const struct virtio_msg *request)
++{
++	struct virtio_msg_ffa_driver *drv;
++	size_t req_len;
++	int ret;
++
++	if (!vmdev)
++		return -EINVAL;
++	if (!request)
++		return -EINVAL;
++	if (!virtio_msg_ffa_msg_is_event(request->msg_id))
++		return -EINVAL;
++	req_len = le16_to_cpu(request->msg_size);
++	if (req_len < sizeof(*request) || req_len > FFA_BUS_MAX_MSG_SIZE)
++		return -EMSGSIZE;
++
++	drv = virtio_msg_ffa_provider_callback_begin(vmdev);
++	if (!drv)
++		return -ENODEV;
++
++	ret = virtio_msg_ffa_vmdev_enqueue_event(vmdev, request, GFP_ATOMIC);
++	if (ret == -ENOMEM)
++		ret = -ENOSPC;
++
++	virtio_msg_ffa_provider_callback_end(vmdev);
++	return ret;
++}
++
++static int virtio_msg_ffa_send(struct virtio_msg_transport_device *vmdev,
++			       const struct virtio_msg *request,
++			       struct virtio_msg *response)
++{
++	if (!vmdev || !request)
++		return -EINVAL;
++	if (!response)
++		return virtio_msg_ffa_send_event(vmdev, request);
++
++	return virtio_msg_ffa_send_request(vmdev, request, response);
++}
++
++static void
++virtio_msg_ffa_synchronize_cbs(struct virtio_msg_transport_device *vmdev)
++{
++	virtio_msg_ffa_vmdev_callback_wait_zero(vmdev);
++}
++
++static void virtio_msg_ffa_release(struct virtio_msg_transport_device *vmdev)
++{
++	(void)vmdev;
++}
++
++static const struct virtio_msg_bus_provider_ops virtio_msg_ffa_bus_ops = {
++	.get_caps		= virtio_msg_ffa_get_caps,
++	.send			= virtio_msg_ffa_send,
++	.synchronize_cbs	= virtio_msg_ffa_synchronize_cbs,
++	.release		= virtio_msg_ffa_release,
++};
++
++const struct virtio_msg_bus_provider_ops *virtio_msg_ffa_bus_ops_get(void)
++{
++	return &virtio_msg_ffa_bus_ops;
++}
++
++static int virtio_msg_ffa_probe(struct ffa_device *fdev)
++{
++	struct virtio_msg_ffa_driver *drv;
++	int ret;
++
++	if (!fdev)
++		return -EINVAL;
++	dev_info(&fdev->dev, "driver binding probe: peer_vm=%u\n",
++		 (u16)fdev->vm_id);
++
++	ret = dma_set_mask_and_coherent(&fdev->dev, DMA_BIT_MASK(64));
++	if (ret)
++		ret = dma_set_mask_and_coherent(&fdev->dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(&fdev->dev, ret,
++				     "failed to configure DMA mask\n");
++
++	drv = kzalloc(sizeof(*drv), GFP_KERNEL);
++	if (!drv)
++		return -ENOMEM;
++
++	drv->fdev = fdev;
++	mutex_init(&drv->lock);
++	spin_lock_init(&drv->bus_req_lock);
++	init_waitqueue_head(&drv->bus_req_wait);
++	virtio_msg_ffa_endpoint_init(&drv->ep);
++	virtio_msg_ffa_area_ctx_alloc(drv);
++	virtio_msg_ffa_version_begin(&drv->ep);
++	virtio_msg_ffa_xfer_engine_reset(&drv->bootstrap_xfer);
++	virtio_msg_ffa_xfer_engine_reset(&drv->active_xfer);
++	WRITE_ONCE(drv->indirect_rx_generation, 0);
++	drv->local_ffa_version = FFA_VERSION_1_2;
++	if (fdev->ops && fdev->ops->info_ops &&
++	    fdev->ops->info_ops->api_version_get)
++		drv->local_ffa_version = fdev->ops->info_ops->api_version_get();
++	drv->ep.local_bus_features =
++		virtio_msg_ffa_driver_local_bus_features_locked(drv);
++	ffa_dev_set_drvdata(fdev, drv);
++
++	ret = virtio_msg_ffa_driver_indirect_rx_init(drv);
++	if (ret)
++		goto err_cleanup_endpoint;
++
++	ret = virtio_msg_ffa_topology_init(drv);
++	if (ret)
++		goto err_stop_indirect_rx;
++
++	dev_info(&fdev->dev, "driver binding probe complete: peer_vm=%u\n",
++		 (u16)fdev->vm_id);
++	return 0;
++
++err_stop_indirect_rx:
++	virtio_msg_ffa_driver_indirect_rx_quiesce(drv);
++err_cleanup_endpoint:
++	ffa_dev_set_drvdata(fdev, NULL);
++	virtio_msg_ffa_exchange_abort_all(&drv->ep, -ESHUTDOWN);
++	virtio_msg_ffa_endpoint_cleanup(&drv->ep);
++	virtio_msg_ffa_area_ctx_free(&drv->area_ctx);
++	kfree(drv);
++	return ret;
++}
++
++static void virtio_msg_ffa_remove(struct ffa_device *fdev)
++{
++	struct virtio_msg_ffa_driver *drv;
++	struct virtio_msg_ffa_topology *topo;
++
++	if (!fdev)
++		return;
++
++	drv = ffa_dev_get_drvdata(fdev);
++	if (!drv)
++		return;
++	dev_info(&fdev->dev, "driver binding remove: peer_vm=%u\n",
++		 (u16)fdev->vm_id);
++
++	ffa_dev_set_drvdata(fdev, NULL);
++	mutex_lock(&drv->lock);
++	virtio_msg_ffa_endpoint_disable(drv);
++	WRITE_ONCE(drv->indirect_rx_generation,
++		   READ_ONCE(drv->indirect_rx_generation) + 1);
++	virtio_msg_ffa_exchange_abort_all(&drv->ep, -ESHUTDOWN);
++	virtio_msg_ffa_local_services_unpublish_locked(drv);
++	rcu_read_lock();
++	topo = virtio_msg_ffa_driver_topology_get(drv);
++	rcu_read_unlock();
++	virtio_msg_ffa_driver_topology_set(drv, NULL);
++	virtio_msg_ffa_method_teardown_locked(drv);
++	mutex_unlock(&drv->lock);
++	virtio_msg_ffa_driver_indirect_rx_quiesce(drv);
++	synchronize_rcu();
++	virtio_msg_ffa_topology_destroy(topo);
++	virtio_msg_ffa_xfer_priv_release_all(drv);
++
++	virtio_msg_ffa_endpoint_cleanup(&drv->ep);
++	virtio_msg_ffa_area_ctx_free(&drv->area_ctx);
++	kfree(drv);
++}
++
++static const struct ffa_device_id virtio_msg_ffa_device_ids[] = {
++	{ .uuid = virtio_msg_ffa_device_uuid },
++	{}
++};
++
++static struct ffa_driver virtio_msg_ffa_driver = {
++	.name = "virtio-msg-ffa",
++	.probe = virtio_msg_ffa_probe,
++	.remove = virtio_msg_ffa_remove,
++	.id_table = virtio_msg_ffa_device_ids,
++	.local_uuid_table = virtio_msg_ffa_local_uuid_ids,
++#if IS_ENABLED(CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT)
++	.rx_msg = virtio_msg_ffa_indirect_rx_cb,
++#endif
++};
++
++static int __init virtio_msg_ffa_init(void)
++{
++	int ret;
++
++	ret = ffa_register(&virtio_msg_ffa_driver);
++	if (ret) {
++		pr_debug("driver binding register failed: ffa ret=%d\n", ret);
++		return ret;
++	}
++
++	ret = virtio_msg_ffa_local_services_module_publish();
++	if (ret == -EOPNOTSUPP) {
++		pr_debug("driver local service publish unsupported; continuing without dynamic publication\n");
++		return 0;
++	}
++	if (ret) {
++		ffa_unregister(&virtio_msg_ffa_driver);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void __exit virtio_msg_ffa_exit(void)
++{
++	virtio_msg_ffa_local_services_module_unpublish();
++	ffa_unregister(&virtio_msg_ffa_driver);
++}
++
++module_init(virtio_msg_ffa_init);
++module_exit(virtio_msg_ffa_exit);
++
++MODULE_DESCRIPTION("Virtio message bus over FF-A driver binding");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_driver_area.c b/drivers/virtio/virtio_msg_bus_ffa_driver_area.c
+new file mode 100644
+index 000000000000..5a89b1a59ed2
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_driver_area.c
+@@ -0,0 +1,828 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio message bus over FF-A area publication helpers.
++ *
++ * Copyright (C) 2026 Google LLC and Linaro.
++ * Viresh Kumar <viresh.kumar@linaro.org>
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#include <linux/arm_ffa.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/idr.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/limits.h>
++#include <linux/mutex.h>
++#include <linux/refcount.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/workqueue.h>
++#include <linux/xarray.h>
++
++#include "virtio_msg_bus_dma_driver_helper.h"
++#include "virtio_msg_bus_ffa.h"
++#include "virtio_msg_bus_ffa_driver_priv.h"
++#include "virtio_msg_bus_ffa_protocol.h"
++
++#define VIRTIO_MSG_FFA_AREA_ID_MIN	1U
++#define VIRTIO_MSG_FFA_AREA_RETRY_DELAY_MS	1000
++
++struct virtio_msg_ffa_area_export {
++	struct ffa_device *fdev;
++	struct virtio_msg_ffa_area_ctx *ctx;
++	struct virtio_msg_bus_dma_driver_export export;
++	struct delayed_work retry_work;
++	struct mutex op_lock; /* Serializes per-area teardown transitions. */
++	refcount_t refs;
++	bool handle_dropped;
++	bool retry_queued;
++	bool completed;
++	bool teardown_requested;
++	bool area_released;
++	bool reclaim_deferred;
++	bool unshare_inflight;
++	u64 g_handle;
++	dma_addr_t bus_addr;
++	u64 mem_tag;
++	u32 page_count;
++	u32 sharing_attrs;
++	u16 area_id;
++};
++
++static DEFINE_IDA(virtio_msg_ffa_area_ida);
++static DEFINE_XARRAY(virtio_msg_ffa_area_exports);
++static DEFINE_MUTEX(virtio_msg_ffa_area_exports_lock);
++
++static bool
++virtio_msg_ffa_area_mem_ops_ready(const struct ffa_device *fdev)
++{
++	return fdev && fdev->ops && fdev->ops->mem_ops &&
++	       fdev->ops->mem_ops->memory_share &&
++	       fdev->ops->mem_ops->memory_reclaim;
++}
++
++static void
++virtio_msg_ffa_area_share_dbg
++	(struct virtio_msg_ffa_area_export *area_export, const char *stage,
++	 int ret, u16 result, size_t resp_len)
++{
++	if (!area_export || !area_export->fdev)
++		return;
++
++	dev_dbg(&area_export->fdev->dev,
++		"area-share: %s failed area=%u pages=%u attrs=%#x handle=%#llx tag=%#llx ret=%d result=%u resp_len=%zu\n",
++		stage, area_export->area_id, area_export->page_count,
++		area_export->sharing_attrs,
++		(unsigned long long)area_export->g_handle,
++		(unsigned long long)area_export->mem_tag, ret, result,
++		resp_len);
++}
++
++static int
++virtio_msg_ffa_area_build_sg_table(const struct virtio_msg_bus_dma_driver_export *export,
++				   struct sg_table *sgt, gfp_t gfp)
++{
++	if (!export || !sgt)
++		return -EINVAL;
++	if (!export->pages || !export->npages || !export->mmap_length)
++		return -EINVAL;
++
++	return sg_alloc_table_from_pages(sgt, export->pages, export->npages,
++					 0, export->mmap_length,
++					 gfp);
++}
++
++static int
++virtio_msg_ffa_area_protocol_page_count
++			(const struct virtio_msg_bus_dma_driver_export *export,
++			 u32 *page_count)
++{
++	u64 count;
++
++	if (!export || !page_count || !export->mmap_length)
++		return -EINVAL;
++
++	count = DIV_ROUND_UP_ULL(export->mmap_length, FFA_PAGE_SIZE);
++	if (!count || count > U32_MAX)
++		return -EOVERFLOW;
++
++	*page_count = count;
++	return 0;
++}
++
++static void
++virtio_msg_ffa_area_release_sg_table(const struct virtio_msg_bus_dma_driver_export *export,
++				     struct sg_table *sgt)
++{
++	if (!export || !sgt)
++		return;
++
++	sg_free_table(sgt);
++}
++
++static void
++virtio_msg_ffa_area_export_put(struct virtio_msg_ffa_area_export *area_export)
++{
++	if (!area_export)
++		return;
++	if (!refcount_dec_and_test(&area_export->refs))
++		return;
++
++	put_device(&area_export->fdev->dev);
++	kfree(area_export);
++}
++
++static void
++virtio_msg_ffa_area_export_get(struct virtio_msg_ffa_area_export *area_export)
++{
++	if (!area_export)
++		return;
++
++	refcount_inc(&area_export->refs);
++}
++
++static int
++virtio_msg_ffa_area_export_track(struct virtio_msg_ffa_area_export *area_export)
++{
++	int ret;
++
++	if (!area_export)
++		return -EINVAL;
++
++	mutex_lock(&virtio_msg_ffa_area_exports_lock);
++	ret = xa_insert(&virtio_msg_ffa_area_exports, area_export->area_id,
++			area_export, GFP_KERNEL);
++	if (!ret)
++		virtio_msg_ffa_area_export_get(area_export);
++	mutex_unlock(&virtio_msg_ffa_area_exports_lock);
++	return ret;
++}
++
++static void
++virtio_msg_ffa_area_export_untrack(struct virtio_msg_ffa_area_export *area_export)
++{
++	bool untracked = false;
++
++	if (!area_export)
++		return;
++
++	mutex_lock(&virtio_msg_ffa_area_exports_lock);
++	if (xa_load(&virtio_msg_ffa_area_exports, area_export->area_id) ==
++	    area_export) {
++		xa_erase(&virtio_msg_ffa_area_exports, area_export->area_id);
++		untracked = true;
++	}
++	mutex_unlock(&virtio_msg_ffa_area_exports_lock);
++
++	if (untracked)
++		virtio_msg_ffa_area_export_put(area_export);
++}
++
++static struct virtio_msg_ffa_area_export *
++virtio_msg_ffa_area_export_lookup(u16 area_id)
++{
++	struct virtio_msg_ffa_area_export *area_export;
++
++	mutex_lock(&virtio_msg_ffa_area_exports_lock);
++	area_export = xa_load(&virtio_msg_ffa_area_exports, area_id);
++	if (area_export)
++		virtio_msg_ffa_area_export_get(area_export);
++	mutex_unlock(&virtio_msg_ffa_area_exports_lock);
++	return area_export;
++}
++
++static void
++virtio_msg_ffa_area_queue_retry_locked(struct virtio_msg_ffa_area_export *area_export,
++				       unsigned long delay_ms)
++{
++	if (area_export->retry_queued) {
++		mod_delayed_work(system_wq, &area_export->retry_work,
++				 msecs_to_jiffies(delay_ms));
++		return;
++	}
++
++	area_export->retry_queued = true;
++	virtio_msg_ffa_area_export_get(area_export);
++	if (!schedule_delayed_work(&area_export->retry_work,
++				   msecs_to_jiffies(delay_ms))) {
++		area_export->retry_queued = false;
++		virtio_msg_ffa_area_export_put(area_export);
++	}
++}
++
++static int
++virtio_msg_ffa_area_set_state(struct virtio_msg_ffa_area_export *area_export,
++			      enum virtio_msg_ffa_area_state state)
++{
++	struct virtio_msg_ffa_area area;
++	struct virtio_msg_ffa_area_ctx *ctx;
++	int ret;
++
++	if (!area_export)
++		return -EINVAL;
++
++	ctx = area_export->ctx;
++	if (!ctx || !ctx->ep)
++		return -ENODEV;
++
++	ret = virtio_msg_ffa_area_lookup(ctx->ep, area_export->area_id, &area);
++	if (ret) {
++		memset(&area, 0, sizeof(area));
++		area.area_id = area_export->area_id;
++		area.mem_tag = area_export->mem_tag;
++		area.page_count = area_export->page_count;
++		area.sharing_attrs = area_export->sharing_attrs;
++	}
++	area.state = state;
++
++	return virtio_msg_ffa_area_add(ctx->ep, &area);
++}
++
++static int
++virtio_msg_ffa_area_registry_remove(struct virtio_msg_ffa_area_export *area_export)
++{
++	struct virtio_msg_ffa_area_ctx *ctx;
++	int ret;
++
++	if (!area_export)
++		return -EINVAL;
++
++	ctx = area_export->ctx;
++	if (!ctx || !ctx->ep)
++		return -ENODEV;
++
++	ret = virtio_msg_ffa_area_remove(ctx->ep, area_export->area_id, NULL);
++	if (ret == -ENOENT)
++		return 0;
++	return ret;
++}
++
++static int
++virtio_msg_ffa_send_area_share(struct virtio_msg_ffa_area_export *area_export)
++{
++	struct virtio_msg_ffa_area_ctx *ctx;
++	struct virtio_msg_ffa_area_share_req req = { 0 };
++	struct virtio_msg_ffa_area_share_resp *resp;
++	u8 resp_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *resp_msg = (struct virtio_msg *)resp_buf;
++	size_t resp_len = 0;
++	u16 result;
++	int ret;
++
++	if (!area_export)
++		return -EINVAL;
++
++	ctx = area_export->ctx;
++	if (!ctx || !ctx->send_bus_req)
++		return -ENODEV;
++
++	req.area_id = cpu_to_le16(area_export->area_id);
++	req.mem_handle = cpu_to_le64(area_export->g_handle);
++	req.mem_tag = cpu_to_le64(area_export->mem_tag);
++	req.page_count = cpu_to_le32(area_export->page_count);
++	req.sharing_attrs = cpu_to_le32(area_export->sharing_attrs);
++
++	memset(resp_buf, 0, sizeof(resp_buf));
++	ret = ctx->send_bus_req(ctx, FFA_BUS_MSG_AREA_SHARE,
++				&req, sizeof(req),
++				resp_msg, sizeof(resp_buf),
++				&resp_len);
++	if (ret) {
++		virtio_msg_ffa_area_share_dbg
++			(area_export, "request", ret, 0, resp_len);
++		return ret;
++	}
++
++	if (resp_len != sizeof(*resp_msg) + sizeof(*resp)) {
++		virtio_msg_ffa_area_share_dbg
++			(area_export, "response-length", -EPROTO, 0,
++			 resp_len);
++		return -EPROTO;
++	}
++	resp = (struct virtio_msg_ffa_area_share_resp *)resp_msg->payload;
++	if (le16_to_cpu(resp->area_id) != area_export->area_id) {
++		virtio_msg_ffa_area_share_dbg
++			(area_export, "response-area-id", -EPROTO,
++			 le16_to_cpu(resp->result), resp_len);
++		return -EPROTO;
++	}
++
++	result = le16_to_cpu(resp->result);
++	if (result == VIRTIO_MSG_FFA_BUS_SUCCESS)
++		return 0;
++	if (result == VIRTIO_MSG_FFA_BUS_BUSY) {
++		virtio_msg_ffa_area_share_dbg
++			(area_export, "peer-busy", -EBUSY, result,
++			 resp_len);
++		return -EBUSY;
++	}
++	virtio_msg_ffa_area_share_dbg
++		(area_export, "peer-error", -EIO, result, resp_len);
++	return -EIO;
++}
++
++static int
++virtio_msg_ffa_send_area_unshare(struct virtio_msg_ffa_area_export *area_export)
++{
++	struct virtio_msg_ffa_area_ctx *ctx;
++	struct virtio_msg_ffa_area_unshare_req req = { 0 };
++	struct virtio_msg_ffa_area_unshare_resp *resp;
++	u8 resp_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *resp_msg = (struct virtio_msg *)resp_buf;
++	size_t resp_len;
++	u16 result;
++	int ret;
++
++	if (!area_export)
++		return -EINVAL;
++
++	ctx = area_export->ctx;
++	if (!ctx || !ctx->send_bus_req)
++		return -ENODEV;
++
++	req.area_id = cpu_to_le16(area_export->area_id);
++
++	memset(resp_buf, 0, sizeof(resp_buf));
++	ret = ctx->send_bus_req(ctx, FFA_BUS_MSG_AREA_UNSHARE,
++				&req, sizeof(req),
++				resp_msg, sizeof(resp_buf),
++				&resp_len);
++	if (ret)
++		return ret;
++
++	if (resp_len != sizeof(*resp_msg) + sizeof(*resp))
++		return -EPROTO;
++	resp = (struct virtio_msg_ffa_area_unshare_resp *)resp_msg->payload;
++	if (le16_to_cpu(resp->area_id) != area_export->area_id)
++		return -EPROTO;
++
++	result = le16_to_cpu(resp->result);
++	if (result == VIRTIO_MSG_FFA_BUS_SUCCESS)
++		return 0;
++	if (result == VIRTIO_MSG_FFA_BUS_BUSY)
++		return -EBUSY;
++	return -EIO;
++}
++
++static int
++virtio_msg_ffa_area_memory_reclaim(struct virtio_msg_ffa_area_export *area_export)
++{
++	if (!area_export || !virtio_msg_ffa_area_mem_ops_ready(area_export->fdev))
++		return -EOPNOTSUPP;
++
++	return area_export->fdev->ops->mem_ops->memory_reclaim
++			(area_export->g_handle, 0);
++}
++
++static bool
++virtio_msg_ffa_area_remote_release_active
++		(struct virtio_msg_ffa_area_export *area_export)
++{
++	struct virtio_msg_bus_dma_driver_release release;
++	int ret;
++
++	ret = virtio_msg_bus_dma_export_released(&area_export->export, &release);
++	if (ret)
++		return false;
++
++	return release.action ==
++	       VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_RETAINED_ACTIVE;
++}
++
++static int
++virtio_msg_ffa_driver_area_local_teardown
++		(struct virtio_msg_ffa_area_export *area_export)
++{
++	int ret;
++
++	if (!area_export)
++		return -EINVAL;
++
++	lockdep_assert_held(&area_export->op_lock);
++
++	ret = virtio_msg_ffa_area_memory_reclaim(area_export);
++	if (ret)
++		return ret;
++
++	(void)virtio_msg_ffa_area_registry_remove(area_export);
++	virtio_msg_ffa_area_export_untrack(area_export);
++	ida_free(&virtio_msg_ffa_area_ida, area_export->area_id);
++
++	area_export->teardown_requested = false;
++	area_export->completed = true;
++	area_export->reclaim_deferred = false;
++	return 0;
++}
++
++static void
++virtio_msg_ffa_area_share_failure_cleanup
++		(struct virtio_msg_ffa_area_export *area_export)
++{
++	int ret;
++
++	if (!area_export)
++		return;
++
++	mutex_lock(&area_export->op_lock);
++	area_export->handle_dropped = true;
++	area_export->area_released = true;
++	area_export->teardown_requested = true;
++	ret = virtio_msg_ffa_driver_area_local_teardown(area_export);
++	if (ret) {
++		(void)virtio_msg_ffa_area_set_state
++				(area_export,
++				 VIRTIO_MSG_FFA_AREA_UNSHARE_PENDING);
++		virtio_msg_ffa_area_queue_retry_locked
++				(area_export, VIRTIO_MSG_FFA_AREA_RETRY_DELAY_MS);
++	}
++	mutex_unlock(&area_export->op_lock);
++}
++
++static int
++virtio_msg_ffa_area_try_complete(struct virtio_msg_ffa_area_export *area_export)
++{
++	bool send_unshare = false;
++	int ret;
++
++	if (!area_export)
++		return -EINVAL;
++
++	mutex_lock(&area_export->op_lock);
++	if (area_export->completed || !area_export->teardown_requested) {
++		mutex_unlock(&area_export->op_lock);
++		return 0;
++	}
++
++	if (area_export->reclaim_deferred && !area_export->handle_dropped) {
++		if (virtio_msg_ffa_area_remote_release_active(area_export)) {
++			mutex_unlock(&area_export->op_lock);
++			return -EAGAIN;
++		}
++		area_export->reclaim_deferred = false;
++	}
++
++	if (!area_export->area_released) {
++		/*
++		 * Avoid calling into topology/bus send paths while holding
++		 * @op_lock (those take drv->lock). Mark the operation as
++		 * inflight, drop @op_lock, and send AREA_UNSHARE.
++		 */
++		if (area_export->unshare_inflight) {
++			mutex_unlock(&area_export->op_lock);
++			return -EAGAIN;
++		}
++
++		area_export->unshare_inflight = true;
++		send_unshare = true;
++		mutex_unlock(&area_export->op_lock);
++	}
++
++	if (send_unshare) {
++		ret = virtio_msg_ffa_send_area_unshare(area_export);
++
++		mutex_lock(&area_export->op_lock);
++		area_export->unshare_inflight = false;
++		if (area_export->area_released || !ret) {
++			area_export->area_released = true;
++		} else if (ret == -EBUSY) {
++			/*
++			 * Keep retrying AREA_UNSHARE as a liveness/recovery
++			 * measure in case the original teardown indication was
++			 * lost or the peer needs another prompt.
++			 */
++			(void)virtio_msg_ffa_area_set_state
++					(area_export,
++					 VIRTIO_MSG_FFA_AREA_UNSHARE_PENDING);
++			mutex_unlock(&area_export->op_lock);
++			return -EAGAIN;
++		} else if (ret) {
++			mutex_unlock(&area_export->op_lock);
++			return ret;
++		}
++	}
++
++	ret = virtio_msg_ffa_driver_area_local_teardown(area_export);
++	if (ret) {
++		(void)virtio_msg_ffa_area_set_state
++				(area_export,
++				 VIRTIO_MSG_FFA_AREA_UNSHARE_PENDING);
++		mutex_unlock(&area_export->op_lock);
++		return -EAGAIN;
++	}
++
++	mutex_unlock(&area_export->op_lock);
++	return 0;
++}
++
++static void
++virtio_msg_ffa_area_retry_work(struct work_struct *work)
++{
++	struct virtio_msg_ffa_area_export *area_export =
++		container_of(to_delayed_work(work),
++			     struct virtio_msg_ffa_area_export, retry_work);
++	int ret;
++
++	mutex_lock(&area_export->op_lock);
++	area_export->retry_queued = false;
++	mutex_unlock(&area_export->op_lock);
++
++	ret = virtio_msg_ffa_area_try_complete(area_export);
++	if (ret == -EAGAIN) {
++		mutex_lock(&area_export->op_lock);
++		virtio_msg_ffa_area_queue_retry_locked
++				(area_export, VIRTIO_MSG_FFA_AREA_RETRY_DELAY_MS);
++		mutex_unlock(&area_export->op_lock);
++	}
++	virtio_msg_ffa_area_export_put(area_export);
++}
++
++static int
++virtio_msg_ffa_area_export_add(void *ctx,
++			       struct virtio_msg_bus_dma_driver_export *export,
++			       void **provider_handle, gfp_t gfp)
++{
++	struct virtio_msg_ffa_area_export *area_export;
++	struct virtio_msg_ffa_area_ctx *area_ctx = ctx;
++	struct ffa_mem_region_attributes receiver = { 0 };
++	struct ffa_mem_ops_args args = { 0 };
++	struct sg_table local_sgt = { 0 };
++	struct ffa_device *fdev = area_ctx ? area_ctx->fdev : NULL;
++	u32 protocol_page_count;
++	int area_id = -1;
++	int ret;
++
++	if (!area_ctx || !virtio_msg_ffa_area_mem_ops_ready(fdev) || !export ||
++	    !provider_handle)
++		return -EOPNOTSUPP;
++	if (!gfpflags_allow_blocking(gfp))
++		return -ENOMEM;
++
++	area_export = kzalloc(sizeof(*area_export), gfp);
++	if (!area_export)
++		return -ENOMEM;
++
++	get_device(&fdev->dev);
++	area_export->fdev = fdev;
++	area_export->ctx = area_ctx;
++	refcount_set(&area_export->refs, 1);
++	mutex_init(&area_export->op_lock);
++	INIT_DELAYED_WORK(&area_export->retry_work, virtio_msg_ffa_area_retry_work);
++
++	area_id = ida_alloc_range(&virtio_msg_ffa_area_ida,
++				  VIRTIO_MSG_FFA_AREA_ID_MIN, U16_MAX, gfp);
++	if (area_id < 0) {
++		ret = area_id;
++		goto err_put_export;
++	}
++
++	ret = virtio_msg_ffa_area_protocol_page_count(export,
++						      &protocol_page_count);
++	if (ret)
++		goto err_free_area_id;
++
++	ret = virtio_msg_ffa_area_build_sg_table(export, &local_sgt, gfp);
++	if (ret)
++		goto err_free_area_id;
++
++	area_export->area_id = area_id;
++	area_export->bus_addr =
++		virtio_msg_ffa_bus_addr_pack(area_id, export->page_offset);
++	area_export->export = *export;
++	area_export->export.dma_addr = area_export->bus_addr;
++	area_export->mem_tag = 0;
++	area_export->page_count = protocol_page_count;
++	area_export->sharing_attrs =
++		VIRTIO_MSG_FFA_AREA_SHARING_ATTR_SHARE_RW_XN_INNER_WB_NORMAL_NS |
++		VIRTIO_MSG_FFA_AREA_ATTR_DRIVER_RETENTION_REQUESTED;
++
++	receiver.receiver = fdev->vm_id;
++	receiver.attrs = FFA_MEM_RW;
++
++	args.use_txbuf = true;
++	args.nattrs = 1;
++	args.tag = area_export->mem_tag;
++	args.sg = local_sgt.sgl;
++	args.attrs = &receiver;
++
++	ret = virtio_msg_ffa_memory_share(fdev, &args);
++	virtio_msg_ffa_area_release_sg_table(export, &local_sgt);
++	if (ret) {
++		dev_warn_ratelimited(&fdev->dev,
++				     "area-export: FFA_MEM_SHARE failed area=%u npages=%u ret=%d\n",
++				     area_id, export->npages, ret);
++		goto err_free_area_id;
++	}
++
++	area_export->g_handle = args.g_handle;
++
++	ret = virtio_msg_ffa_area_set_state(area_export,
++					    VIRTIO_MSG_FFA_AREA_SHARED);
++	if (ret)
++		goto err_reclaim;
++
++	ret = virtio_msg_ffa_area_export_track(area_export);
++	if (ret)
++		goto err_remove_area;
++
++	ret = virtio_msg_ffa_send_area_share(area_export);
++	if (ret)
++		goto err_share_cleanup;
++
++	export->dma_addr = area_export->bus_addr;
++
++	*provider_handle = area_export;
++	return 0;
++
++err_share_cleanup:
++	virtio_msg_ffa_area_share_failure_cleanup(area_export);
++	virtio_msg_ffa_area_export_put(area_export);
++	return ret;
++err_remove_area:
++	(void)virtio_msg_ffa_area_registry_remove(area_export);
++err_reclaim:
++	(void)virtio_msg_ffa_area_memory_reclaim(area_export);
++err_free_area_id:
++	if (area_id >= 0)
++		ida_free(&virtio_msg_ffa_area_ida, area_id);
++err_put_export:
++	virtio_msg_ffa_area_export_put(area_export);
++	return ret;
++}
++
++static int
++virtio_msg_ffa_area_export_del(void *ctx,
++			       const struct virtio_msg_bus_dma_driver_export *export,
++			       void *provider_handle, bool sync)
++{
++	struct virtio_msg_ffa_area_export *area_export = provider_handle;
++	bool drop_handle = false;
++	int ret;
++
++	(void)ctx;
++	(void)export;
++
++	if (!provider_handle)
++		return 0;
++
++	mutex_lock(&area_export->op_lock);
++	if (!area_export->handle_dropped) {
++		area_export->handle_dropped = true;
++		drop_handle = true;
++	}
++
++	if (area_export->completed) {
++		mutex_unlock(&area_export->op_lock);
++		ret = 0;
++		goto out_unlock;
++	}
++
++	area_export->teardown_requested = true;
++	mutex_unlock(&area_export->op_lock);
++
++	ret = virtio_msg_ffa_area_try_complete(area_export);
++	if (ret == -EAGAIN) {
++		mutex_lock(&area_export->op_lock);
++		virtio_msg_ffa_area_queue_retry_locked
++				(area_export, VIRTIO_MSG_FFA_AREA_RETRY_DELAY_MS);
++		mutex_unlock(&area_export->op_lock);
++		if (!sync)
++			ret = 0;
++	} else if (ret && !sync) {
++		mutex_lock(&area_export->op_lock);
++		virtio_msg_ffa_area_queue_retry_locked
++				(area_export, VIRTIO_MSG_FFA_AREA_RETRY_DELAY_MS);
++		mutex_unlock(&area_export->op_lock);
++		ret = 0;
++	}
++
++out_unlock:
++	if (drop_handle)
++		virtio_msg_ffa_area_export_put(area_export);
++	return ret;
++}
++
++void virtio_msg_ffa_area_endpoint_cleanup(struct virtio_msg_ffa_area_ctx *ctx)
++{
++	struct virtio_msg_ffa_area_export *area_export;
++	struct ffa_device *fdev;
++	unsigned long index;
++	u16 *area_ids;
++	size_t count = 0;
++	size_t i = 0;
++
++	if (!ctx || !ctx->fdev)
++		return;
++
++	fdev = ctx->fdev;
++	if (!fdev)
++		return;
++
++	/*
++	 * Snapshot matching AREA IDs first: completion paths take @op_lock and
++	 * may untrack (which takes @virtio_msg_ffa_area_exports_lock), so avoid
++	 * lock inversion by not holding the exports lock while queueing work.
++	 */
++	mutex_lock(&virtio_msg_ffa_area_exports_lock);
++	xa_for_each(&virtio_msg_ffa_area_exports, index, area_export) {
++		if (area_export && area_export->fdev == fdev)
++			count++;
++	}
++	mutex_unlock(&virtio_msg_ffa_area_exports_lock);
++
++	if (!count)
++		return;
++
++	area_ids = kcalloc(count, sizeof(*area_ids), GFP_KERNEL);
++	if (!area_ids)
++		return;
++
++	mutex_lock(&virtio_msg_ffa_area_exports_lock);
++	xa_for_each(&virtio_msg_ffa_area_exports, index, area_export) {
++		if (!area_export || area_export->fdev != fdev)
++			continue;
++		if (i >= count)
++			break;
++		area_ids[i++] = area_export->area_id;
++	}
++	mutex_unlock(&virtio_msg_ffa_area_exports_lock);
++
++	for (count = 0; count < i; count++) {
++		area_export = virtio_msg_ffa_area_export_lookup(area_ids[count]);
++		if (!area_export)
++			continue;
++
++		mutex_lock(&area_export->op_lock);
++		if (!area_export->completed) {
++			area_export->teardown_requested = true;
++			virtio_msg_ffa_area_queue_retry_locked(area_export, 0);
++		}
++		mutex_unlock(&area_export->op_lock);
++
++		virtio_msg_ffa_area_export_put(area_export);
++	}
++
++	kfree(area_ids);
++}
++
++int virtio_msg_ffa_area_handle_release(struct virtio_msg_ffa_area_ctx *ctx,
++				       u16 area_id)
++{
++	struct virtio_msg_ffa_area_export *area_export;
++	unsigned long retry_delay = 0;
++	int ret;
++
++	if (!ctx || !ctx->ep)
++		return -EINVAL;
++
++	ret = virtio_msg_ffa_area_mark_released(ctx->ep, area_id);
++	if (ret && ret != -ENOENT)
++		return ret;
++
++	area_export = virtio_msg_ffa_area_export_lookup(area_id);
++	if (!area_export)
++		return 0;
++
++	mutex_lock(&area_export->op_lock);
++	if (!area_export->completed) {
++		area_export->area_released = true;
++		area_export->teardown_requested = true;
++		if (virtio_msg_ffa_area_remote_release_active(area_export)) {
++			area_export->reclaim_deferred = true;
++			retry_delay = VIRTIO_MSG_FFA_AREA_RETRY_DELAY_MS;
++		}
++		virtio_msg_ffa_area_queue_retry_locked(area_export, retry_delay);
++	}
++	mutex_unlock(&area_export->op_lock);
++
++	virtio_msg_ffa_area_export_put(area_export);
++	return 0;
++}
++
++static int
++virtio_msg_ffa_area_query_caps(void *ctx,
++			       struct virtio_msg_bus_dma_driver_provider_caps *caps)
++{
++	if (!ctx || !caps)
++		return -EINVAL;
++
++	memset(caps, 0, sizeof(*caps));
++
++	return 0;
++}
++
++static const struct virtio_msg_bus_dma_driver_provider_ops
++virtio_msg_ffa_area_ops = {
++	.export_add = virtio_msg_ffa_area_export_add,
++	.export_del = virtio_msg_ffa_area_export_del,
++	.query_caps = virtio_msg_ffa_area_query_caps,
++};
++
++const struct virtio_msg_bus_dma_driver_provider_ops *
++virtio_msg_ffa_area_provider_ops_get(void)
++{
++	return &virtio_msg_ffa_area_ops;
++}
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_driver_priv.h b/drivers/virtio/virtio_msg_bus_ffa_driver_priv.h
+new file mode 100644
+index 000000000000..57cc3602754c
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_driver_priv.h
+@@ -0,0 +1,214 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Virtio message bus over FF-A driver-binding private declarations.
++ *
++ * Copyright (C) 2026 Google LLC and Linaro.
++ * Viresh Kumar <viresh.kumar@linaro.org>
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#ifndef _VIRTIO_MSG_BUS_FFA_DRIVER_PRIV_H
++#define _VIRTIO_MSG_BUS_FFA_DRIVER_PRIV_H
++
++#include <linux/bitops.h>
++#include <linux/gfp.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++
++#include "virtio_msg_bus_ffa.h"
++#include "virtio_msg_bus_queue_helper.h"
++#include "virtio_msg_bus_ffa_xfer.h"
++
++struct device;
++struct virtio_msg_bus_provider_ops;
++struct virtio_msg_bus_dma_driver_provider_ops;
++struct virtio_msg_ffa_driver;
++struct virtio_msg_ffa_area_ctx;
++struct virtio_msg_ffa_topology;
++struct virtio_msg_transport_device;
++
++struct virtio_msg_ffa_xfer_engine {
++	enum virtio_msg_ffa_transfer_method method;
++	const struct virtio_msg_ffa_xfer_ops *ops;
++	void *priv;
++};
++
++struct virtio_msg_ffa_xfer_ops {
++	int (*setup_locked)(struct virtio_msg_ffa_driver *drv,
++			    struct virtio_msg_ffa_xfer_engine *xfer);
++	void (*teardown_locked)(struct virtio_msg_ffa_driver *drv,
++				struct virtio_msg_ffa_xfer_engine *xfer);
++	void (*quiesce_locked)(struct virtio_msg_ffa_driver *drv,
++			       struct virtio_msg_ffa_xfer_engine *xfer);
++	int (*submit_locked)(struct virtio_msg_ffa_driver *drv,
++			     struct virtio_msg_ffa_xfer_engine *xfer,
++			     const struct virtio_msg *req, size_t req_len,
++			     struct virtio_msg *resp, size_t resp_buf_len,
++			     size_t *resp_len);
++	int (*event_configure_locked)(struct virtio_msg_ffa_driver *drv,
++				      struct virtio_msg_ffa_xfer_engine *xfer);
++	int (*event_poll_once_locked)(struct virtio_msg_ffa_driver *drv,
++				      struct virtio_msg_ffa_xfer_engine *xfer,
++				      bool *empty);
++	void (*release_priv)(struct virtio_msg_ffa_driver *drv,
++			     struct virtio_msg_ffa_xfer_engine *xfer);
++	bool async_response;
++};
++
++#ifdef CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT
++bool virtio_msg_ffa_indirect_available(struct virtio_msg_ffa_driver *drv);
++extern const struct virtio_msg_ffa_xfer_ops virtio_msg_ffa_indirect_xfer_ops;
++extern const struct virtio_msg_ffa_xfer_method_desc
++	virtio_msg_ffa_indirect_driver_method_desc;
++#endif
++#ifdef CONFIG_VIRTIO_MSG_FFA_XFER_FIFO
++bool virtio_msg_ffa_fifo_available(struct virtio_msg_ffa_driver *drv);
++extern const struct virtio_msg_ffa_xfer_ops virtio_msg_ffa_fifo_xfer_ops;
++extern const struct virtio_msg_ffa_xfer_method_desc
++	virtio_msg_ffa_fifo_driver_method_desc;
++#endif
++
++struct virtio_msg_ffa_driver {
++	struct ffa_device *fdev;
++	struct virtio_msg_ffa_endpoint ep;
++	struct virtio_msg_ffa_xfer_engine bootstrap_xfer;
++	struct virtio_msg_ffa_xfer_engine active_xfer;
++	struct virtio_msg_bus_queue_helper indirect_rx_queue;
++	void *xfer_priv[4];
++	struct mutex lock; /* Serializes endpoint driver-side state. */
++	spinlock_t bus_req_lock; /* Protects same-type bus request state. */
++	DECLARE_BITMAP(bus_req_inflight, 256);
++	wait_queue_head_t bus_req_wait;
++	u32 local_ffa_version;
++	bool event_configured;
++	bool endpoint_disabled;
++	struct virtio_msg_ffa_area_ctx area_ctx;
++	struct virtio_msg_ffa_topology *topology;
++	u64 indirect_rx_generation;
++};
++
++const struct virtio_msg_bus_provider_ops *virtio_msg_ffa_bus_ops_get(void);
++const struct virtio_msg_bus_dma_driver_provider_ops *
++virtio_msg_ffa_area_provider_ops_get(void);
++
++struct virtio_msg_ffa_area_ctx *
++virtio_msg_ffa_area_ctx_alloc(struct virtio_msg_ffa_driver *drv);
++void virtio_msg_ffa_area_ctx_free(struct virtio_msg_ffa_area_ctx *ctx);
++int virtio_msg_ffa_area_ctx_send_bus_req
++		(struct virtio_msg_ffa_area_ctx *ctx, u8 msg_id,
++		 const void *payload, size_t payload_len,
++		 struct virtio_msg *resp, size_t resp_buf_len,
++		 size_t *resp_len);
++
++int virtio_msg_ffa_topology_init(struct virtio_msg_ffa_driver *drv);
++void virtio_msg_ffa_topology_destroy(struct virtio_msg_ffa_topology *topo);
++void virtio_msg_ffa_topology_schedule(struct virtio_msg_ffa_driver *drv);
++int virtio_msg_ffa_topology_handle_event(struct virtio_msg_ffa_driver *drv,
++					 const struct virtio_msg_bus_event_device *event);
++int virtio_msg_ffa_topology_handle_transport_event(struct virtio_msg_ffa_driver *drv,
++						   const struct virtio_msg *msg);
++int virtio_msg_ffa_topology_send_bus_request(struct virtio_msg_ffa_driver *drv,
++					     u8 msg_id, const void *payload,
++					     size_t payload_len,
++					     struct virtio_msg *resp,
++					     size_t resp_buf_len,
++					     size_t *resp_len);
++
++struct virtio_msg_ffa_driver *
++virtio_msg_ffa_vmdev_callback_begin(struct virtio_msg_transport_device *vmdev);
++void virtio_msg_ffa_vmdev_callback_end(struct virtio_msg_transport_device *vmdev);
++void
++virtio_msg_ffa_vmdev_callback_wait_zero(struct virtio_msg_transport_device *vmdev);
++int virtio_msg_ffa_vmdev_enqueue_event(struct virtio_msg_transport_device *vmdev,
++				       const struct virtio_msg *request,
++				       gfp_t gfp);
++
++struct device *virtio_msg_ffa_driver_parent(struct virtio_msg_ffa_driver *drv);
++struct virtio_msg_ffa_area_ctx *
++virtio_msg_ffa_driver_area_ctx(struct virtio_msg_ffa_driver *drv);
++int virtio_msg_ffa_driver_area_add(struct virtio_msg_ffa_driver *drv,
++				   const struct virtio_msg_ffa_area *area);
++int virtio_msg_ffa_driver_area_lookup(struct virtio_msg_ffa_driver *drv,
++				      u16 area_id,
++				      struct virtio_msg_ffa_area *out);
++int virtio_msg_ffa_driver_area_mark_released(struct virtio_msg_ffa_driver *drv,
++					     u16 area_id);
++int virtio_msg_ffa_driver_area_remove(struct virtio_msg_ffa_driver *drv,
++				      u16 area_id,
++				      struct virtio_msg_ffa_area *removed);
++
++void virtio_msg_ffa_area_endpoint_cleanup(struct virtio_msg_ffa_area_ctx *ctx);
++int virtio_msg_ffa_area_handle_release(struct virtio_msg_ffa_area_ctx *ctx,
++				       u16 area_id);
++
++struct virtio_msg_ffa_topology *
++virtio_msg_ffa_driver_topology_get(struct virtio_msg_ffa_driver *drv);
++void virtio_msg_ffa_driver_topology_set(struct virtio_msg_ffa_driver *drv,
++					struct virtio_msg_ffa_topology *topo);
++int virtio_msg_ffa_driver_send_bus_request_locked(struct virtio_msg_ffa_driver *drv,
++						  u8 msg_id,
++						  const void *payload,
++						  size_t payload_len,
++						  struct virtio_msg *resp,
++						  size_t resp_buf_len,
++						  size_t *resp_len);
++int virtio_msg_ffa_driver_event_configure_send_locked(struct virtio_msg_ffa_driver *drv,
++						      enum virtio_msg_ffa_bus_event_delivery method,
++						      u16 notif_id);
++int virtio_msg_ffa_driver_dispatch_inbound_locked(struct virtio_msg_ffa_driver *drv,
++						  const struct virtio_msg *msg,
++						  size_t msg_len);
++void virtio_msg_ffa_driver_trace_msg(struct virtio_msg_ffa_driver *drv,
++				     const char *dir, const char *path,
++				     const struct virtio_msg *msg,
++				     size_t msg_len);
++bool virtio_msg_ffa_driver_event_runtime_ready_locked(struct virtio_msg_ffa_driver *drv);
++int virtio_msg_ffa_driver_submit_event(struct virtio_msg_ffa_driver *drv,
++				       const struct virtio_msg *request);
++bool
++virtio_msg_ffa_driver_indirect_rx_ready_locked(struct virtio_msg_ffa_driver *drv);
++
++/*
++ * init_runtime() owns transient busy handling. Once a method is rejected, the
++ * generic selector must not see -EBUSY as a retry signal.
++ */
++static inline int virtio_msg_ffa_driver_init_runtime_reject(int ret)
++{
++	return ret == -EBUSY ? -EIO : ret;
++}
++
++#ifdef CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT
++int virtio_msg_ffa_driver_indirect_rx_init(struct virtio_msg_ffa_driver *drv);
++void virtio_msg_ffa_driver_indirect_rx_quiesce(struct virtio_msg_ffa_driver *drv);
++bool virtio_msg_ffa_indirect_rx_cb(struct ffa_device *fdev, u16 sender_vm_id,
++				   const uuid_t *uuid, const void *buf,
++				   size_t len);
++#else
++static inline int
++virtio_msg_ffa_driver_indirect_rx_init(struct virtio_msg_ffa_driver *drv)
++{
++	(void)drv;
++
++	return 0;
++}
++
++static inline void
++virtio_msg_ffa_driver_indirect_rx_quiesce(struct virtio_msg_ffa_driver *drv)
++{
++	(void)drv;
++}
++#endif
++void virtio_msg_ffa_driver_handle_device_failure_locked(struct virtio_msg_ffa_driver *drv,
++							u16 dev_num);
++void virtio_msg_ffa_driver_handle_endpoint_failure_locked(struct virtio_msg_ffa_driver *drv,
++							  int err);
++int virtio_msg_ffa_driver_prepare_runtime(struct virtio_msg_ffa_driver *drv);
++int virtio_msg_ffa_driver_event_configure(struct virtio_msg_ffa_driver *drv);
++void virtio_msg_ffa_endpoint_disable(struct virtio_msg_ffa_driver *drv);
++bool virtio_msg_ffa_endpoint_disabled(struct virtio_msg_ffa_driver *drv);
++bool virtio_msg_ffa_driver_uuid_match(const uuid_t *uuid);
++
++#endif /* _VIRTIO_MSG_BUS_FFA_DRIVER_PRIV_H */
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_driver_topology.c b/drivers/virtio/virtio_msg_bus_ffa_driver_topology.c
+new file mode 100644
+index 000000000000..3d02d15d2ea6
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_driver_topology.c
+@@ -0,0 +1,971 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio message bus over FF-A topology reconciliation.
++ *
++ * Copyright (C) 2026 Google LLC and Linaro.
++ * Viresh Kumar <viresh.kumar@linaro.org>
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#define pr_fmt(fmt) "virtio-msg-ffa: " fmt
++
++#include <linux/bitmap.h>
++#include <linux/bitops.h>
++#include <linux/completion.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/rcupdate.h>
++#include <linux/refcount.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_features.h>
++#include <linux/virtio_msg_bus_provider.h>
++#include <linux/virtio_msg_protocol.h>
++#include <linux/virtio_msg_transport.h>
++#include <linux/workqueue.h>
++#include <linux/xarray.h>
++
++#include "virtio_msg_bus_dma_driver_helper.h"
++#include "virtio_msg_bus_ffa.h"
++#include "virtio_msg_bus_ffa_driver_priv.h"
++#include "virtio_msg_bus_ffa_protocol.h"
++#include "virtio_msg_bus_queue_helper.h"
++
++#define VIRTIO_MSG_FFA_BUS_NAME			"virtio-msg-ffa"
++#define VIRTIO_MSG_FFA_EVENT_QUEUE_DEPTH	32
++#define VIRTIO_MSG_FFA_EVENT_QUEUE_TIMEOUT_MS	5000
++#define VIRTIO_MSG_FFA_TOPOLOGY_WINDOW_COUNT	256U
++#define VIRTIO_MSG_FFA_TOPOLOGY_MAX_WINDOWS	8192U
++#define VIRTIO_MSG_FFA_TOPOLOGY_MAX_DEVS	65536U
++#define VIRTIO_MSG_FFA_INIT_BUSY_RETRY_MAX	60
++#define VIRTIO_MSG_FFA_INIT_BUSY_DELAY_MS	50
++
++struct virtio_msg_ffa_vmdev {
++	struct virtio_msg_transport_device vmdev;
++	struct virtio_msg_ffa_driver *drv;
++	u16 dev_num;
++	bool provider_attached;
++	bool transport_prepared;
++	bool device_registered;
++	spinlock_t cb_lock; /* Protects provider callback inflight accounting. */
++	bool cb_blocked; /* Prevent new callback entry during unregister. */
++	unsigned int cb_inflight;
++	struct completion cb_zero_inflight;
++	struct list_head pending;
++	struct virtio_msg_bus_queue_helper event_queue;
++};
++
++struct virtio_msg_ffa_topology {
++	struct virtio_msg_ffa_driver *drv;
++	struct delayed_work reconcile_work;
++	struct mutex lock; /* Protects devices and reconcile flags. */
++	struct xarray devices;
++	refcount_t refcount;
++	struct completion release;
++	u32 init_busy_retries;
++	bool reconcile_requested;
++	bool initial_reconcile_done;
++	bool stopping;
++};
++
++static struct virtio_msg_ffa_topology *
++virtio_msg_ffa_topology_get_rcu(struct virtio_msg_ffa_driver *drv)
++{
++	struct virtio_msg_ffa_topology *topo;
++
++	rcu_read_lock();
++	topo = virtio_msg_ffa_driver_topology_get(drv);
++	if (topo && !refcount_inc_not_zero(&topo->refcount))
++		topo = NULL;
++	rcu_read_unlock();
++
++	return topo;
++}
++
++static void virtio_msg_ffa_topology_put(struct virtio_msg_ffa_topology *topo)
++{
++	if (!topo)
++		return;
++
++	if (refcount_dec_and_test(&topo->refcount))
++		complete(&topo->release);
++}
++
++static u16 virtio_msg_ffa_topology_peer_vm(struct virtio_msg_ffa_topology *topo)
++{
++	if (!topo || !topo->drv || !topo->drv->fdev)
++		return 0;
++
++	return (u16)topo->drv->fdev->vm_id;
++}
++
++static bool
++virtio_msg_ffa_topology_queue_delay(struct virtio_msg_ffa_topology *topo,
++				    unsigned long delay)
++{
++	if (!topo)
++		return false;
++	if (!refcount_inc_not_zero(&topo->refcount))
++		return false;
++
++	if (!schedule_delayed_work(&topo->reconcile_work, delay)) {
++		virtio_msg_ffa_topology_put(topo);
++		return false;
++	}
++
++	return true;
++}
++
++static struct virtio_msg_ffa_vmdev *
++virtio_msg_ffa_vmdev_from_transport(struct virtio_msg_transport_device *vmdev)
++{
++	if (!vmdev)
++		return NULL;
++
++	return container_of(vmdev, struct virtio_msg_ffa_vmdev, vmdev);
++}
++
++static bool virtio_msg_ffa_vmdev_event_avail_valid
++					(const struct virtio_msg *request)
++{
++	u16 msg_size;
++
++	if (!request)
++		return false;
++
++	msg_size = le16_to_cpu(request->msg_size);
++	if (request->type != VIRTIO_MSG_TYPE_TRANSPORT)
++		return false;
++	if (request->msg_id != VIRTIO_MSG_EVENT_AVAIL)
++		return false;
++	if (msg_size != sizeof(*request) +
++			sizeof(struct virtio_msg_event_avail))
++		return false;
++
++	return true;
++}
++
++static int
++virtio_msg_ffa_vmdev_event_submit
++		(void *context,
++		 const struct virtio_msg_bus_queue_helper_item *item)
++{
++	struct virtio_msg_ffa_vmdev *shell = context;
++	const struct virtio_msg *request;
++
++	if (!shell || !shell->drv || !item)
++		return -EINVAL;
++	if (item->type != VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG)
++		return -EINVAL;
++
++	request = item->vmsg;
++	if (!virtio_msg_ffa_vmdev_event_avail_valid(request))
++		return -EINVAL;
++	if (item->msg_size != le16_to_cpu(request->msg_size))
++		return -EMSGSIZE;
++
++	return virtio_msg_ffa_driver_submit_event(shell->drv, request);
++}
++
++int virtio_msg_ffa_vmdev_enqueue_event(struct virtio_msg_transport_device *vmdev,
++				       const struct virtio_msg *request,
++				       gfp_t gfp)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++
++	if (!request)
++		return -EINVAL;
++	if (!virtio_msg_ffa_vmdev_event_avail_valid(request))
++		return -EINVAL;
++
++	shell = virtio_msg_ffa_vmdev_from_transport(vmdev);
++	if (!shell)
++		return -EINVAL;
++
++	return virtio_msg_bus_queue_helper_enqueue(&shell->event_queue,
++						   request, gfp);
++}
++
++struct virtio_msg_ffa_driver *
++virtio_msg_ffa_vmdev_callback_begin(struct virtio_msg_transport_device *vmdev)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	unsigned long flags;
++
++	shell = virtio_msg_ffa_vmdev_from_transport(vmdev);
++	if (!shell)
++		return NULL;
++
++	spin_lock_irqsave(&shell->cb_lock, flags);
++	if (shell->cb_blocked) {
++		spin_unlock_irqrestore(&shell->cb_lock, flags);
++		return NULL;
++	}
++	if (!shell->cb_inflight)
++		reinit_completion(&shell->cb_zero_inflight);
++	shell->cb_inflight++;
++	spin_unlock_irqrestore(&shell->cb_lock, flags);
++
++	return shell->drv;
++}
++
++void virtio_msg_ffa_vmdev_callback_end(struct virtio_msg_transport_device *vmdev)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	unsigned long flags;
++
++	shell = virtio_msg_ffa_vmdev_from_transport(vmdev);
++	if (!shell)
++		return;
++
++	spin_lock_irqsave(&shell->cb_lock, flags);
++	if (WARN_ON(!shell->cb_inflight)) {
++		spin_unlock_irqrestore(&shell->cb_lock, flags);
++		return;
++	}
++	shell->cb_inflight--;
++	if (!shell->cb_inflight)
++		complete(&shell->cb_zero_inflight);
++	spin_unlock_irqrestore(&shell->cb_lock, flags);
++}
++
++void
++virtio_msg_ffa_vmdev_callback_wait_zero(struct virtio_msg_transport_device *vmdev)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	unsigned long flags;
++
++	shell = virtio_msg_ffa_vmdev_from_transport(vmdev);
++	if (!shell)
++		return;
++
++	spin_lock_irqsave(&shell->cb_lock, flags);
++	if (!shell->cb_inflight)
++		complete(&shell->cb_zero_inflight);
++	spin_unlock_irqrestore(&shell->cb_lock, flags);
++
++	wait_for_completion(&shell->cb_zero_inflight);
++}
++
++static void
++virtio_msg_ffa_vmdev_callback_block(struct virtio_msg_transport_device *vmdev)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	unsigned long flags;
++
++	shell = virtio_msg_ffa_vmdev_from_transport(vmdev);
++	if (!shell)
++		return;
++
++	spin_lock_irqsave(&shell->cb_lock, flags);
++	shell->cb_blocked = true;
++	if (!shell->cb_inflight)
++		complete(&shell->cb_zero_inflight);
++	spin_unlock_irqrestore(&shell->cb_lock, flags);
++
++	wait_for_completion(&shell->cb_zero_inflight);
++}
++
++static void virtio_msg_ffa_topology_set_required_features
++		(struct virtio_msg_transport_device *vmdev)
++{
++	u64 required[VIRTIO_FEATURES_U64S];
++
++	virtio_features_zero(required);
++	virtio_features_set_bit(required, VIRTIO_F_VERSION_1);
++	virtio_features_set_bit(required, VIRTIO_F_ACCESS_PLATFORM);
++	virtio_msg_transport_set_required_features(vmdev, required);
++}
++
++static int
++virtio_msg_ffa_topology_enumerate_devices(struct virtio_msg_ffa_topology *topo,
++					  unsigned long *present)
++{
++	struct virtio_msg_bus_get_devices req;
++	u8 resp_msg_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *resp_msg = (struct virtio_msg *)resp_msg_buf;
++	const struct virtio_msg_bus_get_devices_resp *resp;
++	size_t resp_len;
++	size_t bitmap_len;
++	u16 offset = 0;
++	u16 count = VIRTIO_MSG_FFA_TOPOLOGY_WINDOW_COUNT;
++	u16 next_offset;
++	u16 resp_count;
++	unsigned int window;
++	unsigned int i;
++	int ret;
++
++	if (!topo || !present)
++		return -EINVAL;
++
++	for (window = 0; window < VIRTIO_MSG_FFA_TOPOLOGY_MAX_WINDOWS; window++) {
++		req.offset = cpu_to_le16(offset);
++		req.count = cpu_to_le16(count);
++
++		ret = virtio_msg_ffa_topology_send_bus_request
++				(topo->drv, VIRTIO_MSG_BUS_GET_DEVICES,
++				 &req, sizeof(req), resp_msg,
++				 sizeof(resp_msg_buf), &resp_len);
++		if (ret)
++			return ret;
++
++		if (resp_len < sizeof(*resp_msg) + sizeof(*resp))
++			return -EPROTO;
++
++		resp = (const struct virtio_msg_bus_get_devices_resp *)
++			resp_msg->payload;
++		resp_count = le16_to_cpu(resp->count);
++		if (resp_count > count)
++			return -EPROTO;
++
++		if (le16_to_cpu(resp->offset) != offset)
++			return -EPROTO;
++
++		bitmap_len = DIV_ROUND_UP(resp_count, 8);
++		if (resp_len != sizeof(*resp_msg) + sizeof(*resp) + bitmap_len)
++			return -EPROTO;
++
++		for (i = 0; i < resp_count; i++) {
++			unsigned int dev_num = offset + i;
++
++			if (dev_num >= VIRTIO_MSG_FFA_TOPOLOGY_MAX_DEVS)
++				break;
++			if (resp->bitmap[i / 8] & BIT(i % 8))
++				set_bit(dev_num, present);
++		}
++
++		next_offset = le16_to_cpu(resp->next_offset);
++		if (!next_offset)
++			return 0;
++		if (next_offset <= offset)
++			return -EPROTO;
++
++		offset = next_offset;
++	}
++
++	return -EOVERFLOW;
++}
++
++static void
++virtio_msg_ffa_topology_mark_initial_done(struct virtio_msg_ffa_topology *topo)
++{
++	if (!topo)
++		return;
++
++	mutex_lock(&topo->lock);
++	topo->init_busy_retries = 0;
++	topo->initial_reconcile_done = true;
++	mutex_unlock(&topo->lock);
++}
++
++static bool
++virtio_msg_ffa_topology_initial_done(struct virtio_msg_ffa_topology *topo)
++{
++	bool done;
++
++	if (!topo)
++		return false;
++
++	mutex_lock(&topo->lock);
++	done = topo->initial_reconcile_done;
++	mutex_unlock(&topo->lock);
++
++	return done;
++}
++
++static bool
++virtio_msg_ffa_topology_retry_init_busy(struct virtio_msg_ffa_topology *topo,
++					int ret)
++{
++	struct device *parent;
++	unsigned long delay;
++	u32 attempt;
++
++	if (!topo || ret != -EBUSY)
++		return false;
++
++	mutex_lock(&topo->lock);
++	if (topo->initial_reconcile_done ||
++	    topo->init_busy_retries >= VIRTIO_MSG_FFA_INIT_BUSY_RETRY_MAX ||
++	    topo->stopping || virtio_msg_ffa_endpoint_disabled(topo->drv)) {
++		mutex_unlock(&topo->lock);
++		return false;
++	}
++
++	topo->init_busy_retries++;
++	attempt = topo->init_busy_retries;
++	topo->reconcile_requested = true;
++	mutex_unlock(&topo->lock);
++
++	parent = virtio_msg_ffa_driver_parent(topo->drv);
++	if (parent)
++		dev_dbg(parent,
++			"topology init busy retry: peer_vm=%u attempt=%u/%u delay_ms=%u\n",
++			virtio_msg_ffa_topology_peer_vm(topo), attempt,
++			VIRTIO_MSG_FFA_INIT_BUSY_RETRY_MAX,
++			VIRTIO_MSG_FFA_INIT_BUSY_DELAY_MS);
++	else
++		pr_debug("topology init busy retry: peer_vm=%u attempt=%u/%u delay_ms=%u\n",
++			 virtio_msg_ffa_topology_peer_vm(topo), attempt,
++			 VIRTIO_MSG_FFA_INIT_BUSY_RETRY_MAX,
++			 VIRTIO_MSG_FFA_INIT_BUSY_DELAY_MS);
++
++	delay = msecs_to_jiffies(VIRTIO_MSG_FFA_INIT_BUSY_DELAY_MS);
++	virtio_msg_ffa_topology_queue_delay(topo, delay);
++	return true;
++}
++
++static void
++virtio_msg_ffa_topology_warn_init_busy_exhausted
++			(struct virtio_msg_ffa_topology *topo, int ret)
++{
++	struct device *parent;
++
++	if (!topo)
++		return;
++
++	parent = virtio_msg_ffa_driver_parent(topo->drv);
++	if (parent)
++		dev_warn_ratelimited(parent,
++				     "topology init busy retry exhausted: peer_vm=%u ret=%d\n",
++				     virtio_msg_ffa_topology_peer_vm(topo), ret);
++	else
++		pr_warn_ratelimited("topology init busy retry exhausted: peer_vm=%u ret=%d\n",
++				    virtio_msg_ffa_topology_peer_vm(topo), ret);
++}
++
++static struct virtio_msg_ffa_vmdev *
++virtio_msg_ffa_topology_publish_device(struct virtio_msg_ffa_topology *topo,
++				       u16 dev_num)
++{
++	const struct virtio_msg_bus_provider_ops *provider_ops;
++	const struct virtio_msg_bus_dma_driver_provider_ops *area_ops;
++	struct device *parent;
++	struct virtio_msg_ffa_vmdev *shell;
++	int ret;
++
++	if (!topo)
++		return ERR_PTR(-EINVAL);
++
++	provider_ops = virtio_msg_ffa_bus_ops_get();
++	area_ops = virtio_msg_ffa_area_provider_ops_get();
++	parent = virtio_msg_ffa_driver_parent(topo->drv);
++	if (!provider_ops || !area_ops || !parent)
++		return ERR_PTR(-ENODEV);
++
++	shell = kzalloc(sizeof(*shell), GFP_KERNEL);
++	if (!shell)
++		return ERR_PTR(-ENOMEM);
++
++	shell->drv = topo->drv;
++	shell->dev_num = dev_num;
++	shell->vmdev.dev_num = dev_num;
++	spin_lock_init(&shell->cb_lock);
++	shell->cb_blocked = false;
++	init_completion(&shell->cb_zero_inflight);
++	complete(&shell->cb_zero_inflight);
++	INIT_LIST_HEAD(&shell->pending);
++
++	ret = virtio_msg_bus_queue_helper_init
++			(&shell->event_queue, parent, FFA_BUS_MAX_MSG_SIZE,
++			 VIRTIO_MSG_FFA_EVENT_QUEUE_DEPTH,
++			 VIRTIO_MSG_FFA_EVENT_QUEUE_TIMEOUT_MS,
++			 virtio_msg_ffa_vmdev_event_submit, NULL, shell);
++	if (ret)
++		goto err_free;
++
++	ret = virtio_msg_transport_attach_provider(&shell->vmdev, provider_ops,
++						   VIRTIO_MSG_FFA_BUS_NAME,
++						   topo->drv);
++	if (ret)
++		goto err_free;
++	shell->provider_attached = true;
++
++	virtio_msg_ffa_topology_set_required_features(&shell->vmdev);
++
++	ret = virtio_msg_transport_prepare_device(&shell->vmdev);
++	if (ret)
++		goto err_detach;
++	shell->transport_prepared = true;
++
++	shell->vmdev.vdev.vmap.dma_dev = parent;
++	shell->vmdev.vdev.dev.parent = parent;
++	ret = virtio_msg_bus_dma_driver_helper_install
++			(&shell->vmdev, area_ops,
++			 virtio_msg_ffa_driver_area_ctx(topo->drv));
++	if (ret)
++		goto err_unprepare;
++
++	if (topo->drv->fdev)
++		dev_info(&topo->drv->fdev->dev,
++			 "device publish prepared: peer_vm=%u dev_num=%u\n",
++			 (u16)topo->drv->fdev->vm_id, dev_num);
++
++	return shell;
++
++err_unprepare:
++	shell->vmdev.vdev.vmap.dma_dev = NULL;
++	shell->vmdev.vdev.dev.parent = NULL;
++	if (shell->transport_prepared) {
++		virtio_msg_transport_unprepare_device(&shell->vmdev);
++		shell->transport_prepared = false;
++	}
++err_detach:
++	if (shell->provider_attached) {
++		virtio_msg_transport_detach_provider(&shell->vmdev);
++		shell->provider_attached = false;
++	}
++err_free:
++	virtio_msg_bus_queue_helper_stop(&shell->event_queue);
++	kfree(shell);
++	return ERR_PTR(ret);
++}
++
++static void
++virtio_msg_ffa_topology_unpublish_device(struct virtio_msg_ffa_vmdev *shell)
++{
++	if (!shell)
++		return;
++
++	virtio_msg_ffa_vmdev_callback_block(&shell->vmdev);
++	virtio_msg_bus_queue_helper_stop(&shell->event_queue);
++
++	if (shell->device_registered) {
++		if (shell->drv && shell->drv->fdev)
++			dev_info(&shell->drv->fdev->dev,
++				 "device unregister: peer_vm=%u dev_num=%u\n",
++				 (u16)shell->drv->fdev->vm_id,
++				 shell->dev_num);
++		virtio_msg_transport_unregister_device(&shell->vmdev);
++		shell->device_registered = false;
++	}
++
++	if (virtio_msg_bus_dma_driver_helper_is_installed(&shell->vmdev))
++		virtio_msg_bus_dma_driver_helper_cleanup(&shell->vmdev);
++
++	if (shell->transport_prepared) {
++		virtio_msg_transport_unprepare_device(&shell->vmdev);
++		shell->transport_prepared = false;
++	}
++
++	if (shell->provider_attached) {
++		virtio_msg_transport_detach_provider(&shell->vmdev);
++		shell->provider_attached = false;
++	}
++
++	shell->vmdev.vdev.vmap.dma_dev = NULL;
++	shell->vmdev.vdev.dev.parent = NULL;
++	if (shell->drv && shell->drv->fdev)
++		dev_info(&shell->drv->fdev->dev,
++			 "device unpublish: peer_vm=%u dev_num=%u\n",
++			 (u16)shell->drv->fdev->vm_id, shell->dev_num);
++	kfree(shell);
++}
++
++static void
++virtio_msg_ffa_topology_remove_stale(struct virtio_msg_ffa_topology *topo,
++				     unsigned long *present)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	unsigned long index;
++
++	for (;;) {
++		shell = NULL;
++
++		mutex_lock(&topo->lock);
++		xa_for_each(&topo->devices, index, shell) {
++			if (!test_bit(index, present)) {
++				xa_erase(&topo->devices, index);
++				break;
++			}
++			shell = NULL;
++		}
++		mutex_unlock(&topo->lock);
++
++		if (!shell)
++			break;
++
++		virtio_msg_ffa_topology_unpublish_device(shell);
++	}
++}
++
++static int
++virtio_msg_ffa_topology_prepare_new(struct virtio_msg_ffa_topology *topo,
++				    unsigned long *present,
++				    struct list_head *prepared)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	unsigned long dev_num;
++	int ret;
++
++	if (!topo || !present || !prepared)
++		return -EINVAL;
++
++	for_each_set_bit(dev_num, present, VIRTIO_MSG_FFA_TOPOLOGY_MAX_DEVS) {
++		mutex_lock(&topo->lock);
++		if (xa_load(&topo->devices, dev_num)) {
++			mutex_unlock(&topo->lock);
++			continue;
++		}
++		mutex_unlock(&topo->lock);
++
++		shell = virtio_msg_ffa_topology_publish_device(topo, dev_num);
++		if (IS_ERR(shell)) {
++			ret = PTR_ERR(shell);
++			goto err_unwind;
++		}
++
++		mutex_lock(&topo->lock);
++		if (xa_load(&topo->devices, dev_num)) {
++			mutex_unlock(&topo->lock);
++			virtio_msg_ffa_topology_unpublish_device(shell);
++			continue;
++		}
++
++		ret = xa_err(xa_store(&topo->devices, dev_num, shell, GFP_KERNEL));
++		mutex_unlock(&topo->lock);
++		if (ret) {
++			virtio_msg_ffa_topology_unpublish_device(shell);
++			goto err_unwind;
++		}
++
++		list_add_tail(&shell->pending, prepared);
++	}
++
++	return 0;
++
++err_unwind:
++	while (!list_empty(prepared)) {
++		shell = list_first_entry(prepared,
++					 struct virtio_msg_ffa_vmdev,
++					 pending);
++		list_del_init(&shell->pending);
++		mutex_lock(&topo->lock);
++		if (xa_load(&topo->devices, shell->dev_num) == shell)
++			xa_erase(&topo->devices, shell->dev_num);
++		mutex_unlock(&topo->lock);
++		virtio_msg_ffa_topology_unpublish_device(shell);
++	}
++	return ret;
++}
++
++static void
++virtio_msg_ffa_topology_unwind_prepared(struct virtio_msg_ffa_topology *topo,
++					struct list_head *prepared)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	struct virtio_msg_ffa_vmdev *tmp;
++
++	if (!topo || !prepared)
++		return;
++
++	list_for_each_entry_safe(shell, tmp, prepared, pending) {
++		list_del_init(&shell->pending);
++		mutex_lock(&topo->lock);
++		if (xa_load(&topo->devices, shell->dev_num) == shell)
++			xa_erase(&topo->devices, shell->dev_num);
++		mutex_unlock(&topo->lock);
++		virtio_msg_ffa_topology_unpublish_device(shell);
++	}
++}
++
++static int
++virtio_msg_ffa_topology_register_prepared(struct virtio_msg_ffa_topology *topo,
++					  struct list_head *prepared)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	struct virtio_msg_ffa_vmdev *tmp;
++	int ret;
++
++	if (!topo || !prepared)
++		return -EINVAL;
++
++	list_for_each_entry_safe(shell, tmp, prepared, pending) {
++		ret = virtio_msg_transport_register_prepared_device(&shell->vmdev);
++		if (ret) {
++			mutex_lock(&topo->lock);
++			if (xa_load(&topo->devices, shell->dev_num) == shell)
++				xa_erase(&topo->devices, shell->dev_num);
++			mutex_unlock(&topo->lock);
++			list_del_init(&shell->pending);
++			virtio_msg_ffa_topology_unpublish_device(shell);
++			virtio_msg_ffa_topology_unwind_prepared(topo, prepared);
++			return ret;
++		}
++		shell->device_registered = true;
++		if (topo->drv->fdev)
++			dev_info(&topo->drv->fdev->dev,
++				 "device register: peer_vm=%u dev_num=%u\n",
++				 (u16)topo->drv->fdev->vm_id, shell->dev_num);
++		list_del_init(&shell->pending);
++	}
++
++	return 0;
++}
++
++static int virtio_msg_ffa_topology_reconcile_once
++			(struct virtio_msg_ffa_topology *topo)
++{
++	unsigned long *present;
++	LIST_HEAD(prepared);
++	int ret;
++
++	if (!topo)
++		return -EINVAL;
++	if (virtio_msg_ffa_endpoint_disabled(topo->drv))
++		return 0;
++	if (topo->drv->fdev)
++		dev_info(&topo->drv->fdev->dev,
++			 "topology reconcile start: peer_vm=%u\n",
++			 (u16)topo->drv->fdev->vm_id);
++
++	ret = virtio_msg_ffa_driver_prepare_runtime(topo->drv);
++	if (virtio_msg_ffa_topology_retry_init_busy(topo, ret))
++		return -EAGAIN;
++	if (ret) {
++		if (ret == -EBUSY &&
++		    !virtio_msg_ffa_topology_initial_done(topo))
++			virtio_msg_ffa_topology_warn_init_busy_exhausted(topo,
++									 ret);
++		virtio_msg_ffa_endpoint_disable(topo->drv);
++		return ret;
++	}
++
++	present = bitmap_zalloc(VIRTIO_MSG_FFA_TOPOLOGY_MAX_DEVS, GFP_KERNEL);
++	if (!present)
++		return -ENOMEM;
++
++	ret = virtio_msg_ffa_topology_enumerate_devices(topo, present);
++	if (virtio_msg_ffa_topology_retry_init_busy(topo, ret)) {
++		ret = -EAGAIN;
++		goto out_free;
++	}
++	if (ret) {
++		if (ret == -EBUSY &&
++		    !virtio_msg_ffa_topology_initial_done(topo)) {
++			virtio_msg_ffa_topology_warn_init_busy_exhausted(topo,
++									 ret);
++			virtio_msg_ffa_endpoint_disable(topo->drv);
++		}
++		goto out_free;
++	}
++
++	virtio_msg_ffa_topology_mark_initial_done(topo);
++	virtio_msg_ffa_topology_remove_stale(topo, present);
++	ret = virtio_msg_ffa_topology_prepare_new(topo, present, &prepared);
++	if (ret)
++		goto out_free;
++
++	if (list_empty(&prepared))
++		goto out_free;
++
++	ret = virtio_msg_ffa_topology_register_prepared(topo, &prepared);
++
++out_free:
++	bitmap_free(present);
++	if (topo->drv->fdev)
++		dev_info(&topo->drv->fdev->dev,
++			 "topology reconcile result: peer_vm=%u ret=%d\n",
++			 (u16)topo->drv->fdev->vm_id, ret);
++	return ret;
++}
++
++static void virtio_msg_ffa_topology_reconcile_work(struct work_struct *work)
++{
++	struct virtio_msg_ffa_topology *topo =
++		container_of(to_delayed_work(work),
++			     struct virtio_msg_ffa_topology, reconcile_work);
++	struct device *parent;
++	int ret;
++
++	parent = virtio_msg_ffa_driver_parent(topo->drv);
++
++	for (;;) {
++		mutex_lock(&topo->lock);
++		if (topo->stopping ||
++		    virtio_msg_ffa_endpoint_disabled(topo->drv)) {
++			topo->reconcile_requested = false;
++			mutex_unlock(&topo->lock);
++			break;
++		}
++
++		if (!topo->reconcile_requested) {
++			mutex_unlock(&topo->lock);
++			break;
++		}
++
++		topo->reconcile_requested = false;
++		mutex_unlock(&topo->lock);
++
++		ret = virtio_msg_ffa_topology_reconcile_once(topo);
++		if (ret == -EAGAIN)
++			break;
++		if (ret && parent)
++			dev_warn_ratelimited(parent,
++					     "topology reconcile failed: %d\n",
++					     ret);
++	}
++
++	virtio_msg_ffa_topology_put(topo);
++}
++
++int virtio_msg_ffa_topology_init(struct virtio_msg_ffa_driver *drv)
++{
++	struct virtio_msg_ffa_topology *topo;
++
++	if (!drv)
++		return -EINVAL;
++
++	topo = kzalloc(sizeof(*topo), GFP_KERNEL);
++	if (!topo)
++		return -ENOMEM;
++
++	topo->drv = drv;
++	mutex_init(&topo->lock);
++	xa_init(&topo->devices);
++	refcount_set(&topo->refcount, 1);
++	init_completion(&topo->release);
++	INIT_DELAYED_WORK(&topo->reconcile_work,
++			  virtio_msg_ffa_topology_reconcile_work);
++	virtio_msg_ffa_driver_topology_set(drv, topo);
++
++	virtio_msg_ffa_topology_schedule(drv);
++
++	return 0;
++}
++
++void virtio_msg_ffa_topology_destroy(struct virtio_msg_ffa_topology *topo)
++{
++	struct virtio_msg_ffa_vmdev *shell;
++	unsigned long index;
++
++	if (!topo)
++		return;
++
++	mutex_lock(&topo->lock);
++	topo->stopping = true;
++	mutex_unlock(&topo->lock);
++	if (cancel_delayed_work_sync(&topo->reconcile_work))
++		virtio_msg_ffa_topology_put(topo);
++
++	for (;;) {
++		shell = NULL;
++
++		mutex_lock(&topo->lock);
++		xa_for_each(&topo->devices, index, shell) {
++			xa_erase(&topo->devices, index);
++			break;
++		}
++		mutex_unlock(&topo->lock);
++
++		if (!shell)
++			break;
++
++		virtio_msg_ffa_topology_unpublish_device(shell);
++	}
++
++	xa_destroy(&topo->devices);
++	virtio_msg_ffa_topology_put(topo);
++	wait_for_completion(&topo->release);
++	kfree(topo);
++}
++
++void virtio_msg_ffa_topology_schedule(struct virtio_msg_ffa_driver *drv)
++{
++	struct virtio_msg_ffa_topology *topo;
++	bool do_schedule = false;
++
++	if (!drv)
++		return;
++
++	if (virtio_msg_ffa_endpoint_disabled(drv))
++		return;
++
++	topo = virtio_msg_ffa_topology_get_rcu(drv);
++	if (!topo)
++		return;
++
++	mutex_lock(&topo->lock);
++	if (!topo->stopping && !virtio_msg_ffa_endpoint_disabled(drv)) {
++		topo->reconcile_requested = true;
++		do_schedule = true;
++	}
++	mutex_unlock(&topo->lock);
++	if (do_schedule) {
++		if (mod_delayed_work(system_wq, &topo->reconcile_work, 0))
++			virtio_msg_ffa_topology_put(topo);
++	} else {
++		virtio_msg_ffa_topology_put(topo);
++	}
++}
++
++int virtio_msg_ffa_topology_handle_event(struct virtio_msg_ffa_driver *drv,
++					 const struct virtio_msg_bus_event_device *event)
++{
++	u16 dev_num;
++	u16 dev_state;
++
++	if (!drv || !event)
++		return -EINVAL;
++	dev_num = le16_to_cpu(event->dev_num);
++	dev_state = le16_to_cpu(event->dev_state);
++	if (drv->fdev)
++		dev_dbg(&drv->fdev->dev,
++			"topology event queued: peer_vm=%u dev_num=%u state=%u\n",
++			(u16)drv->fdev->vm_id, dev_num, dev_state);
++
++	switch (dev_state) {
++	case VIRTIO_MSG_BUS_EVENT_DEV_STATE_ADDED:
++	case VIRTIO_MSG_BUS_EVENT_DEV_STATE_REMOVED:
++		virtio_msg_ffa_topology_schedule(drv);
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++int virtio_msg_ffa_topology_handle_transport_event(struct virtio_msg_ffa_driver *drv,
++						   const struct virtio_msg *msg)
++{
++	struct virtio_msg_ffa_topology *topo;
++	struct virtio_msg_ffa_vmdev *shell;
++	u16 dev_num;
++	int ret = 0;
++
++	if (!drv || !msg)
++		return -EINVAL;
++
++	dev_num = le16_to_cpu(msg->dev_num);
++	topo = virtio_msg_ffa_topology_get_rcu(drv);
++	if (!topo)
++		return 0;
++
++	mutex_lock(&topo->lock);
++	shell = xa_load(&topo->devices, dev_num);
++	if (shell)
++		ret = virtio_msg_transport_handle_device_event(&shell->vmdev,
++							       msg);
++	else if (drv->fdev) {
++		/*
++		 * Before initial enumeration completes there is no transport
++		 * device to receive an event. Discard it because the peer must
++		 * not emit device events before driver initialisation completes.
++		 */
++		dev_dbg(&drv->fdev->dev,
++			"transport event dropped: peer_vm=%u dev_num=%u id=0x%02x\n",
++			(u16)drv->fdev->vm_id, dev_num, msg->msg_id);
++	}
++	mutex_unlock(&topo->lock);
++	virtio_msg_ffa_topology_put(topo);
++
++	return ret;
++}
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo_driver.c b/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo_driver.c
+new file mode 100644
+index 000000000000..8fe21237d951
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo_driver.c
+@@ -0,0 +1,827 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio message bus over FF-A driver-side FIFO transfer helpers.
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#include <linux/arm_ffa.h>
++#include <linux/byteorder/little_endian.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/mm.h>
++#include <linux/overflow.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/vmalloc.h>
++#include <linux/workqueue.h>
++
++#include "virtio_msg_bus_ffa_driver_priv.h"
++#include "virtio_msg_bus_ffa_xfer_fifo.h"
++
++#define VIRTIO_MSG_FFA_FIFO_MESSAGE_SIZE		128
++#define VIRTIO_MSG_FFA_FIFO_DEPTH			30
++
++struct virtio_msg_ffa_xfer_fifo_priv {
++	struct virtio_msg_ffa_driver *drv;
++	struct virtio_msg_ffa_fifo_state fifo;
++	struct work_struct fifo_rx_work;
++	struct delayed_work fifo_notify_work;
++	bool fifo_work_inited;
++	bool fifo_notify_pending;
++	u32 fifo_notify_delay_ms;
++	bool fifo_mem_shared;
++	void *fifo_region;
++	size_t fifo_region_len;
++	struct page **fifo_pages;
++	u16 fifo_page_count;
++	u64 fifo_mem_handle;
++};
++
++static bool virtio_msg_ffa_fifo_mem_ops_ready(const struct virtio_msg_ffa_driver *drv)
++{
++	return drv && drv->fdev && drv->fdev->ops && drv->fdev->ops->mem_ops &&
++	       drv->fdev->ops->mem_ops->memory_share &&
++	       drv->fdev->ops->mem_ops->memory_reclaim;
++}
++
++static bool
++virtio_msg_ffa_fifo_notifier_ops_ready(const struct virtio_msg_ffa_driver *drv)
++{
++	const struct ffa_notifier_ops *notifier_ops;
++
++	if (!drv || !drv->fdev || !drv->fdev->ops)
++		return false;
++	if (!ffa_partition_supports_notify_recv(drv->fdev))
++		return false;
++
++	notifier_ops = drv->fdev->ops->notifier_ops;
++	return notifier_ops && notifier_ops->notify_alloc &&
++	       notifier_ops->notify_relinquish && notifier_ops->notify_send;
++}
++
++static bool
++virtio_msg_ffa_fifo_driver_runtime_capable(struct virtio_msg_ffa_driver *drv)
++{
++	return virtio_msg_ffa_fifo_mem_ops_ready(drv) &&
++	       virtio_msg_ffa_fifo_notifier_ops_ready(drv);
++}
++
++bool virtio_msg_ffa_fifo_available(struct virtio_msg_ffa_driver *drv)
++{
++	return virtio_msg_ffa_fifo_driver_runtime_capable(drv);
++}
++
++static struct virtio_msg_ffa_xfer_fifo_priv *
++virtio_msg_ffa_fifo_priv_get(struct virtio_msg_ffa_driver *drv,
++			     struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv;
++
++	if (!drv || !xfer || xfer->method != VIRTIO_MSG_FFA_XFER_FIFO ||
++	    !xfer->priv)
++		return NULL;
++
++	priv = xfer->priv;
++	if (priv->drv && priv->drv != drv)
++		return NULL;
++
++	return priv;
++}
++
++static void virtio_msg_ffa_fifo_region_release_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 struct virtio_msg_ffa_xfer_fifo_priv *priv)
++{
++	unsigned int i;
++
++	if (!drv || !priv)
++		return;
++
++	if (priv->fifo_mem_shared && virtio_msg_ffa_fifo_mem_ops_ready(drv))
++		drv->fdev->ops->mem_ops->memory_reclaim(priv->fifo_mem_handle, 0);
++
++	priv->fifo_mem_shared = false;
++	priv->fifo_mem_handle = 0;
++
++	if (priv->fifo_region) {
++		vunmap(priv->fifo_region);
++		priv->fifo_region = NULL;
++	}
++
++	if (priv->fifo_pages) {
++		for (i = 0; i < priv->fifo_page_count; i++) {
++			if (priv->fifo_pages[i])
++				__free_page(priv->fifo_pages[i]);
++		}
++		kfree(priv->fifo_pages);
++		priv->fifo_pages = NULL;
++	}
++
++	priv->fifo_region_len = 0;
++	priv->fifo_page_count = 0;
++}
++
++static void virtio_msg_ffa_fifo_cleanup_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 struct virtio_msg_ffa_xfer_fifo_priv *priv)
++{
++	struct virtio_msg_ffa_fifo_state unbind_fifo = { 0 };
++	int ret;
++
++	if (!drv || !priv)
++		return;
++
++	lockdep_assert_held(&drv->lock);
++
++	unbind_fifo.rx_notif_bound = priv->fifo.rx_notif_bound;
++	unbind_fifo.local_notif_id = priv->fifo.local_notif_id;
++	priv->fifo.configured = false;
++	priv->fifo.rx_notif_bound = false;
++	priv->fifo.local_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	priv->fifo_notify_pending = false;
++	virtio_msg_ffa_fifo_notify_backoff_reset(&priv->fifo_notify_delay_ms);
++	virtio_msg_ffa_fifo_space_wake(&priv->fifo);
++
++	if (unbind_fifo.rx_notif_bound) {
++		mutex_unlock(&drv->lock);
++		ret = virtio_msg_ffa_fifo_unbind_rx_notification(drv->fdev,
++								 &unbind_fifo);
++		mutex_lock(&drv->lock);
++		if (ret && drv->fdev)
++			dev_warn_ratelimited(&drv->fdev->dev,
++					     "FIFO RX notification unbind failed: %d\n",
++					     ret);
++	}
++
++	virtio_msg_ffa_fifo_reset(&priv->fifo);
++	virtio_msg_ffa_fifo_region_release_locked(drv, priv);
++}
++
++static void virtio_msg_ffa_fifo_notify_schedule_locked
++			(struct virtio_msg_ffa_driver *drv,
++			 struct virtio_msg_ffa_xfer_fifo_priv *priv)
++{
++	u32 delay_ms;
++
++	if (!drv || !priv)
++		return;
++	if (!priv->fifo.configured)
++		return;
++
++	delay_ms = virtio_msg_ffa_fifo_notify_backoff_delay
++			(&priv->fifo_notify_delay_ms);
++	priv->fifo_notify_pending = true;
++	schedule_delayed_work(&priv->fifo_notify_work,
++			      msecs_to_jiffies(delay_ms));
++}
++
++static int virtio_msg_ffa_fifo_region_init(struct virtio_msg_ffa_xfer_fifo_priv *priv)
++{
++	struct virtio_msg_ffa_fifo_hdr *tx_hdr;
++	struct virtio_msg_ffa_fifo_hdr *rx_hdr;
++	size_t ring_bytes;
++	size_t total_bytes;
++	size_t alloc_len;
++	struct page **pages;
++	void *region;
++	u16 page_count;
++	unsigned int i;
++	int ret;
++
++	if (!priv)
++		return -EINVAL;
++
++	if (check_mul_overflow((size_t)VIRTIO_MSG_FFA_FIFO_MESSAGE_SIZE,
++			       (size_t)VIRTIO_MSG_FFA_FIFO_DEPTH, &ring_bytes))
++		return -EOVERFLOW;
++	if (check_add_overflow(ring_bytes,
++			       (size_t)VIRTIO_MSG_FFA_FIFO_MSG_AREA_OFFSET,
++			       &ring_bytes))
++		return -EOVERFLOW;
++	if (check_mul_overflow(ring_bytes, (size_t)2, &total_bytes))
++		return -EOVERFLOW;
++
++	page_count = DIV_ROUND_UP(total_bytes, PAGE_SIZE);
++	if (!page_count)
++		return -EINVAL;
++	if (page_count > U16_MAX)
++		return -EOVERFLOW;
++
++	pages = kcalloc(page_count, sizeof(*pages), GFP_KERNEL);
++	if (!pages)
++		return -ENOMEM;
++
++	for (i = 0; i < page_count; i++) {
++		pages[i] = alloc_page(GFP_KERNEL);
++		if (!pages[i]) {
++			ret = -ENOMEM;
++			goto err_free_pages;
++		}
++	}
++
++	region = vmap(pages, page_count, VM_MAP, PAGE_KERNEL);
++	if (!region) {
++		ret = -ENOMEM;
++		goto err_free_pages;
++	}
++
++	alloc_len = (size_t)page_count * PAGE_SIZE;
++	memset(region, 0, alloc_len);
++
++	tx_hdr = region;
++	rx_hdr = (struct virtio_msg_ffa_fifo_hdr *)((u8 *)region + ring_bytes);
++
++	memcpy(tx_hdr->magic, VIRTIO_MSG_FFA_FIFO_MAGIC, sizeof(tx_hdr->magic));
++	tx_hdr->version = cpu_to_le16(VIRTIO_MSG_FFA_FIFO_VERSION);
++	tx_hdr->message_size = cpu_to_le16(VIRTIO_MSG_FFA_FIFO_MESSAGE_SIZE);
++	tx_hdr->depth = cpu_to_le16(VIRTIO_MSG_FFA_FIFO_DEPTH);
++	tx_hdr->next_offset = cpu_to_le32(ring_bytes);
++
++	memcpy(rx_hdr->magic, VIRTIO_MSG_FFA_FIFO_MAGIC, sizeof(rx_hdr->magic));
++	rx_hdr->version = cpu_to_le16(VIRTIO_MSG_FFA_FIFO_VERSION);
++	rx_hdr->message_size = cpu_to_le16(VIRTIO_MSG_FFA_FIFO_MESSAGE_SIZE);
++	rx_hdr->depth = cpu_to_le16(VIRTIO_MSG_FFA_FIFO_DEPTH);
++	rx_hdr->next_offset = cpu_to_le32(0);
++
++	priv->fifo_region = region;
++	priv->fifo_region_len = total_bytes;
++	priv->fifo_pages = pages;
++	priv->fifo_page_count = page_count;
++	return 0;
++
++err_free_pages:
++	for (i = 0; i < page_count; i++) {
++		if (pages[i])
++			__free_page(pages[i]);
++	}
++	kfree(pages);
++	return ret;
++}
++
++static int virtio_msg_ffa_fifo_share_region(struct virtio_msg_ffa_driver *drv,
++					    struct virtio_msg_ffa_xfer_fifo_priv *priv)
++{
++	struct ffa_mem_region_attributes receiver = { 0 };
++	struct ffa_mem_ops_args args = { 0 };
++	struct sg_table sgt = { 0 };
++	size_t share_len;
++	int ret;
++
++	if (!drv || !priv)
++		return -EINVAL;
++	if (!virtio_msg_ffa_fifo_mem_ops_ready(drv))
++		return -EOPNOTSUPP;
++	if (!priv->fifo_pages || !priv->fifo_page_count || !priv->fifo_region_len)
++		return -EINVAL;
++
++	share_len = (size_t)priv->fifo_page_count * PAGE_SIZE;
++	ret = sg_alloc_table_from_pages(&sgt, priv->fifo_pages,
++					priv->fifo_page_count, 0, share_len,
++					GFP_KERNEL);
++	if (ret)
++		return ret;
++
++	receiver.receiver = drv->fdev->vm_id;
++	receiver.attrs = FFA_MEM_RW;
++
++	args.use_txbuf = true;
++	args.nattrs = 1;
++	args.tag = 0;
++	args.sg = sgt.sgl;
++	args.attrs = &receiver;
++
++	ret = virtio_msg_ffa_memory_share(drv->fdev, &args);
++	sg_free_table(&sgt);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-share: FFA_MEM_SHARE failed page_count=%u ret=%d\n",
++				     priv->fifo_page_count, ret);
++		return ret;
++	}
++
++	priv->fifo_mem_handle = args.g_handle;
++	priv->fifo_mem_shared = true;
++	return 0;
++}
++
++static int virtio_msg_ffa_fifo_configure_send_locked(struct virtio_msg_ffa_driver *drv,
++						     u64 mem_handle,
++						     u16 page_count,
++						     u16 notif_id,
++						     u16 *peer_notif_id)
++{
++	struct virtio_msg_ffa_fifo_configure_req req = { 0 };
++	struct virtio_msg_ffa_fifo_configure_resp *resp;
++	u8 resp_msg_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *resp_msg = (struct virtio_msg *)resp_msg_buf;
++	size_t resp_len;
++	u16 result;
++	int ret;
++
++	req.mem_handle = cpu_to_le64(mem_handle);
++	req.page_count = cpu_to_le16(page_count);
++	req.driver_notif_id = cpu_to_le16(notif_id);
++
++	memset(resp_msg_buf, 0, sizeof(resp_msg_buf));
++	ret = virtio_msg_ffa_driver_send_bus_request_locked(drv,
++							    FFA_BUS_MSG_FIFO_CONFIGURE,
++							    &req, sizeof(req),
++							    resp_msg,
++							    sizeof(resp_msg_buf),
++							    &resp_len);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-configure: request failed handle=%#llx pages=%u local_notif=%u ret=%d\n",
++				     mem_handle, page_count, notif_id, ret);
++		return ret;
++	}
++	if (resp_len != sizeof(*resp_msg) + sizeof(*resp)) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-configure: bad response length=%zu expected=%zu\n",
++				     resp_len, sizeof(*resp_msg) + sizeof(*resp));
++		return -EPROTO;
++	}
++
++	resp = (struct virtio_msg_ffa_fifo_configure_resp *)resp_msg->payload;
++	result = le16_to_cpu(resp->result);
++	if (result == VIRTIO_MSG_FFA_BUS_ERROR) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-configure: peer error result=%u handle=%#llx pages=%u local_notif=%u device_notif=%u\n",
++				     result, mem_handle, page_count, notif_id,
++				     le16_to_cpu(resp->device_notif_id));
++		return -EIO;
++	}
++	if (result != VIRTIO_MSG_FFA_BUS_SUCCESS) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-configure: peer reserved result=%u handle=%#llx pages=%u local_notif=%u device_notif=%u\n",
++				     result, mem_handle, page_count, notif_id,
++				     le16_to_cpu(resp->device_notif_id));
++		return -EPROTO;
++	}
++
++	if (peer_notif_id)
++		*peer_notif_id = le16_to_cpu(resp->device_notif_id);
++	return 0;
++}
++
++static int virtio_msg_ffa_fifo_rx_cb(struct virtio_msg_ffa_endpoint *ep,
++				     const struct virtio_msg *msg,
++				     size_t msg_len, void *cb_data)
++{
++	struct virtio_msg_ffa_driver *drv = cb_data;
++
++	(void)ep;
++	if (!drv)
++		return -EINVAL;
++
++	virtio_msg_ffa_driver_trace_msg(drv, "rx", "fifo", msg, msg_len);
++	return virtio_msg_ffa_driver_dispatch_inbound_locked(drv, msg, msg_len);
++}
++
++static void virtio_msg_ffa_fifo_rx_notif_cb(int notify_id, void *cb_data)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv = cb_data;
++
++	(void)notify_id;
++	if (!priv || !priv->fifo_work_inited)
++		return;
++
++	virtio_msg_ffa_fifo_space_wake(&priv->fifo);
++	schedule_work(&priv->fifo_rx_work);
++}
++
++static void virtio_msg_ffa_fifo_rx_work(struct work_struct *work)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv =
++		container_of(work, struct virtio_msg_ffa_xfer_fifo_priv,
++			     fifo_rx_work);
++	struct virtio_msg_ffa_driver *drv;
++	struct virtio_msg_ffa_xfer_ctx ctx = { 0 };
++	int ret;
++
++	if (!priv)
++		return;
++
++	drv = priv->drv;
++	if (!drv)
++		return;
++
++	mutex_lock(&drv->lock);
++	if (priv->drv != drv || !priv->fifo.configured) {
++		mutex_unlock(&drv->lock);
++		return;
++	}
++
++	ctx.ep = &drv->ep;
++	ctx.fdev = drv->fdev;
++	ctx.priv = &priv->fifo;
++
++	ret = virtio_msg_ffa_fifo_drain_rx(&ctx, &priv->fifo,
++					   virtio_msg_ffa_fifo_rx_cb, drv,
++					   NULL);
++	if (ret && drv->fdev)
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "FIFO RX drain failed: %d\n", ret);
++
++	mutex_unlock(&drv->lock);
++}
++
++static void virtio_msg_ffa_fifo_notify_work(struct work_struct *work)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv =
++		container_of(to_delayed_work(work),
++			     struct virtio_msg_ffa_xfer_fifo_priv,
++			     fifo_notify_work);
++	struct virtio_msg_ffa_driver *drv;
++	u32 next_delay;
++	int ret;
++
++	if (!priv)
++		return;
++
++	drv = priv->drv;
++	if (!drv)
++		return;
++
++	mutex_lock(&drv->lock);
++	if (priv->drv != drv || !priv->fifo_notify_pending ||
++	    !priv->fifo.configured) {
++		priv->fifo_notify_pending = false;
++		virtio_msg_ffa_fifo_notify_backoff_reset
++			(&priv->fifo_notify_delay_ms);
++		mutex_unlock(&drv->lock);
++		return;
++	}
++
++	ret = virtio_msg_ffa_fifo_notify_peer(drv->fdev, &priv->fifo);
++	if (!ret) {
++		priv->fifo_notify_pending = false;
++		virtio_msg_ffa_fifo_notify_backoff_reset
++			(&priv->fifo_notify_delay_ms);
++		mutex_unlock(&drv->lock);
++		return;
++	}
++
++	if (!virtio_msg_ffa_fifo_notify_backoff_next
++			(&priv->fifo_notify_delay_ms, &next_delay)) {
++		virtio_msg_ffa_driver_handle_endpoint_failure_locked(drv, ret);
++		mutex_unlock(&drv->lock);
++		return;
++	}
++	mutex_unlock(&drv->lock);
++
++	schedule_delayed_work(&priv->fifo_notify_work,
++			      msecs_to_jiffies(next_delay));
++}
++
++static int virtio_msg_ffa_send_fifo_locked(struct virtio_msg_ffa_driver *drv,
++					   struct virtio_msg_ffa_xfer_engine *xfer,
++					   const struct virtio_msg *req,
++					   size_t req_len,
++					   struct virtio_msg *resp,
++					   size_t resp_buf_len,
++					   size_t *resp_len)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv;
++	struct virtio_msg_ffa_fifo_state *state;
++	long remaining;
++	u64 generation;
++	u64 space_seq;
++	u16 dev_num;
++	bool is_bus_msg;
++	int ret;
++
++	(void)resp;
++	(void)resp_buf_len;
++	(void)resp_len;
++	if (!drv || !req)
++		return -EINVAL;
++
++	priv = virtio_msg_ffa_fifo_priv_get(drv, xfer);
++	if (!priv)
++		return -EINVAL;
++
++	state = &priv->fifo;
++	if (!state->configured)
++		return -EOPNOTSUPP;
++
++	dev_num = le16_to_cpu(req->dev_num);
++	is_bus_msg = req->type & VIRTIO_MSG_TYPE_BUS;
++	remaining = msecs_to_jiffies(VIRTIO_MSG_FFA_FIFO_TX_TIMEOUT_MS);
++
++	for (;;) {
++		space_seq = READ_ONCE(state->space_seq);
++		generation = READ_ONCE(state->generation);
++		ret = virtio_msg_ffa_fifo_enqueue(state, req, req_len);
++		if (ret != -ENOSPC)
++			break;
++
++		mutex_unlock(&drv->lock);
++		ret = virtio_msg_ffa_fifo_wait_space(state, space_seq,
++						     generation, &remaining);
++		mutex_lock(&drv->lock);
++		if (ret)
++			break;
++
++		priv = virtio_msg_ffa_fifo_priv_get(drv, xfer);
++		if (!priv) {
++			ret = -ESHUTDOWN;
++			break;
++		}
++
++		state = &priv->fifo;
++		if (!state->configured ||
++		    READ_ONCE(state->generation) != generation) {
++			ret = -ESHUTDOWN;
++			break;
++		}
++	}
++
++	if (ret) {
++		dev_dbg(&drv->fdev->dev,
++			"bus tx fifo failed: msg_id=0x%02x dev=%u tok=%u ret=%d\n",
++			req->msg_id, dev_num, le16_to_cpu(req->token), ret);
++		if ((ret == -ENOSPC || ret == -ETIMEDOUT) && !is_bus_msg)
++			virtio_msg_ffa_driver_handle_device_failure_locked(drv, dev_num);
++		return ret;
++	}
++
++	ret = virtio_msg_ffa_fifo_notify_peer(drv->fdev, state);
++	if (ret)
++		virtio_msg_ffa_fifo_notify_schedule_locked(drv, priv);
++
++	return 0;
++}
++
++static int virtio_msg_ffa_fifo_setup_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv;
++	u16 peer_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	size_t share_len;
++	u16 ffa_page_count;
++	u32 ffa_pages;
++	int ret;
++
++	if (!drv)
++		return -EINVAL;
++	if (!xfer->priv) {
++		priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++		if (!priv)
++			return -ENOMEM;
++		virtio_msg_ffa_fifo_init(&priv->fifo);
++		virtio_msg_ffa_fifo_reset(&priv->fifo);
++		xfer->priv = priv;
++	}
++	priv = virtio_msg_ffa_fifo_priv_get(drv, xfer);
++	if (!priv) {
++		kfree(xfer->priv);
++		xfer->priv = NULL;
++		return -EINVAL;
++	}
++	priv->drv = drv;
++	if (!virtio_msg_ffa_fifo_mem_ops_ready(drv))
++		return -EOPNOTSUPP;
++	if (!priv->fifo_work_inited) {
++		INIT_WORK(&priv->fifo_rx_work, virtio_msg_ffa_fifo_rx_work);
++		INIT_DELAYED_WORK(&priv->fifo_notify_work,
++				  virtio_msg_ffa_fifo_notify_work);
++		priv->fifo_work_inited = true;
++	}
++	if (priv->fifo.configured)
++		return 0;
++
++	virtio_msg_ffa_fifo_cleanup_locked(drv, priv);
++
++	ret = virtio_msg_ffa_fifo_region_init(priv);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-setup: region init failed ret=%d\n",
++				     ret);
++		goto err_cleanup;
++	}
++
++	ret = virtio_msg_ffa_fifo_share_region(drv, priv);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-setup: share region failed pages=%u ret=%d\n",
++				     priv->fifo_page_count, ret);
++		goto err_cleanup;
++	}
++
++	share_len = (size_t)priv->fifo_page_count * PAGE_SIZE;
++	ffa_pages = DIV_ROUND_UP(share_len, FFA_PAGE_SIZE);
++	if (!ffa_pages || ffa_pages > U16_MAX) {
++		ret = -EOVERFLOW;
++		goto err_cleanup;
++	}
++	ffa_page_count = ffa_pages;
++
++	ret = virtio_msg_ffa_fifo_configure_layout(&priv->fifo, priv->fifo_region,
++						   priv->fifo_region_len,
++						   priv->fifo_mem_handle,
++						   ffa_page_count);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-setup: layout configure failed handle=%#llx pages=%u len=%zu ret=%d\n",
++				     priv->fifo_mem_handle, ffa_page_count,
++				     priv->fifo_region_len, ret);
++		goto err_cleanup;
++	}
++
++	ret = virtio_msg_ffa_fifo_bind_rx_notification
++		(drv->fdev, &priv->fifo, virtio_msg_ffa_fifo_rx_notif_cb, priv);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-setup: local RX notification bind failed ret=%d\n",
++				     ret);
++		goto err_cleanup;
++	}
++
++	ret = virtio_msg_ffa_fifo_configure_send_locked(drv, priv->fifo_mem_handle,
++							ffa_page_count,
++							priv->fifo.local_notif_id,
++							&peer_notif_id);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-setup: FIFO_CONFIGURE failed handle=%#llx pages=%u local_notif=%u ret=%d\n",
++				     priv->fifo_mem_handle, priv->fifo.page_count,
++				     priv->fifo.local_notif_id, ret);
++		goto err_cleanup;
++	}
++
++	ret = virtio_msg_ffa_fifo_set_peer_notif_id(&priv->fifo, peer_notif_id);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-setup: invalid peer notification id=%u valid_range=%u..%u ret=%d\n",
++				     peer_notif_id, VIRTIO_MSG_FFA_NOTIF_ID_MIN,
++				     VIRTIO_MSG_FFA_NOTIF_ID_MAX, ret);
++		goto err_cleanup;
++	}
++
++	priv->fifo_notify_pending = false;
++	virtio_msg_ffa_fifo_notify_backoff_reset(&priv->fifo_notify_delay_ms);
++	return 0;
++
++err_cleanup:
++	virtio_msg_ffa_fifo_cleanup_locked(drv, priv);
++	return ret;
++}
++
++static int virtio_msg_ffa_fifo_event_configure_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv;
++	int ret;
++
++	priv = virtio_msg_ffa_fifo_priv_get(drv, xfer);
++	if (!drv || !priv || !priv->fifo.configured)
++		return -EINVAL;
++
++	ret = virtio_msg_ffa_driver_event_configure_send_locked
++		(drv, VIRTIO_MSG_FFA_BUS_EVENT_DELIV_FIFO,
++		 0);
++	if (ret) {
++		dev_warn_ratelimited(&drv->fdev->dev,
++				     "fifo-event-configure: local_notif=%u ret=%d\n",
++				     priv->fifo.local_notif_id, ret);
++		return ret;
++	}
++
++	virtio_msg_ffa_select_event_delivery(&drv->ep,
++					     VIRTIO_MSG_FFA_BUS_EVENT_DELIV_FIFO);
++	return 0;
++}
++
++static int virtio_msg_ffa_fifo_event_poll_once_unsupported
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer,
++				 bool *empty)
++{
++	(void)drv;
++	(void)xfer;
++	(void)empty;
++	return -EOPNOTSUPP;
++}
++
++static void virtio_msg_ffa_fifo_teardown_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv;
++
++	priv = virtio_msg_ffa_fifo_priv_get(drv, xfer);
++	if (!priv)
++		return;
++
++	virtio_msg_ffa_fifo_cleanup_locked(drv, priv);
++}
++
++static void virtio_msg_ffa_fifo_release_priv
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_fifo_priv *priv;
++
++	priv = virtio_msg_ffa_fifo_priv_get(drv, xfer);
++	if (!priv)
++		return;
++
++	if (priv->fifo_work_inited) {
++		cancel_work_sync(&priv->fifo_rx_work);
++		cancel_delayed_work_sync(&priv->fifo_notify_work);
++	}
++
++	xfer->priv = NULL;
++	kfree(priv);
++}
++
++const struct virtio_msg_ffa_xfer_ops virtio_msg_ffa_fifo_xfer_ops = {
++	.setup_locked = virtio_msg_ffa_fifo_setup_locked,
++	.teardown_locked = virtio_msg_ffa_fifo_teardown_locked,
++	.submit_locked = virtio_msg_ffa_send_fifo_locked,
++	.event_configure_locked = virtio_msg_ffa_fifo_event_configure_locked,
++	.event_poll_once_locked = virtio_msg_ffa_fifo_event_poll_once_unsupported,
++	.release_priv = virtio_msg_ffa_fifo_release_priv,
++	.async_response = true,
++};
++
++static int
++virtio_msg_ffa_fifo_driver_init_runtime
++		(struct virtio_msg_ffa_driver *drv,
++		 const struct virtio_msg_ffa_xfer_method_desc *desc)
++{
++	struct virtio_msg_ffa_xfer_engine xfer;
++	void *old_priv;
++	int ret;
++
++	if (!drv || !desc || desc->method != VIRTIO_MSG_FFA_XFER_FIFO ||
++	    !(desc->role_mask & VIRTIO_MSG_FFA_XFER_ROLE_DRIVER) ||
++	    !(desc->phase_flags & VIRTIO_MSG_FFA_XFER_PHASE_RUNTIME) ||
++	    (desc->phase_flags & VIRTIO_MSG_FFA_XFER_PHASE_BOOTSTRAP) ||
++	    desc->event_delivery != VIRTIO_MSG_FFA_BUS_EVENT_DELIV_FIFO)
++		return -EINVAL;
++
++	if (!virtio_msg_ffa_fifo_driver_runtime_capable(drv))
++		return -EOPNOTSUPP;
++	if (drv->bootstrap_xfer.method == VIRTIO_MSG_FFA_XFER_NONE ||
++	    !drv->bootstrap_xfer.ops)
++		return -EOPNOTSUPP;
++
++	old_priv = drv->xfer_priv[VIRTIO_MSG_FFA_XFER_FIFO];
++	xfer.method = VIRTIO_MSG_FFA_XFER_FIFO;
++	xfer.ops = &virtio_msg_ffa_fifo_xfer_ops;
++	xfer.priv = old_priv;
++
++	ret = virtio_msg_ffa_fifo_setup_locked(drv, &xfer);
++	if (ret) {
++		if (xfer.priv != old_priv)
++			virtio_msg_ffa_fifo_release_priv(drv, &xfer);
++		drv->xfer_priv[VIRTIO_MSG_FFA_XFER_FIFO] = old_priv;
++		return virtio_msg_ffa_driver_init_runtime_reject(ret);
++	}
++
++	drv->xfer_priv[VIRTIO_MSG_FFA_XFER_FIFO] = xfer.priv;
++	drv->event_configured = false;
++	ret = virtio_msg_ffa_fifo_event_configure_locked(drv, &xfer);
++	if (ret)
++		goto err_teardown;
++
++	drv->event_configured = true;
++	drv->active_xfer = xfer;
++	virtio_msg_ffa_select_transfer_method(&drv->ep,
++					      VIRTIO_MSG_FFA_XFER_FIFO);
++	if (drv->ep.transfer_method == VIRTIO_MSG_FFA_XFER_FIFO &&
++	    virtio_msg_ffa_driver_event_runtime_ready_locked(drv))
++		return 0;
++
++	ret = -EIO;
++	drv->event_configured = false;
++
++err_teardown:
++	virtio_msg_ffa_fifo_teardown_locked(drv, &xfer);
++	if (xfer.priv != old_priv)
++		virtio_msg_ffa_fifo_release_priv(drv, &xfer);
++	drv->xfer_priv[VIRTIO_MSG_FFA_XFER_FIFO] = old_priv;
++	return virtio_msg_ffa_driver_init_runtime_reject(ret);
++}
++
++static const struct virtio_msg_ffa_xfer_driver_method_ops
++virtio_msg_ffa_fifo_driver_method_ops = {
++	.init_runtime = virtio_msg_ffa_fifo_driver_init_runtime,
++};
++
++const struct virtio_msg_ffa_xfer_method_desc
++virtio_msg_ffa_fifo_driver_method_desc = {
++	.method = VIRTIO_MSG_FFA_XFER_FIFO,
++	.name = "fifo",
++	.role_mask = VIRTIO_MSG_FFA_XFER_ROLE_DRIVER,
++	.phase_flags = VIRTIO_MSG_FFA_XFER_PHASE_RUNTIME,
++	.bus_feature_mask = VIRTIO_MSG_FFA_BUS_FEATURE_FIFO,
++	.event_delivery = VIRTIO_MSG_FFA_BUS_EVENT_DELIV_FIFO,
++	.driver_ops = &virtio_msg_ffa_fifo_driver_method_ops,
++};
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect_driver.c b/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect_driver.c
+new file mode 100644
+index 000000000000..3d2acf8eb677
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_xfer_indirect_driver.c
+@@ -0,0 +1,485 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio message bus over FF-A driver-side indirect transfer helpers.
++ *
++ * Copyright (C) 2026 Google LLC and Linaro.
++ * Viresh Kumar <viresh.kumar@linaro.org>
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#include <linux/byteorder/little_endian.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/uuid.h>
++
++#include "virtio_msg_bus_ffa_driver_priv.h"
++#include "virtio_msg_bus_ffa_xfer_indirect.h"
++
++#define VIRTIO_MSG_FFA_INDIRECT_RX_QUEUE_DEPTH		128
++
++struct virtio_msg_ffa_driver_indirect_rx {
++	u64 generation;
++	u16 sender_vm_id;
++	u16 len;
++	u8 msg[FFA_BUS_MAX_MSG_SIZE];
++};
++
++struct virtio_msg_ffa_xfer_indirect_priv {
++	struct virtio_msg_ffa_driver *drv;
++};
++
++static struct virtio_msg_ffa_xfer_indirect_priv *
++virtio_msg_ffa_indirect_priv_get(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_indirect_priv *priv;
++
++	if (!drv || !xfer || xfer->method != VIRTIO_MSG_FFA_XFER_INDIRECT ||
++	    !xfer->priv)
++		return NULL;
++
++	priv = xfer->priv;
++	if (priv->drv && priv->drv != drv)
++		return NULL;
++
++	return priv;
++}
++
++static bool
++virtio_msg_ffa_indirect_driver_runtime_capable
++		(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv || !drv->fdev || !drv->fdev->ops ||
++	    !drv->fdev->ops->msg_ops)
++		return false;
++	if (!drv->fdev->ops->msg_ops->indirect_send)
++		return false;
++
++	return ffa_partition_supports_indirect_msg(drv->fdev);
++}
++
++bool virtio_msg_ffa_indirect_available(struct virtio_msg_ffa_driver *drv)
++{
++	return virtio_msg_ffa_indirect_driver_runtime_capable(drv);
++}
++
++static int virtio_msg_ffa_indirect_parse_cloned_rx
++			(struct virtio_msg_ffa_xfer_ctx *ctx,
++			 const void *cloned_buf, size_t cloned_len,
++			 struct virtio_msg *resp, size_t resp_buf_len,
++			 size_t *resp_len)
++{
++	return virtio_msg_ffa_indirect_parse_wire_response(ctx, cloned_buf,
++							   cloned_len, resp,
++							   resp_buf_len,
++							   resp_len);
++}
++
++static int
++virtio_msg_ffa_driver_indirect_rx_queue_submit
++		(void *context,
++		 const struct virtio_msg_bus_queue_helper_item *item)
++{
++	struct virtio_msg_ffa_driver_indirect_rx *entry;
++	struct virtio_msg_ffa_xfer_ctx ctx = { 0 };
++	struct virtio_msg_ffa_driver *drv = context;
++	struct device *dev;
++	u8 resp_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *resp = (struct virtio_msg *)resp_buf;
++	size_t resp_len = 0;
++	int ret = 0;
++
++	if (!drv || !item ||
++	    item->type != VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_OPAQUE)
++		return -EINVAL;
++
++	entry = item->opaque;
++	if (!entry)
++		return -EINVAL;
++
++	mutex_lock(&drv->lock);
++	dev = drv->fdev ? &drv->fdev->dev : NULL;
++	if (virtio_msg_ffa_endpoint_disabled(drv) ||
++	    entry->generation != READ_ONCE(drv->indirect_rx_generation) ||
++	    !drv->fdev || entry->sender_vm_id != drv->fdev->vm_id ||
++	    !virtio_msg_ffa_driver_indirect_rx_ready_locked(drv))
++		goto out_unlock;
++
++	ctx.ep = &drv->ep;
++	ctx.fdev = drv->fdev;
++
++	ret = virtio_msg_ffa_indirect_parse_cloned_rx(&ctx, entry->msg,
++						      entry->len, resp,
++						      sizeof(resp_buf),
++						      &resp_len);
++	if (ret) {
++		if (drv->fdev)
++			dev_dbg(&drv->fdev->dev,
++				"indirect RX parse failed: %d\n", ret);
++		goto out_unlock;
++	}
++
++	dev_dbg(dev,
++		"bus rx indirect: sender=%u type=0x%x msg_id=0x%02x dev=%u tok=%u size=%u len=%zu\n",
++		entry->sender_vm_id, resp->type, resp->msg_id,
++		le16_to_cpu(resp->dev_num), le16_to_cpu(resp->token),
++		le16_to_cpu(resp->msg_size), resp_len);
++	ret = virtio_msg_ffa_driver_dispatch_inbound_locked(drv, resp,
++							    resp_len);
++	if (ret)
++		dev_dbg(dev,
++			"bus rx indirect dispatch failed: sender=%u ret=%d\n",
++			entry->sender_vm_id, ret);
++
++out_unlock:
++	mutex_unlock(&drv->lock);
++	return ret;
++}
++
++static void
++virtio_msg_ffa_driver_indirect_rx_queue_release
++		(void *context,
++		 const struct virtio_msg_bus_queue_helper_item *item, int status)
++{
++	(void)context;
++	(void)status;
++
++	if (!item || item->type != VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_OPAQUE)
++		return;
++
++	kfree(item->opaque);
++}
++
++int virtio_msg_ffa_driver_indirect_rx_init(struct virtio_msg_ffa_driver *drv)
++{
++	struct device *dev;
++
++	if (!drv)
++		return -EINVAL;
++
++	dev = drv->fdev ? &drv->fdev->dev : NULL;
++	return virtio_msg_bus_queue_helper_init
++		(&drv->indirect_rx_queue, dev, FFA_BUS_MAX_MSG_SIZE,
++		 VIRTIO_MSG_FFA_INDIRECT_RX_QUEUE_DEPTH, 0,
++		 virtio_msg_ffa_driver_indirect_rx_queue_submit,
++		 virtio_msg_ffa_driver_indirect_rx_queue_release, drv);
++}
++
++void
++virtio_msg_ffa_driver_indirect_rx_quiesce(struct virtio_msg_ffa_driver *drv)
++{
++	if (!drv)
++		return;
++
++	virtio_msg_bus_queue_helper_stop(&drv->indirect_rx_queue);
++}
++
++static void virtio_msg_ffa_indirect_rx_cb_log_no_entry(struct device *dev)
++{
++	/*
++	 * The RX callback consumes this failure. Keep the diagnostic out of
++	 * line so checkpatch does not flag it as a generic OOM log.
++	 */
++	dev_warn_ratelimited(dev,
++			     "indirect rx cb drop: queue entry unavailable\n");
++}
++
++bool virtio_msg_ffa_indirect_rx_cb(struct ffa_device *fdev, u16 sender_vm_id,
++				   const uuid_t *uuid, const void *buf,
++				   size_t len)
++{
++	struct device *dev = fdev ? &fdev->dev : NULL;
++	struct virtio_msg_ffa_driver *drv;
++	struct virtio_msg_ffa_driver_indirect_rx *entry;
++	int ret;
++
++	if (!virtio_msg_ffa_driver_uuid_match(uuid))
++		return false;
++	if (!fdev || fdev->vm_id != sender_vm_id)
++		return false;
++	if (!buf || !len) {
++		dev_dbg(dev, "indirect rx cb consumed empty payload\n");
++		return true;
++	}
++	if (len > FFA_BUS_MAX_MSG_SIZE) {
++		dev_dbg(dev, "indirect rx cb drop oversized payload: len=%zu\n",
++			len);
++		return true;
++	}
++
++	drv = ffa_dev_get_drvdata(fdev);
++	if (!drv || drv->fdev != fdev) {
++		dev_dbg(dev, "indirect rx cb consumed: missing driver state\n");
++		return true;
++	}
++	if (virtio_msg_ffa_endpoint_disabled(drv)) {
++		dev_dbg(dev, "indirect rx cb consumed: endpoint disabled\n");
++		return true;
++	}
++
++	entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
++	if (!entry) {
++		virtio_msg_ffa_indirect_rx_cb_log_no_entry(dev);
++		return true;
++	}
++
++	entry->generation = READ_ONCE(drv->indirect_rx_generation);
++	entry->sender_vm_id = sender_vm_id;
++	entry->len = len;
++	memcpy(entry->msg, buf, len);
++
++	ret = virtio_msg_bus_queue_helper_enqueue_opaque
++		(&drv->indirect_rx_queue, entry, GFP_ATOMIC);
++	if (ret) {
++		kfree(entry);
++		dev_warn_ratelimited(dev,
++				     "indirect rx cb drop: enqueue failed ret=%d\n",
++				     ret);
++	}
++
++	return true;
++}
++
++static int virtio_msg_ffa_send_indirect_locked(struct virtio_msg_ffa_driver *drv,
++					       struct virtio_msg_ffa_xfer_engine *xfer,
++					       const struct virtio_msg *req,
++					       size_t req_len,
++					       struct virtio_msg *resp,
++					       size_t resp_buf_len,
++					       size_t *resp_len)
++{
++	const struct ffa_msg_ops *msg_ops;
++	struct virtio_msg_ffa_xfer_ctx xfer_ctx = {
++		.ep = &drv->ep,
++		.fdev = drv->fdev,
++		.priv = xfer ? xfer->priv : NULL,
++	};
++	u8 wire_buf[FFA_BUS_MAX_MSG_SIZE];
++	size_t wire_len = req_len;
++	u16 dev_num;
++	bool is_bus_msg;
++	unsigned int retry = VIRTIO_MSG_FFA_TX_BUSY_RETRY_MAX;
++	int ret;
++
++	(void)resp;
++	(void)resp_buf_len;
++	(void)resp_len;
++	if (!drv || !drv->fdev || !req)
++		return -EINVAL;
++	if (!drv->fdev->ops || !drv->fdev->ops->msg_ops)
++		return -EOPNOTSUPP;
++
++	msg_ops = drv->fdev->ops->msg_ops;
++	if (!msg_ops->indirect_send ||
++	    !ffa_partition_supports_indirect_msg(drv->fdev))
++		return -EOPNOTSUPP;
++
++	ret = virtio_msg_ffa_indirect_prepare_wire_request(&xfer_ctx, req,
++							   req_len, wire_buf,
++							   sizeof(wire_buf));
++	if (ret)
++		return ret;
++
++	dev_num = le16_to_cpu(req->dev_num);
++	is_bus_msg = req->type & VIRTIO_MSG_TYPE_BUS;
++	for (;;) {
++		ret = msg_ops->indirect_send(drv->fdev, wire_buf, wire_len);
++		if (ret == -EBUSY) {
++			if (!virtio_msg_ffa_tx_busy_retry_sleepable(&retry))
++				break;
++			continue;
++		}
++		if (ret)
++			return ret;
++		break;
++	}
++
++	if (ret) {
++		dev_dbg(&drv->fdev->dev,
++			"bus tx indirect failed: dest=%u msg_id=0x%02x dev=%u tok=%u ret=%d\n",
++			(u16)drv->fdev->vm_id, req->msg_id, dev_num,
++			le16_to_cpu(req->token), ret);
++		if (ret == -EBUSY && !is_bus_msg)
++			virtio_msg_ffa_driver_handle_device_failure_locked(drv, dev_num);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int virtio_msg_ffa_indirect_event_configure_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	int ret;
++
++	(void)xfer;
++	if (!drv)
++		return -EINVAL;
++
++	ret = virtio_msg_ffa_driver_event_configure_send_locked
++		(drv, VIRTIO_MSG_FFA_BUS_EVENT_DELIV_INDIRECT, 0);
++	if (ret)
++		return ret;
++
++	virtio_msg_ffa_select_event_delivery(&drv->ep,
++					     VIRTIO_MSG_FFA_BUS_EVENT_DELIV_INDIRECT);
++	return 0;
++}
++
++static int virtio_msg_ffa_indirect_event_poll_once_unsupported
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer,
++				 bool *empty)
++{
++	(void)drv;
++	(void)xfer;
++	(void)empty;
++	return -EOPNOTSUPP;
++}
++
++static int virtio_msg_ffa_indirect_setup_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_indirect_priv *priv;
++
++	if (!drv || !xfer)
++		return -EINVAL;
++	if (!xfer->priv) {
++		priv = kzalloc(sizeof(*priv), GFP_KERNEL);
++		if (!priv)
++			return -ENOMEM;
++		priv->drv = drv;
++		xfer->priv = priv;
++	}
++
++	priv = virtio_msg_ffa_indirect_priv_get(drv, xfer);
++	if (!priv) {
++		kfree(xfer->priv);
++		xfer->priv = NULL;
++		return -EINVAL;
++	}
++
++	priv->drv = drv;
++	return 0;
++}
++
++static void virtio_msg_ffa_indirect_teardown_locked
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_indirect_priv *priv;
++
++	priv = virtio_msg_ffa_indirect_priv_get(drv, xfer);
++	if (!priv)
++		return;
++}
++
++static void virtio_msg_ffa_indirect_release_priv
++				(struct virtio_msg_ffa_driver *drv,
++				 struct virtio_msg_ffa_xfer_engine *xfer)
++{
++	struct virtio_msg_ffa_xfer_indirect_priv *priv;
++
++	priv = virtio_msg_ffa_indirect_priv_get(drv, xfer);
++	if (!priv)
++		return;
++
++	xfer->priv = NULL;
++	kfree(priv);
++}
++
++const struct virtio_msg_ffa_xfer_ops virtio_msg_ffa_indirect_xfer_ops = {
++	.setup_locked = virtio_msg_ffa_indirect_setup_locked,
++	.teardown_locked = virtio_msg_ffa_indirect_teardown_locked,
++	.submit_locked = virtio_msg_ffa_send_indirect_locked,
++	.event_configure_locked = virtio_msg_ffa_indirect_event_configure_locked,
++	.event_poll_once_locked = virtio_msg_ffa_indirect_event_poll_once_unsupported,
++	.release_priv = virtio_msg_ffa_indirect_release_priv,
++	.async_response = true,
++};
++
++static int
++virtio_msg_ffa_indirect_driver_init_runtime
++		(struct virtio_msg_ffa_driver *drv,
++		 const struct virtio_msg_ffa_xfer_method_desc *desc)
++{
++	struct virtio_msg_ffa_xfer_engine xfer;
++	void *old_priv;
++	bool shared_bootstrap;
++	int ret;
++
++	if (!drv || !desc || desc->method != VIRTIO_MSG_FFA_XFER_INDIRECT ||
++	    !(desc->role_mask & VIRTIO_MSG_FFA_XFER_ROLE_DRIVER) ||
++	    !(desc->phase_flags & VIRTIO_MSG_FFA_XFER_PHASE_RUNTIME) ||
++	    desc->event_delivery != VIRTIO_MSG_FFA_BUS_EVENT_DELIV_INDIRECT)
++		return -EINVAL;
++
++	if (!virtio_msg_ffa_indirect_driver_runtime_capable(drv))
++		return -EOPNOTSUPP;
++
++	old_priv = drv->xfer_priv[VIRTIO_MSG_FFA_XFER_INDIRECT];
++	xfer.method = VIRTIO_MSG_FFA_XFER_INDIRECT;
++	xfer.ops = &virtio_msg_ffa_indirect_xfer_ops;
++	xfer.priv = old_priv;
++
++	ret = virtio_msg_ffa_indirect_setup_locked(drv, &xfer);
++	if (ret) {
++		if (xfer.priv != old_priv)
++			virtio_msg_ffa_indirect_release_priv(drv, &xfer);
++		drv->xfer_priv[VIRTIO_MSG_FFA_XFER_INDIRECT] = old_priv;
++		return virtio_msg_ffa_driver_init_runtime_reject(ret);
++	}
++
++	drv->xfer_priv[VIRTIO_MSG_FFA_XFER_INDIRECT] = xfer.priv;
++	shared_bootstrap =
++		drv->bootstrap_xfer.method == VIRTIO_MSG_FFA_XFER_INDIRECT &&
++		drv->bootstrap_xfer.priv == xfer.priv;
++
++	drv->event_configured = false;
++	ret = virtio_msg_ffa_indirect_event_configure_locked(drv, &xfer);
++	if (ret)
++		goto err_teardown;
++
++	drv->event_configured = true;
++	drv->active_xfer = xfer;
++	virtio_msg_ffa_select_transfer_method(&drv->ep,
++					      VIRTIO_MSG_FFA_XFER_INDIRECT);
++	if (drv->ep.transfer_method == VIRTIO_MSG_FFA_XFER_INDIRECT &&
++	    virtio_msg_ffa_driver_event_runtime_ready_locked(drv))
++		return 0;
++
++	ret = -EIO;
++	drv->event_configured = false;
++
++err_teardown:
++	if (!shared_bootstrap)
++		virtio_msg_ffa_indirect_teardown_locked(drv, &xfer);
++	if (xfer.priv != old_priv)
++		virtio_msg_ffa_indirect_release_priv(drv, &xfer);
++	drv->xfer_priv[VIRTIO_MSG_FFA_XFER_INDIRECT] = old_priv;
++	return virtio_msg_ffa_driver_init_runtime_reject(ret);
++}
++
++static const struct virtio_msg_ffa_xfer_driver_method_ops
++virtio_msg_ffa_indirect_driver_method_ops = {
++	.init_runtime = virtio_msg_ffa_indirect_driver_init_runtime,
++};
++
++const struct virtio_msg_ffa_xfer_method_desc
++virtio_msg_ffa_indirect_driver_method_desc = {
++	.method = VIRTIO_MSG_FFA_XFER_INDIRECT,
++	.name = "indirect",
++	.role_mask = VIRTIO_MSG_FFA_XFER_ROLE_DRIVER,
++	.phase_flags = VIRTIO_MSG_FFA_XFER_PHASE_BOOTSTRAP |
++		       VIRTIO_MSG_FFA_XFER_PHASE_RUNTIME,
++	.bus_feature_mask = VIRTIO_MSG_FFA_BUS_FEATURE_INDIRECT_RX |
++			    VIRTIO_MSG_FFA_BUS_FEATURE_INDIRECT_TX,
++	.event_delivery = VIRTIO_MSG_FFA_BUS_EVENT_DELIV_INDIRECT,
++	.driver_ops = &virtio_msg_ffa_indirect_driver_method_ops,
++};
+-- 
+2.53.0
+

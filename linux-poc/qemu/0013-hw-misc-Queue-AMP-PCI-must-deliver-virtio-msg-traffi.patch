@@ -1,0 +1,281 @@
+From a2723da15b7bd6736fe67b0537b4f0d32cd9566a Mon Sep 17 00:00:00 2001
+Message-ID: <a2723da15b7bd6736fe67b0537b4f0d32cd9566a.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 11:24:57 +0200
+Subject: [PATCH 13/30] hw/misc: Queue AMP PCI must-deliver virtio-msg traffic
+
+AMP PCI rings can be full when virtio-msg generates required responses or
+events. Dropping that traffic would leave a valid request without its
+completion path.
+
+Add a bounded pending-TX queue and retry timer for must-deliver messages so
+retryable traffic is flushed when ring space becomes available. Clear the
+queue during reset/load cleanup paths so pending state does not leak across
+transport lifecycle changes.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/misc/virtio-msg-amp-pci.c | 178 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 178 insertions(+)
+
+diff --git a/hw/misc/virtio-msg-amp-pci.c b/hw/misc/virtio-msg-amp-pci.c
+index 192e4cf146f7..fb6cc3a75ebb 100644
+--- a/hw/misc/virtio-msg-amp-pci.c
++++ b/hw/misc/virtio-msg-amp-pci.c
+@@ -10,6 +10,8 @@
+ #include "qemu/osdep.h"
+ #include "qemu/units.h"
+ #include "qemu/log.h"
++#include "qemu/queue.h"
++#include "qemu/timer.h"
+ 
+ #include "system/memory.h"
+ #include "migration/vmstate.h"
+@@ -30,6 +32,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(VmsgAmpPciState, VMSG_AMP_PCI)
+ OBJECT_DECLARE_SIMPLE_TYPE(VmsgBusAmpPciState, VMSG_BUS_AMP_PCI)
+ #define VMSG_BUS_AMP_PCI_GET_PARENT_CLASS(obj) \
+         OBJECT_GET_PARENT_CLASS(obj, TYPE_VMSG_BUS_AMP_PCI)
++#define VMSG_BUS_AMP_PCI_MAX_MSG_SIZE SPSC_QUEUE_MAX_PACKET_SIZE
++#define VMSG_BUS_AMP_PCI_PENDING_TX_RETRY_DELAY_MS 1
++#define VMSG_BUS_AMP_PCI_PENDING_TX_MAX 64
+ 
+ REG32(VERSION,  0x00)
+ REG32(FEATURES, 0x04)
+@@ -37,10 +42,19 @@ REG32(NOTIFY,   0x20)
+ 
+ #define MAX_FIFOS 8
+ 
++typedef struct VmsgBusAmpPciPendingTx VmsgBusAmpPciPendingTx;
++struct VmsgBusAmpPciPendingTx {
++    QTAILQ_ENTRY(VmsgBusAmpPciPendingTx) node;
++    VirtIOMSG msg;
++};
++
+ typedef struct VmsgBusAmpPciState {
+     VirtIOMSGBusDevice parent;
+     PCIDevice *pcidev;
+     unsigned int queue_index;
++    QTAILQ_HEAD(, VmsgBusAmpPciPendingTx) pending_tx;
++    unsigned int pending_tx_count;
++    QEMUTimer *pending_tx_retry_timer;
+ 
+     struct {
+         void *va;
+@@ -67,6 +81,15 @@ typedef struct VmsgAmpPciState {
+ } VmsgAmpPciState;
+ 
+ static void vmsg_bus_amp_pci_process(VirtIOMSGBusDevice *bd);
++static int vmsg_bus_amp_pci_send(VirtIOMSGBusDevice *bd, VirtIOMSG *msg_req);
++static void vmsg_bus_amp_pci_clear_pending_tx(VmsgBusAmpPciState *s);
++
++static bool vmsg_bus_amp_pci_valid_msg_size(uint16_t msg_size)
++{
++    size_t min_size = virtio_msg_header_size();
++
++    return msg_size >= min_size && msg_size <= VMSG_BUS_AMP_PCI_MAX_MSG_SIZE;
++}
+ 
+ static uint64_t vmsg_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+@@ -190,6 +213,7 @@ static int vmsg_amp_pci_post_load(void *opaque, int version_id)
+     for (i = 0; i < s->cfg.num_fifos; i++) {
+         VmsgBusAmpPciState *bus = &s->fifo[i].dev;
+ 
++        vmsg_bus_amp_pci_clear_pending_tx(bus);
+         memset(&bus->shm, 0, sizeof(bus->shm));
+     }
+ 
+@@ -278,6 +302,104 @@ static void vmsg_bus_amp_pci_unmap_fifo(VmsgBusAmpPciState *s)
+     /* TODO: Actually unmap. */
+ }
+ 
++static void vmsg_bus_amp_pci_remove_pending_tx(VmsgBusAmpPciState *s,
++                                               VmsgBusAmpPciPendingTx *pending)
++{
++    QTAILQ_REMOVE(&s->pending_tx, pending, node);
++    assert(s->pending_tx_count);
++    s->pending_tx_count--;
++    g_free(pending);
++}
++
++static void vmsg_bus_amp_pci_schedule_pending_tx_retry(VmsgBusAmpPciState *s)
++{
++    int64_t now;
++
++    if (!s->pending_tx_retry_timer || QTAILQ_EMPTY(&s->pending_tx)) {
++        return;
++    }
++
++    now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    timer_mod_anticipate(s->pending_tx_retry_timer,
++                         now + VMSG_BUS_AMP_PCI_PENDING_TX_RETRY_DELAY_MS);
++}
++
++static void vmsg_bus_amp_pci_cancel_pending_tx_retry(VmsgBusAmpPciState *s)
++{
++    if (!s->pending_tx_retry_timer) {
++        return;
++    }
++
++    timer_del(s->pending_tx_retry_timer);
++}
++
++static bool vmsg_bus_amp_pci_queue_pending_tx(VmsgBusAmpPciState *s,
++                                              const VirtIOMSG *msg)
++{
++    VmsgBusAmpPciPendingTx *pending;
++    uint16_t msg_size = le16_to_cpu(msg->msg_size);
++
++    if (s->pending_tx_count >= VMSG_BUS_AMP_PCI_PENDING_TX_MAX) {
++        return false;
++    }
++
++    pending = g_try_new0(VmsgBusAmpPciPendingTx, 1);
++    if (!pending) {
++        return false;
++    }
++
++    assert(vmsg_bus_amp_pci_valid_msg_size(msg_size));
++    memcpy(&pending->msg, msg, msg_size);
++    QTAILQ_INSERT_TAIL(&s->pending_tx, pending, node);
++    s->pending_tx_count++;
++    return true;
++}
++
++static void vmsg_bus_amp_pci_clear_pending_tx(VmsgBusAmpPciState *s)
++{
++    VmsgBusAmpPciPendingTx *pending;
++
++    while ((pending = QTAILQ_FIRST(&s->pending_tx))) {
++        vmsg_bus_amp_pci_remove_pending_tx(s, pending);
++    }
++    vmsg_bus_amp_pci_cancel_pending_tx_retry(s);
++}
++
++static void vmsg_bus_amp_pci_flush_pending_tx(VmsgBusAmpPciState *s)
++{
++    VmsgBusAmpPciPendingTx *pending;
++
++    while ((pending = QTAILQ_FIRST(&s->pending_tx))) {
++        int ret = vmsg_bus_amp_pci_send(VIRTIO_MSG_BUS_DEVICE(s),
++                                        &pending->msg);
++
++        if (ret == VIRTIO_MSG_NO_ERROR) {
++            vmsg_bus_amp_pci_remove_pending_tx(s, pending);
++            continue;
++        }
++
++        if (ret == VIRTIO_MSG_ERROR_RETRY ||
++            ret == VIRTIO_MSG_ERROR_MEMORY) {
++            vmsg_bus_amp_pci_schedule_pending_tx_retry(s);
++            return;
++        }
++
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: dropping queued TX message ret=%d\n",
++                      __func__, ret);
++        vmsg_bus_amp_pci_remove_pending_tx(s, pending);
++    }
++
++    vmsg_bus_amp_pci_cancel_pending_tx_retry(s);
++}
++
++static void vmsg_bus_amp_pci_pending_tx_retry_cb(void *opaque)
++{
++    VmsgBusAmpPciState *s = opaque;
++
++    vmsg_bus_amp_pci_flush_pending_tx(s);
++}
++
+ static void vmsg_bus_amp_pci_process(VirtIOMSGBusDevice *bd)
+ {
+     VmsgBusAmpPciState *s = VMSG_BUS_AMP_PCI(bd);
+@@ -301,6 +423,7 @@ static void vmsg_bus_amp_pci_process(VirtIOMSGBusDevice *bd)
+         }
+     } while (r);
+     vmsg_bus_amp_pci_unmap_fifo(s);
++    vmsg_bus_amp_pci_flush_pending_tx(s);
+ }
+ 
+ static int vmsg_bus_amp_pci_send(VirtIOMSGBusDevice *bd, VirtIOMSG *msg_req)
+@@ -326,6 +449,58 @@ static int vmsg_bus_amp_pci_send(VirtIOMSGBusDevice *bd, VirtIOMSG *msg_req)
+     return VIRTIO_MSG_NO_ERROR;
+ }
+ 
++static int vmsg_bus_amp_pci_send_must_deliver(VirtIOMSGBusDevice *bd,
++                                              VirtIOMSG *msg_req)
++{
++    VmsgBusAmpPciState *s = VMSG_BUS_AMP_PCI(bd);
++    uint16_t msg_size = le16_to_cpu(msg_req->msg_size);
++    int ret;
++
++    if (!vmsg_bus_amp_pci_valid_msg_size(msg_size)) {
++        return VIRTIO_MSG_ERROR_BAD_MESSAGE;
++    }
++
++    vmsg_bus_amp_pci_flush_pending_tx(s);
++    if (!QTAILQ_EMPTY(&s->pending_tx)) {
++        if (!vmsg_bus_amp_pci_queue_pending_tx(s, msg_req)) {
++            return VIRTIO_MSG_ERROR_MEMORY;
++        }
++        vmsg_bus_amp_pci_schedule_pending_tx_retry(s);
++        return VIRTIO_MSG_NO_ERROR;
++    }
++
++    ret = vmsg_bus_amp_pci_send(bd, msg_req);
++    if (ret != VIRTIO_MSG_ERROR_RETRY) {
++        return ret;
++    }
++
++    if (!vmsg_bus_amp_pci_queue_pending_tx(s, msg_req)) {
++        return VIRTIO_MSG_ERROR_MEMORY;
++    }
++    vmsg_bus_amp_pci_schedule_pending_tx_retry(s);
++    return VIRTIO_MSG_NO_ERROR;
++}
++
++static void vmsg_bus_amp_pci_init(Object *obj)
++{
++    VmsgBusAmpPciState *s = VMSG_BUS_AMP_PCI(obj);
++
++    QTAILQ_INIT(&s->pending_tx);
++    s->pending_tx_count = 0;
++    s->pending_tx_retry_timer =
++        timer_new_ms(QEMU_CLOCK_VIRTUAL,
++                     vmsg_bus_amp_pci_pending_tx_retry_cb, s);
++}
++
++static void vmsg_bus_amp_pci_finalize(Object *obj)
++{
++    VmsgBusAmpPciState *s = VMSG_BUS_AMP_PCI(obj);
++
++    vmsg_bus_amp_pci_clear_pending_tx(s);
++    timer_free(s->pending_tx_retry_timer);
++    s->pending_tx_retry_timer = NULL;
++}
++
+ static void vmsg_bus_amp_pci_class_init(ObjectClass *klass,
+                                               const void *data)
+ {
+@@ -333,6 +508,7 @@ static void vmsg_bus_amp_pci_class_init(ObjectClass *klass,
+ 
+     bdc->process = vmsg_bus_amp_pci_process;
+     bdc->send = vmsg_bus_amp_pci_send;
++    bdc->send_must_deliver = vmsg_bus_amp_pci_send_must_deliver;
+ }
+ 
+ static const TypeInfo vmsg_pci_info[] = {
+@@ -349,6 +525,8 @@ static const TypeInfo vmsg_pci_info[] = {
+         .name = TYPE_VMSG_BUS_AMP_PCI,
+         .parent = TYPE_VIRTIO_MSG_BUS_DEVICE,
+         .instance_size = sizeof(VmsgBusAmpPciState),
++        .instance_init = vmsg_bus_amp_pci_init,
++        .instance_finalize = vmsg_bus_amp_pci_finalize,
+         .class_init = vmsg_bus_amp_pci_class_init,
+     },
+ };
+-- 
+2.53.0
+

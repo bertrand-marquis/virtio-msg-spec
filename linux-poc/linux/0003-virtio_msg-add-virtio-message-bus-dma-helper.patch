@@ -1,45 +1,59 @@
-From daa42984a131dcfbf9dbdde1f8b87bf3101b362d Mon Sep 17 00:00:00 2001
-Message-ID: <daa42984a131dcfbf9dbdde1f8b87bf3101b362d.1776951067.git.bertrand.marquis@arm.com>
-In-Reply-To: <a4391e0c6a881b60d45c5922dbd9d8fb8675d9f8.1776951067.git.bertrand.marquis@arm.com>
-References: <a4391e0c6a881b60d45c5922dbd9d8fb8675d9f8.1776951067.git.bertrand.marquis@arm.com>
+From a3b7451fe67fd8d9526d69d82644211ce0b3412d Mon Sep 17 00:00:00 2001
+Message-ID: <a3b7451fe67fd8d9526d69d82644211ce0b3412d.1779811422.git.bertrand.marquis@arm.com>
+In-Reply-To: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+References: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
 From: Bertrand Marquis <bertrand.marquis@arm.com>
-Date: Thu, 23 Apr 2026 14:41:29 +0200
-Subject: [RFC PATCH 3/4] virtio_msg: add virtio message bus dma helper
+Date: Mon, 27 Apr 2026 14:10:02 +0200
+Subject: [PATCH 03/12] virtio_msg: add virtio message bus DMA helper
 
-Add the generic virtio-msg DMA helper and its exported helper API for
-transport and bridge-owned DMA areas.
-
-Keep the helper provider-abstracted and reusable so FF-A-specific area
-ownership, publication, and role-dependent lifecycle handling remain in
-later patches.
+Add the shared DMA mapping helper used by virtio message bus providers for map and mmap flows.
 
 Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
 ---
- drivers/virtio/Makefile             |    1 +
- drivers/virtio/virtio_msg_bus_dma.c | 2606 +++++++++++++++++++++++++++
- drivers/virtio/virtio_msg_bus_dma.h |   70 +
- 3 files changed, 2677 insertions(+)
- create mode 100644 drivers/virtio/virtio_msg_bus_dma.c
- create mode 100644 drivers/virtio/virtio_msg_bus_dma.h
+ drivers/virtio/Kconfig                        |    5 +
+ drivers/virtio/Makefile                       |    1 +
+ .../virtio/virtio_msg_bus_dma_driver_helper.c | 2767 +++++++++++++++++
+ .../virtio/virtio_msg_bus_dma_driver_helper.h |  104 +
+ drivers/virtio/virtio_msg_bus_dma_record.h    |   80 +
+ 5 files changed, 2957 insertions(+)
+ create mode 100644 drivers/virtio/virtio_msg_bus_dma_driver_helper.c
+ create mode 100644 drivers/virtio/virtio_msg_bus_dma_driver_helper.h
+ create mode 100644 drivers/virtio/virtio_msg_bus_dma_record.h
 
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index bb10b0be01ab..ef0d06f41196 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -188,6 +188,11 @@ config VIRTIO_MSG_BRIDGE
+ 	  This enables the provisional Linux-to-userspace bridge scaffolding
+ 	  for /dev/virtio-msg-bridge.
+ 
++config VIRTIO_MSG_BUS_DMA_DRIVER_HELPER
++	tristate
++	depends on VIRTIO_MSG_TRANSPORT
++	depends on HAS_DMA
++
+ config VIRTIO_DMA_SHARED_BUFFER
+ 	tristate
+ 	depends on DMA_SHARED_BUFFER
 diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
-index 71d49999a819..cba87c5bdc38 100644
+index 71d49999a819..ea63fe1a8262 100644
 --- a/drivers/virtio/Makefile
 +++ b/drivers/virtio/Makefile
 @@ -5,6 +5,7 @@ obj-$(CONFIG_VIRTIO_PCI_LIB) += virtio_pci_modern_dev.o
  obj-$(CONFIG_VIRTIO_PCI_LIB_LEGACY) += virtio_pci_legacy_dev.o
  obj-$(CONFIG_VIRTIO_MMIO) += virtio_mmio.o
  obj-$(CONFIG_VIRTIO_MSG_TRANSPORT) += virtio_msg_transport.o
-+obj-$(CONFIG_VIRTIO_MSG_TRANSPORT) += virtio_msg_bus_dma.o
++obj-$(CONFIG_VIRTIO_MSG_BUS_DMA_DRIVER_HELPER) += virtio_msg_bus_dma_driver_helper.o
  obj-$(CONFIG_VIRTIO_MSG_BRIDGE) += virtio_msg_bus_bridge_device.o
  obj-$(CONFIG_VIRTIO_PCI) += virtio_pci.o
  virtio_pci-y := virtio_pci_modern.o virtio_pci_common.o
-diff --git a/drivers/virtio/virtio_msg_bus_dma.c b/drivers/virtio/virtio_msg_bus_dma.c
+diff --git a/drivers/virtio/virtio_msg_bus_dma_driver_helper.c b/drivers/virtio/virtio_msg_bus_dma_driver_helper.c
 new file mode 100644
-index 000000000000..7730828eaeed
+index 000000000000..f6b24c0935f6
 --- /dev/null
-+++ b/drivers/virtio/virtio_msg_bus_dma.c
-@@ -0,0 +1,2606 @@
++++ b/drivers/virtio/virtio_msg_bus_dma_driver_helper.c
+@@ -0,0 +1,2767 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Virtio message bus DMA helper (Step 1 shell).
@@ -65,20 +79,19 @@ index 000000000000..7730828eaeed
 +#include <linux/virtio_config.h>
 +#include <linux/virtio_msg_transport.h>
 +
-+#define VM_LOG_COMPONENT VM_LOG_COMPONENT_DMA
-+#include "virtio_msg_debug.h"
-+#include "virtio_msg_bus_dma.h"
++#include "virtio_msg_bus_dma_driver_helper.h"
++#include "virtio_msg_bus_dma_record.h"
 +
 +/*
-+ * Pool chunk size in MiB.  Each pre-registered chunk is exported once to the
++ * Pool chunk size in KiB.  Each pre-registered chunk is exported once to the
 + * VMM during endpoint init, after which sub-allocations carved from the same
 + * chunk reuse already-ACTIVE page windows without producing additional
 + * MAP_EVENT_ADD round-trips.  Set to 0 to disable the pool.
 + */
-+static unsigned long virtio_msg_dma_pool_chunk_size_mb = 2;
-+module_param(virtio_msg_dma_pool_chunk_size_mb, ulong, 0444);
-+MODULE_PARM_DESC(virtio_msg_dma_pool_chunk_size_mb,
-+		 "DMA pool chunk size in MiB (0 = disabled, default: 2)");
++static unsigned long virtio_msg_dma_pool_chunk_size_kb = 512;
++module_param(virtio_msg_dma_pool_chunk_size_kb, ulong, 0444);
++MODULE_PARM_DESC(virtio_msg_dma_pool_chunk_size_kb,
++		 "DMA pool chunk size in KiB (0 = disabled, default: 512)");
 +
 +/*
 + * Per-mapping size ceiling for pool shadow allocations in KiB.  Mappings
@@ -114,6 +127,12 @@ index 000000000000..7730828eaeed
 +	VIRTIO_MSG_BUS_DMA_BACKING_SHADOW,
 +};
 +
++enum virtio_msg_bus_dma_pool_remote_state {
++	VIRTIO_MSG_BUS_DMA_POOL_REMOTE_PUBLISHED = 0,
++	VIRTIO_MSG_BUS_DMA_POOL_REMOTE_RELEASED,
++	VIRTIO_MSG_BUS_DMA_POOL_REMOTE_QUARANTINED,
++};
++
 +struct virtio_msg_bus_dma_shadow {
 +	struct page **src_pages;
 +	size_t src_page_offset;
@@ -138,7 +157,7 @@ index 000000000000..7730828eaeed
 +	struct virtio_msg_bus_dma_key key;
 +	enum virtio_msg_bus_dma_mapping_kind kind;
 +	enum virtio_msg_bus_dma_backing_mode backing_mode;
-+	struct virtio_msg_bus_dma_export backing;
++	struct virtio_msg_bus_dma_driver_export backing;
 +	struct virtio_msg_bus_dma_shadow shadow;
 +	struct sg_table backing_sgt;
 +	bool backing_sgt_valid;
@@ -177,9 +196,9 @@ index 000000000000..7730828eaeed
 +	spinlock_t active_exports_lock; /* Protects active exports and frees. */
 +	struct list_head deferred_local_frees;
 +	struct delayed_work deferred_local_free_work;
-+	const struct virtio_msg_bus_dma_provider_ops *provider_ops;
++	const struct virtio_msg_bus_dma_driver_provider_ops *provider_ops;
 +	void *provider_ctx;
-+	struct virtio_msg_bus_dma_provider_caps provider_caps;
++	struct virtio_msg_bus_dma_driver_provider_caps provider_caps;
 +	/* DMA pool: pre-registered shadow-buffer chunks. */
 +	struct list_head pool_chunks;   /* list of virtio_msg_bus_dma_pool_chunk */
 +	spinlock_t pool_lock;           /* protects pool_chunks and each bitmap */
@@ -203,19 +222,24 @@ index 000000000000..7730828eaeed
 + */
 +struct virtio_msg_bus_dma_pool_chunk {
 +	struct list_head node;
++	spinlock_t lock;               /* protects bitmap and remote state */
 +	void *cpu_addr;                 /* chunk base CPU-virtual address */
 +	dma_addr_t dma_addr;            /* chunk base DMA address */
 +	size_t length;                  /* total chunk size in bytes */
 +	unsigned int npages;            /* total pages in chunk */
 +	unsigned long *bitmap;          /* set bit = page in use by sub-alloc */
 +	unsigned int free_pages;        /* pages available for sub-alloc */
++	unsigned int active_suballocs;  /* active dependent DMA mappings */
++	enum virtio_msg_bus_dma_pool_remote_state remote_state;
 +	struct page **pages;            /* page pointer array [0..npages-1] */
-+	struct virtio_msg_bus_dma_export export;
++	struct virtio_msg_bus_dma_driver_export export;
 +	void *provider_handle;
 +};
 +
 +static LIST_HEAD(virtio_msg_bus_dma_orphaned_local_frees);
 +static DEFINE_SPINLOCK(virtio_msg_bus_dma_orphaned_local_frees_lock);
++static LIST_HEAD(virtio_msg_bus_dma_orphaned_pool_chunks);
++static DEFINE_SPINLOCK(virtio_msg_bus_dma_orphaned_pool_chunks_lock);
 +
 +static inline struct virtio_msg_transport_device *
 +virtio_msg_bus_dma_vmdev_from_vdev(struct virtio_device *vdev)
@@ -236,20 +260,69 @@ index 000000000000..7730828eaeed
 +	return vmdev ? vmdev->dma_shim : NULL;
 +}
 +
-+bool virtio_msg_bus_dma_is_installed(const struct virtio_msg_transport_device *vmdev)
++bool
++virtio_msg_bus_dma_driver_helper_is_installed(const struct virtio_msg_transport_device *vmdev)
 +{
 +	return vmdev && vmdev->dma_shim && vmdev->dma_shim->shim_installed;
 +}
-+EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_is_installed);
++EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_driver_helper_is_installed);
 +
-+struct device *virtio_msg_bus_dma_delegate_dev(const struct virtio_msg_transport_device *vmdev)
++struct device *
++virtio_msg_bus_dma_driver_helper_delegate_dev(const struct virtio_msg_transport_device *vmdev)
 +{
-+	if (!virtio_msg_bus_dma_is_installed(vmdev))
++	if (!virtio_msg_bus_dma_driver_helper_is_installed(vmdev))
 +		return NULL;
 +
 +	return vmdev->dma_shim->delegate_dev;
 +}
-+EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_delegate_dev);
++EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_driver_helper_delegate_dev);
++
++int
++virtio_msg_bus_dma_export_released(const struct virtio_msg_bus_dma_driver_export *export,
++				   struct virtio_msg_bus_dma_driver_release *release)
++{
++	struct virtio_msg_bus_dma_pool_chunk *chunk;
++	unsigned long flags;
++
++	if (release)
++		memset(release, 0, sizeof(*release));
++
++	if (!export)
++		return -EINVAL;
++	if (!(export->bridge_flags &
++	      VIRTIO_MSG_BUS_BRIDGE_MAP_F_RETENTION_REQUESTED))
++		return 0;
++	if (export->type != VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_POOL_CHUNK)
++		return -EOPNOTSUPP;
++	if (!export->release_ctx)
++		return -EINVAL;
++
++	chunk = export->release_ctx;
++
++	spin_lock_irqsave(&chunk->lock, flags);
++	if (chunk->active_suballocs) {
++		chunk->remote_state =
++			VIRTIO_MSG_BUS_DMA_POOL_REMOTE_QUARANTINED;
++		if (release) {
++			release->action =
++				VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_RETAINED_ACTIVE;
++			release->active_suballocs = chunk->active_suballocs;
++		}
++	} else {
++		chunk->remote_state =
++			VIRTIO_MSG_BUS_DMA_POOL_REMOTE_RELEASED;
++		if (release)
++			release->action =
++				VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_RETAINED_IDLE;
++	}
++	spin_unlock_irqrestore(&chunk->lock, flags);
++
++	if (release)
++		release->release_ctx = export->release_ctx;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_export_released);
 +
 +/* ------------------------------------------------------------------ */
 +/* DMA pool: sub-allocator over pre-registered shadow-buffer chunks.  */
@@ -266,6 +339,10 @@ index 000000000000..7730828eaeed
 +
 +/* Forward declarations for helpers defined later in this file. */
 +static void virtio_msg_bus_dma_pool_grow_work(struct work_struct *work);
++static bool virtio_msg_bus_dma_provider_revoke_in_progress(int ret);
++static void
++virtio_msg_bus_dma_pool_chunk_orphan
++		(struct virtio_msg_bus_dma_pool_chunk *chunk);
 +static void virtio_msg_bus_dma_sg_extract_release
 +		(struct virtio_msg_bus_dma_sg_extract *extract);
 +static int virtio_msg_bus_dma_extract_sg_data
@@ -303,17 +380,29 @@ index 000000000000..7730828eaeed
 +	struct virtio_msg_bus_dma_pool_chunk *chunk;
 +	unsigned long start;
 +	unsigned long flags;
++	bool found;
 +
 +	spin_lock_irqsave(&dma->pool_lock, flags);
 +	list_for_each_entry(chunk, &dma->pool_chunks, node) {
++		found = false;
++		spin_lock(&chunk->lock);
++		if (chunk->remote_state !=
++		    VIRTIO_MSG_BUS_DMA_POOL_REMOTE_PUBLISHED)
++			goto next_chunk;
 +		if (chunk->free_pages < npages)
-+			continue;
++			goto next_chunk;
 +		start = bitmap_find_next_zero_area(chunk->bitmap, chunk->npages,
 +						   0, npages, 0);
 +		if (start >= chunk->npages)
-+			continue;
++			goto next_chunk;
 +		bitmap_set(chunk->bitmap, start, npages);
 +		chunk->free_pages -= npages;
++		chunk->active_suballocs++;
++		found = true;
++next_chunk:
++		spin_unlock(&chunk->lock);
++		if (!found)
++			continue;
 +		spin_unlock_irqrestore(&dma->pool_lock, flags);
 +		*out_chunk = chunk;
 +		*out_page_offset = (unsigned int)start;
@@ -330,10 +419,16 @@ index 000000000000..7730828eaeed
 +{
 +	unsigned long flags;
 +
-+	spin_lock_irqsave(&dma->pool_lock, flags);
++	(void)dma;
++
++	spin_lock_irqsave(&chunk->lock, flags);
 +	bitmap_clear(chunk->bitmap, page_offset, npages);
 +	chunk->free_pages += npages;
-+	spin_unlock_irqrestore(&dma->pool_lock, flags);
++	if (WARN_ON_ONCE(!chunk->active_suballocs))
++		chunk->remote_state = VIRTIO_MSG_BUS_DMA_POOL_REMOTE_QUARANTINED;
++	else
++		chunk->active_suballocs--;
++	spin_unlock_irqrestore(&chunk->lock, flags);
 +}
 +
 +static struct virtio_msg_bus_dma_pool_chunk *
@@ -344,6 +439,7 @@ index 000000000000..7730828eaeed
 +	struct sg_table sgt;
 +	size_t chunk_size = dma->pool_chunk_size;
 +	unsigned int npages;
++	int revoke_ret;
 +	int ret;
 +
 +	if (!chunk_size || !PAGE_ALIGNED(chunk_size))
@@ -356,7 +452,9 @@ index 000000000000..7730828eaeed
 +		return ERR_PTR(-ENOMEM);
 +
 +	INIT_LIST_HEAD(&chunk->node);
++	spin_lock_init(&chunk->lock);
 +	chunk->length = chunk_size;
++	chunk->remote_state = VIRTIO_MSG_BUS_DMA_POOL_REMOTE_PUBLISHED;
 +
 +	chunk->bitmap = bitmap_zalloc(npages, gfp);
 +	if (!chunk->bitmap) {
@@ -408,11 +506,20 @@ index 000000000000..7730828eaeed
 +	chunk->export.attrs = 0;
 +	chunk->export.dir = DMA_BIDIRECTIONAL;
 +	chunk->export.coherent = true;
++	chunk->export.type = VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_POOL_CHUNK;
++	chunk->export.bridge_flags =
++		VIRTIO_MSG_BUS_BRIDGE_MAP_F_RETENTION_REQUESTED;
++	chunk->export.release_ctx = chunk;
 +
 +	ret = dma->provider_ops->export_add(dma->provider_ctx, &chunk->export,
 +					    &chunk->provider_handle, gfp);
-+	if (ret)
++	if (ret) {
++		dev_dbg(dma->delegate_dev,
++			"dma-pool: provider export failed dma=%pad len=%zu pages=%u ret=%d\n",
++		       &chunk->export.local_dma_addr, chunk->export.length,
++		       chunk->export.npages, ret);
 +		goto err_free_pages;
++	}
 +	if (chunk->export.length != chunk_size ||
 +	    chunk->export.local_dma_addr != chunk->dma_addr) {
 +		ret = -EOPNOTSUPP;
@@ -422,9 +529,18 @@ index 000000000000..7730828eaeed
 +	return chunk;
 +
 +err_revoke_chunk_export:
-+	(void)dma->provider_ops->export_del(dma->provider_ctx,
-+					    &chunk->export,
-+					    chunk->provider_handle, false);
++	revoke_ret = dma->provider_ops->export_del(dma->provider_ctx,
++						   &chunk->export,
++						   chunk->provider_handle,
++						   false);
++	if (virtio_msg_bus_dma_provider_revoke_in_progress(revoke_ret)) {
++		virtio_msg_bus_dma_pool_chunk_orphan(chunk);
++		return ERR_PTR(revoke_ret);
++	}
++	if (revoke_ret && revoke_ret != -EOPNOTSUPP)
++		dev_warn_ratelimited(dma->delegate_dev,
++				     "dma-pool: rollback revoke failed dma=%pad len=%zu ret=%d\n",
++			   &chunk->export.dma_addr, chunk->length, revoke_ret);
 +	chunk->provider_handle = NULL;
 +err_free_pages:
 +	kfree(chunk->pages);
@@ -439,18 +555,48 @@ index 000000000000..7730828eaeed
 +	return ERR_PTR(ret);
 +}
 +
-+static void
-+virtio_msg_bus_dma_pool_chunk_free(struct virtio_msg_bus_dma *dma,
-+				   struct virtio_msg_bus_dma_pool_chunk *chunk)
++static bool virtio_msg_bus_dma_provider_revoke_in_progress(int ret)
 +{
++	return ret == VIRTIO_MSG_BUS_DMA_PROVIDER_REVOKE_IN_PROGRESS ||
++	       ret == -EAGAIN;
++}
++
++static void
++virtio_msg_bus_dma_pool_chunk_orphan
++		(struct virtio_msg_bus_dma_pool_chunk *chunk)
++{
++	unsigned long flags;
++
 +	if (!chunk)
 +		return;
 +
++	spin_lock_irqsave(&virtio_msg_bus_dma_orphaned_pool_chunks_lock, flags);
++	list_add_tail(&chunk->node, &virtio_msg_bus_dma_orphaned_pool_chunks);
++	spin_unlock_irqrestore(&virtio_msg_bus_dma_orphaned_pool_chunks_lock,
++			       flags);
++}
++
++static int
++virtio_msg_bus_dma_pool_chunk_free(struct virtio_msg_bus_dma *dma,
++				   struct virtio_msg_bus_dma_pool_chunk *chunk)
++{
++	int ret = 0;
++
++	if (!chunk)
++		return 0;
++
 +	if (chunk->provider_handle) {
-+		(void)dma->provider_ops->export_del(dma->provider_ctx,
++		ret = dma->provider_ops->export_del(dma->provider_ctx,
 +						    &chunk->export,
 +						    chunk->provider_handle,
 +						    true);
++		if (virtio_msg_bus_dma_provider_revoke_in_progress(ret))
++			return ret;
++		if (ret && ret != -EOPNOTSUPP)
++			dev_warn_ratelimited(dma->delegate_dev,
++					     "dma-pool: provider revoke failed dma=%pad len=%zu ret=%d\n",
++				   &chunk->export.dma_addr, chunk->length,
++				   ret);
 +		chunk->provider_handle = NULL;
 +	}
 +
@@ -459,6 +605,8 @@ index 000000000000..7730828eaeed
 +	kfree(chunk->pages);
 +	bitmap_free(chunk->bitmap);
 +	kfree(chunk);
++
++	return ret;
 +}
 +
 +/*
@@ -510,14 +658,14 @@ index 000000000000..7730828eaeed
 +	}
 +
 +	if (IS_ERR(new_chunk)) {
-+		vm_warn_rl(dma->delegate_dev,
-+			   "dma-pool: deferred grow failed (err %ld)\n",
-+			   PTR_ERR(new_chunk));
++		dev_dbg(dma->delegate_dev,
++			"dma-pool: deferred grow failed chunk_size=%zu min_pages=%u ret=%ld\n",
++		       chunk_size, min_pages, PTR_ERR(new_chunk));
 +		return;
 +	}
 +
-+	vm_trace(dma->delegate_dev,
-+		 "dma-pool: grew chunk size=%zu (min_pages=%u)",
++	dev_dbg(dma->delegate_dev,
++		"dma-pool: grew chunk size=%zu (min_pages=%u)",
 +		 chunk_size, min_pages);
 +
 +	spin_lock(&dma->pool_lock);
@@ -531,7 +679,7 @@ index 000000000000..7730828eaeed
 +	struct virtio_msg_bus_dma_pool_chunk *chunk;
 +	size_t chunk_size;
 +
-+	chunk_size = (size_t)virtio_msg_dma_pool_chunk_size_mb << 20;
++	chunk_size = (size_t)virtio_msg_dma_pool_chunk_size_kb << 10;
 +	if (!chunk_size)
 +		return 0;
 +	if (!PAGE_ALIGNED(chunk_size))
@@ -541,8 +689,8 @@ index 000000000000..7730828eaeed
 +
 +	chunk = virtio_msg_bus_dma_pool_chunk_alloc(dma, GFP_KERNEL);
 +	if (IS_ERR(chunk)) {
-+		vm_warn_rl(dma->delegate_dev,
-+			   "dma-pool: failed to allocate initial %zu-byte chunk (err %ld), pool disabled\n",
++		dev_warn_ratelimited(dma->delegate_dev,
++				     "dma-pool: failed to allocate initial %zu-byte chunk (err %ld), pool disabled\n",
 +			   chunk_size, PTR_ERR(chunk));
 +		dma->pool_chunk_size = 0;
 +		return 0;   /* not fatal — fall back to per-mapping alloc */
@@ -570,8 +718,16 @@ index 000000000000..7730828eaeed
 +	spin_unlock_irqrestore(&dma->pool_lock, flags);
 +
 +	list_for_each_entry_safe(chunk, tmp, &to_free, node) {
++		int ret;
++
 +		list_del_init(&chunk->node);
-+		virtio_msg_bus_dma_pool_chunk_free(dma, chunk);
++		ret = virtio_msg_bus_dma_pool_chunk_free(dma, chunk);
++		if (virtio_msg_bus_dma_provider_revoke_in_progress(ret)) {
++			dev_warn_ratelimited(dma->delegate_dev,
++					     "dma-pool: retaining chunk dma=%pad len=%zu with revoke in progress\n",
++				   &chunk->export.dma_addr, chunk->length);
++			virtio_msg_bus_dma_pool_chunk_orphan(chunk);
++		}
 +	}
 +}
 +
@@ -613,11 +769,12 @@ index 000000000000..7730828eaeed
 +	int ret;
 +
 +	ret = virtio_msg_bus_dma_provider_export_del_record(dma, mapping, true);
-+	if (ret == -EINPROGRESS && retry_inprogress)
++	if (virtio_msg_bus_dma_provider_revoke_in_progress(ret) &&
++	    retry_inprogress)
 +		return false;
 +	if (ret && ret != -EOPNOTSUPP)
-+		vm_warn_rl(dma->delegate_dev,
-+			   "provider sync revoke failed dma=%pad len=%zu ret=%d\n",
++		dev_warn_ratelimited(dma->delegate_dev,
++				     "provider sync revoke failed dma=%pad len=%zu ret=%d\n",
 +			   &mapping->backing.dma_addr,
 +			   mapping->backing.length, ret);
 +
@@ -674,7 +831,7 @@ index 000000000000..7730828eaeed
 +}
 +
 +static void
-+virtio_msg_bus_dma_cleanup_drain_local_frees
++virtio_msg_bus_dma_driver_cleanup_drain_local_frees
 +	(struct virtio_msg_bus_dma *dma,
 +	 struct list_head *pending)
 +{
@@ -715,8 +872,8 @@ index 000000000000..7730828eaeed
 +			       flags);
 +
 +	if (retained)
-+		vm_warn_rl(dma->delegate_dev,
-+			   "cleanup retaining %u DMA mappings with revoke in progress\n",
++		dev_warn_ratelimited(dma->delegate_dev,
++				     "cleanup retaining %u DMA mappings with revoke in progress\n",
 +			   retained);
 +}
 +
@@ -868,6 +1025,10 @@ index 000000000000..7730828eaeed
 +	mapping->backing.cpu_addr = shadow_cpu_addr;
 +	mapping->backing.attrs = 0;
 +	mapping->backing.coherent = false;
++	mapping->backing.type = VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_POOL_CHUNK;
++	mapping->backing.bridge_flags =
++		VIRTIO_MSG_BUS_BRIDGE_MAP_F_RETENTION_REQUESTED;
++	mapping->backing.release_ctx = chunk;
 +	mapping->key.dma_addr = export_dma_addr;
 +	mapping->backing_mode = VIRTIO_MSG_BUS_DMA_BACKING_SHADOW;
 +
@@ -973,9 +1134,9 @@ index 000000000000..7730828eaeed
 +static int
 +virtio_msg_bus_dma_validate_provider_export
 +	(const struct virtio_msg_bus_dma_mapping *mapping,
-+	 const struct virtio_msg_bus_dma_export *expected_export)
++	 const struct virtio_msg_bus_dma_driver_export *expected_export)
 +{
-+	const struct virtio_msg_bus_dma_export *provider_export;
++	const struct virtio_msg_bus_dma_driver_export *provider_export;
 +	size_t mapped_span;
 +
 +	if (!mapping || !expected_export)
@@ -996,7 +1157,10 @@ index 000000000000..7730828eaeed
 +	    provider_export->cpu_addr != expected_export->cpu_addr ||
 +	    provider_export->attrs != expected_export->attrs ||
 +	    provider_export->dir != expected_export->dir ||
-+	    provider_export->coherent != expected_export->coherent)
++	    provider_export->coherent != expected_export->coherent ||
++	    provider_export->type != expected_export->type ||
++	    provider_export->bridge_flags != expected_export->bridge_flags ||
++	    provider_export->release_ctx != expected_export->release_ctx)
 +		return -EOPNOTSUPP;
 +	if (provider_export->length != mapping->key.length)
 +		return -EOPNOTSUPP;
@@ -1023,7 +1187,7 @@ index 000000000000..7730828eaeed
 +		(struct virtio_msg_bus_dma *dma,
 +		 struct virtio_msg_bus_dma_mapping *mapping, gfp_t gfp)
 +{
-+	struct virtio_msg_bus_dma_export expected_export;
++	struct virtio_msg_bus_dma_driver_export expected_export;
 +	int ret;
 +	void *provider_handle = NULL;
 +
@@ -1106,6 +1270,9 @@ index 000000000000..7730828eaeed
 +	mapping->backing.attrs = attrs;
 +	mapping->backing.dir = dir;
 +	mapping->backing.coherent = coherent;
++	mapping->backing.type = VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_ONESHOT;
++	mapping->backing.bridge_flags = 0;
++	mapping->backing.release_ctx = mapping;
 +	mapping->cpu_addr = cpu_addr;
 +	mapping->attrs = attrs;
 +
@@ -1121,7 +1288,7 @@ index 000000000000..7730828eaeed
 +	unsigned int copied = 0;
 +	int ret;
 +
-+	if (!dst || !src || !src->orig_nents || !src->sgl)
++	if (!src || !src->orig_nents || !src->sgl)
 +		return -EINVAL;
 +
 +	ret = sg_alloc_table(dst, src->orig_nents, gfp);
@@ -1174,9 +1341,6 @@ index 000000000000..7730828eaeed
 +	struct page **pages;
 +	bool first = true;
 +	int i;
-+
-+	if (!extract)
-+		return -EINVAL;
 +
 +	memset(extract, 0, sizeof(*extract));
 +
@@ -1289,6 +1453,9 @@ index 000000000000..7730828eaeed
 +	mapping->backing.attrs = attrs;
 +	mapping->backing.dir = dir;
 +	mapping->backing.coherent = coherent;
++	mapping->backing.type = VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_ONESHOT;
++	mapping->backing.bridge_flags = 0;
++	mapping->backing.release_ctx = mapping;
 +	mapping->cpu_addr = cpu_addr;
 +	mapping->attrs = attrs;
 +	extract.pages = NULL;
@@ -1420,8 +1587,10 @@ index 000000000000..7730828eaeed
 +	 size_t length)
 +{
 +	struct virtio_msg_bus_dma_mapping *mapping;
++	unsigned long index;
 +
-+	mapping = xa_load(&dma->active_exports, (unsigned long)dma_addr);
++	index = (unsigned long)dma_addr;
++	mapping = xa_load(&dma->active_exports, index);
 +	if (!mapping || mapping->key.length != length)
 +		return NULL;
 +
@@ -1467,8 +1636,6 @@ index 000000000000..7730828eaeed
 +{
 +	size_t offset;
 +
-+	if (!backing_dma_addr)
-+		return false;
 +	if (!virtio_msg_bus_dma_mapping_offset(mapping, dma_addr, length, &offset))
 +		return false;
 +	if (check_add_overflow(mapping->backing.local_dma_addr, (dma_addr_t)offset,
@@ -1506,19 +1673,14 @@ index 000000000000..7730828eaeed
 +	 struct virtio_msg_bus_dma_mapping *mapping)
 +{
 +	unsigned long flags;
-+	unsigned long index = (unsigned long)mapping->key.dma_addr;
-+	int ret = 0;
++	unsigned long index;
++	int ret;
 +
++	index = (unsigned long)mapping->key.dma_addr;
 +	xa_lock_irqsave(&dma->active_exports, flags);
 +	spin_lock(&dma->active_exports_lock);
-+	if (xa_load(&dma->active_exports, index)) {
-+		ret = -EEXIST;
-+		goto out_unlock;
-+	}
-+
-+	ret = __xa_insert(&dma->active_exports, index, mapping, GFP_ATOMIC);
-+
-+out_unlock:
++	ret = virtio_msg_bus_dma_xa_insert_unique_locked
++		(&dma->active_exports, index, mapping, GFP_ATOMIC);
 +	spin_unlock(&dma->active_exports_lock);
 +	xa_unlock_irqrestore(&dma->active_exports, flags);
 +
@@ -1530,13 +1692,17 @@ index 000000000000..7730828eaeed
 +	(struct virtio_msg_bus_dma *dma, dma_addr_t dma_addr, size_t length)
 +{
 +	struct virtio_msg_bus_dma_mapping *mapping;
++	unsigned long index;
 +	unsigned long flags;
 +
++	index = (unsigned long)dma_addr;
 +	xa_lock_irqsave(&dma->active_exports, flags);
 +	spin_lock(&dma->active_exports_lock);
 +	mapping = virtio_msg_bus_dma_find_record_locked(dma, dma_addr, length);
-+	if (mapping)
-+		mapping = __xa_erase(&dma->active_exports, (unsigned long)dma_addr);
++	if (mapping &&
++	    !virtio_msg_bus_dma_xa_erase_if_match_locked
++		    (&dma->active_exports, index, mapping))
++		mapping = NULL;
 +	spin_unlock(&dma->active_exports_lock);
 +	xa_unlock_irqrestore(&dma->active_exports, flags);
 +
@@ -1700,6 +1866,9 @@ index 000000000000..7730828eaeed
 +	mapping->backing.page_offset = extract.page_offset;
 +	mapping->backing.npages = extract.npages;
 +	mapping->backing.coherent = false;
++	mapping->backing.type = VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_ONESHOT;
++	mapping->backing.bridge_flags = 0;
++	mapping->backing.release_ctx = mapping;
 +	mapping->key.dma_addr = shadow_dma_addr;
 +	mapping->backing_mode = VIRTIO_MSG_BUS_DMA_BACKING_SHADOW;
 +	extract.pages = NULL;
@@ -1794,15 +1963,15 @@ index 000000000000..7730828eaeed
 +
 +	dma = virtio_msg_bus_dma_from_dev(dev);
 +	if (!dma || !dma->shim_installed) {
-+		vm_trace(dev,
-+			 "dma-map reject: shim unavailable phys=%pa len=%zu dir=%d attrs=%#lx\n",
++		dev_dbg(dev,
++			"dma-map reject: shim unavailable phys=%pa len=%zu dir=%d attrs=%#lx\n",
 +			 &phys, size, dir, attrs);
 +		return DMA_MAPPING_ERROR;
 +	}
 +
 +	if ((attrs & DMA_ATTR_MMIO) || !pfn_valid(PHYS_PFN(phys))) {
-+		vm_trace(dev,
-+			 "dma-map reject: unsupported phys=%pa len=%zu dir=%d attrs=%#lx\n",
++		dev_dbg(dev,
++			"dma-map reject: unsupported phys=%pa len=%zu dir=%d attrs=%#lx\n",
 +			 &phys, size, dir, attrs);
 +		return DMA_MAPPING_ERROR;
 +	}
@@ -1814,8 +1983,8 @@ index 000000000000..7730828eaeed
 +		 gfp, VIRTIO_MSG_BUS_DMA_MAPPING_STREAMING);
 +	if (IS_ERR(mapping)) {
 +		ret = PTR_ERR(mapping);
-+			vm_warn_rl(dma->delegate_dev,
-+				   "dma-map alloc record failed phys=%pa len=%zu dir=%d ret=%d\n",
++			dev_warn_ratelimited(dma->delegate_dev,
++					     "dma-map alloc record failed phys=%pa len=%zu dir=%d ret=%d\n",
 +				   &phys, size, dir, ret);
 +		return DMA_MAPPING_ERROR;
 +	}
@@ -1841,8 +2010,8 @@ index 000000000000..7730828eaeed
 +			 * Pool full; grow work scheduled — fail fast and let
 +			 * blk-mq retry after the delayed requeue.
 +			 */
-+			vm_trace(dma->delegate_dev,
-+				 "dma-map pool busy phys=%pa size=%zu dir=%d\n",
++			dev_dbg(dma->delegate_dev,
++				"dma-map pool busy phys=%pa size=%zu dir=%d\n",
 +				 &phys, size, dir);
 +			virtio_msg_bus_dma_free_record(mapping);
 +			return DMA_MAPPING_ERROR;
@@ -1852,8 +2021,8 @@ index 000000000000..7730828eaeed
 +
 +	ret = virtio_msg_bus_dma_prepare_shadow_record(dma, mapping, gfp);
 +	if (ret) {
-+		vm_warn_rl(dma->delegate_dev,
-+			   "dma-map shadow prepare failed phys=%pa len=%zu dir=%d ret=%d\n",
++		dev_warn_ratelimited(dma->delegate_dev,
++				     "dma-map shadow prepare failed phys=%pa len=%zu dir=%d ret=%d\n",
 +			   &phys, size, dir, ret);
 +		virtio_msg_bus_dma_free_record(mapping);
 +		return DMA_MAPPING_ERROR;
@@ -1870,8 +2039,8 @@ index 000000000000..7730828eaeed
 +
 +	ret = virtio_msg_bus_dma_provider_export_record(dma, mapping, gfp);
 +	if (ret) {
-+		vm_warn_rl(dma->delegate_dev,
-+			   "dma-map provider export failed phys=%pa len=%zu dir=%d ret=%d\n",
++		dev_warn_ratelimited(dma->delegate_dev,
++				     "dma-map provider export failed phys=%pa len=%zu dir=%d ret=%d\n",
 +			   &phys, size, dir, ret);
 +		virtio_msg_bus_dma_free_record(mapping);
 +		return DMA_MAPPING_ERROR;
@@ -1881,8 +2050,8 @@ index 000000000000..7730828eaeed
 +track:
 +	ret = virtio_msg_bus_dma_track_export(dma, mapping);
 +	if (ret) {
-+		vm_warn_rl(dma->delegate_dev,
-+			   "dma-map track export failed phys=%pa len=%zu dir=%d ret=%d\n",
++		dev_warn_ratelimited(dma->delegate_dev,
++				     "dma-map track export failed phys=%pa len=%zu dir=%d ret=%d\n",
 +			   &phys, size, dir, ret);
 +		if (virtio_msg_bus_dma_mapping_needs_deferred_release(mapping)) {
 +			virtio_msg_bus_dma_defer_local_free_record(dma, mapping);
@@ -1893,8 +2062,8 @@ index 000000000000..7730828eaeed
 +		}
 +		return DMA_MAPPING_ERROR;
 +	}
-+	vm_trace(dma->delegate_dev,
-+		 "dma-map done: phys=%pa size=%zu dir=%d dma=%pad path=shadow\n",
++	dev_dbg(dma->delegate_dev,
++		"dma-map done: phys=%pa size=%zu dir=%d dma=%pad path=shadow\n",
 +		 &phys, size, dir, &dma_addr);
 +
 +	return dma_addr;
@@ -1924,9 +2093,9 @@ index 000000000000..7730828eaeed
 +			virtio_msg_bus_dma_free_record(mapping);
 +		else
 +			virtio_msg_bus_dma_defer_local_free_record(dma, mapping);
-+			vm_trace(dma->delegate_dev,
-+				 "dma-unmap done: dma=%pad size=%zu dir=%d path=shadow\n",
-+				 &dma_addr, size, dir);
++		dev_dbg(dma->delegate_dev,
++			"dma-unmap done: dma=%pad size=%zu dir=%d path=shadow\n",
++			 &dma_addr, size, dir);
 +		return;
 +	}
 +
@@ -1936,8 +2105,8 @@ index 000000000000..7730828eaeed
 +		ret = virtio_msg_bus_dma_provider_export_del_record(dma, mapping,
 +								    false);
 +			if (ret && ret != -EOPNOTSUPP)
-+				vm_warn_rl(dma->delegate_dev,
-+					   "provider revoke failed dma=%pad len=%zu ret=%d\n",
++				dev_warn_ratelimited(dma->delegate_dev,
++						     "provider revoke failed dma=%pad len=%zu ret=%d\n",
 +					   &mapping->backing.dma_addr,
 +					   mapping->backing.length, ret);
 +	}
@@ -1946,8 +2115,8 @@ index 000000000000..7730828eaeed
 +	dma_unmap_phys(dma->delegate_dev,
 +		       mapping ? mapping->backing.local_dma_addr : dma_addr,
 +		       size, dir, attrs);
-+	vm_trace(dma->delegate_dev,
-+		 "dma-unmap done: dma=%pad size=%zu dir=%d path=%s\n",
++	dev_dbg(dma->delegate_dev,
++		"dma-unmap done: dma=%pad size=%zu dir=%d path=%s\n",
 +		 &dma_addr, size, dir, mapping ? "direct" : "passthrough");
 +	if (!mapping)
 +		return;
@@ -2323,10 +2492,10 @@ index 000000000000..7730828eaeed
 +	vmdev = virtio_msg_bus_dma_vmdev_from_vdev(dev_to_virtio(map.dma_dev));
 +	if (!vmdev)
 +		return map.dma_dev;
-+	if (!virtio_msg_bus_dma_is_installed(vmdev))
++	if (!virtio_msg_bus_dma_driver_helper_is_installed(vmdev))
 +		return map.dma_dev;
 +
-+	return virtio_msg_bus_dma_delegate_dev(vmdev);
++	return virtio_msg_bus_dma_driver_helper_delegate_dev(vmdev);
 +}
 +
 +static dma_addr_t virtio_msg_bus_dma_vmap_page(union virtio_map map,
@@ -2462,7 +2631,7 @@ index 000000000000..7730828eaeed
 +}
 +
 +static void
-+virtio_msg_bus_dma_provider_caps_init(struct virtio_msg_bus_dma *dma)
++virtio_msg_bus_dma_driver_provider_caps_init(struct virtio_msg_bus_dma *dma)
 +{
 +	if (!dma || !dma->provider_ops)
 +		return;
@@ -2473,9 +2642,12 @@ index 000000000000..7730828eaeed
 +						    &dma->provider_caps);
 +}
 +
-+int virtio_msg_bus_dma_install(struct virtio_msg_transport_device *vmdev,
-+			       const struct virtio_msg_bus_dma_provider_ops *provider_ops,
-+			       void *provider_ctx)
++int
++virtio_msg_bus_dma_driver_helper_install(struct virtio_msg_transport_device
++					 *vmdev,
++					 const struct virtio_msg_bus_dma_driver_provider_ops
++					 *provider_ops,
++					 void *provider_ctx)
 +{
 +	struct virtio_msg_bus_dma *dma;
 +	struct device *delegate_dev;
@@ -2484,7 +2656,7 @@ index 000000000000..7730828eaeed
 +	if (!vmdev || !provider_ops || !provider_ops->export_add ||
 +	    !provider_ops->export_del)
 +		return -EINVAL;
-+	if (virtio_msg_bus_dma_is_installed(vmdev))
++	if (virtio_msg_bus_dma_driver_helper_is_installed(vmdev))
 +		return 0;
 +
 +	delegate_dev = vmdev->vdev.dev.parent;
@@ -2506,7 +2678,7 @@ index 000000000000..7730828eaeed
 +	atomic_set(&dma->pool_grow_min_pages, 0);
 +	dma->provider_ops = provider_ops;
 +	dma->provider_ctx = provider_ctx;
-+	virtio_msg_bus_dma_provider_caps_init(dma);
++	virtio_msg_bus_dma_driver_provider_caps_init(dma);
 +
 +	dev = &vmdev->vdev.dev;
 +	dma->delegate_dev = delegate_dev;
@@ -2563,9 +2735,11 @@ index 000000000000..7730828eaeed
 +
 +	return 0;
 +}
-+EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_install);
++EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_driver_helper_install);
 +
-+void virtio_msg_bus_dma_cleanup(struct virtio_msg_transport_device *vmdev)
++void
++virtio_msg_bus_dma_driver_helper_cleanup(struct virtio_msg_transport_device
++					 *vmdev)
 +{
 +	struct virtio_msg_bus_dma_mapping *mapping;
 +	struct virtio_msg_bus_dma *dma;
@@ -2599,8 +2773,8 @@ index 000000000000..7730828eaeed
 +		ret = virtio_msg_bus_dma_provider_export_del_record(dma, mapping,
 +								    false);
 +			if (ret && ret != -EOPNOTSUPP)
-+				vm_warn_rl(dma->delegate_dev,
-+					   "provider revoke failed dma=%pad len=%zu ret=%d\n",
++				dev_warn_ratelimited(dma->delegate_dev,
++						     "provider revoke failed dma=%pad len=%zu ret=%d\n",
 +					   &mapping->backing.dma_addr,
 +					   mapping->backing.length, ret);
 +		switch (mapping->kind) {
@@ -2633,7 +2807,8 @@ index 000000000000..7730828eaeed
 +	list_splice_init(&dma->deferred_local_frees, &deferred_local);
 +	spin_unlock_irqrestore(&dma->active_exports_lock, flags);
 +
-+	virtio_msg_bus_dma_cleanup_drain_local_frees(dma, &deferred_local);
++	virtio_msg_bus_dma_driver_cleanup_drain_local_frees(dma,
++							    &deferred_local);
 +
 +	INIT_LIST_HEAD(&dma->deferred_local_frees);
 +	xa_destroy(&dma->active_exports);
@@ -2645,13 +2820,13 @@ index 000000000000..7730828eaeed
 +	kfree(dma);
 +	vmdev->dma_shim = NULL;
 +}
-+EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_cleanup);
-diff --git a/drivers/virtio/virtio_msg_bus_dma.h b/drivers/virtio/virtio_msg_bus_dma.h
++EXPORT_SYMBOL_GPL(virtio_msg_bus_dma_driver_helper_cleanup);
+diff --git a/drivers/virtio/virtio_msg_bus_dma_driver_helper.h b/drivers/virtio/virtio_msg_bus_dma_driver_helper.h
 new file mode 100644
-index 000000000000..112aa56ee526
+index 000000000000..96e2d7766623
 --- /dev/null
-+++ b/drivers/virtio/virtio_msg_bus_dma.h
-@@ -0,0 +1,70 @@
++++ b/drivers/virtio/virtio_msg_bus_dma_driver_helper.h
+@@ -0,0 +1,104 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
 + * Virtio message bus DMA helper (Step 1 shell).
@@ -2662,17 +2837,42 @@ index 000000000000..112aa56ee526
 + * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
 + */
 +
-+#ifndef _VIRTIO_MSG_BUS_DMA_H
-+#define _VIRTIO_MSG_BUS_DMA_H
++#ifndef _VIRTIO_MSG_BUS_DMA_DRIVER_HELPER_H
++#define _VIRTIO_MSG_BUS_DMA_DRIVER_HELPER_H
 +
 +#include <linux/dma-mapping.h>
++#include <linux/errno.h>
++#include <uapi/linux/virtio_msg_bus_bridge.h>
 +
 +struct device;
 +struct page;
 +struct sg_table;
 +struct virtio_msg_transport_device;
 +
-+struct virtio_msg_bus_dma_export {
++/*
++ * Provider revoke is unresolved and the backing must remain pinned. Providers
++ * should use this single errno when remote access may still be possible.
++ */
++#define VIRTIO_MSG_BUS_DMA_PROVIDER_REVOKE_IN_PROGRESS	(-EINPROGRESS)
++
++enum virtio_msg_bus_dma_driver_export_type {
++	VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_ONESHOT = 0,
++	VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_POOL_CHUNK,
++};
++
++enum virtio_msg_bus_dma_driver_release_action {
++	VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_IGNORED = 0,
++	VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_RETAINED_IDLE,
++	VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_RETAINED_ACTIVE,
++};
++
++struct virtio_msg_bus_dma_driver_release {
++	enum virtio_msg_bus_dma_driver_release_action action;
++	void *release_ctx;
++	unsigned int active_suballocs;
++};
++
++struct virtio_msg_bus_dma_driver_export {
 +	/*
 +	 * @dma_addr is the bus-visible handle presented to virtio consumers.
 +	 * @local_dma_addr is the delegate-facing backing DMA address used for
@@ -2691,37 +2891,132 @@ index 000000000000..112aa56ee526
 +	unsigned long attrs;
 +	enum dma_data_direction dir;
 +	bool coherent;
++	enum virtio_msg_bus_dma_driver_export_type type;
++	u32 bridge_flags;
++	void *release_ctx;
 +};
 +
-+struct virtio_msg_bus_dma_provider_caps {
++struct virtio_msg_bus_dma_driver_provider_caps {
 +	/* reserved for future capability bits */
 +};
 +
-+struct virtio_msg_bus_dma_provider_ops {
++struct virtio_msg_bus_dma_driver_provider_ops {
 +	/*
 +	 * export_add() may rewrite only @export->dma_addr to the bus-visible
 +	 * value. @export->local_dma_addr and the metadata fields must remain
 +	 * valid backing descriptors.
 +	 */
 +	int (*export_add)(void *ctx,
-+			  struct virtio_msg_bus_dma_export *export,
++			  struct virtio_msg_bus_dma_driver_export *export,
 +			  void **provider_handle, gfp_t gfp);
 +	int (*export_del)(void *ctx,
-+			  const struct virtio_msg_bus_dma_export *export,
++			  const struct virtio_msg_bus_dma_driver_export *export,
 +			  void *provider_handle, bool sync);
 +	int (*query_caps)(void *ctx,
-+			  struct virtio_msg_bus_dma_provider_caps *caps);
++			  struct virtio_msg_bus_dma_driver_provider_caps *caps);
 +};
 +
-+int virtio_msg_bus_dma_install
++int virtio_msg_bus_dma_driver_helper_install
 +		(struct virtio_msg_transport_device *vmdev,
-+		 const struct virtio_msg_bus_dma_provider_ops *provider_ops,
++		 const struct virtio_msg_bus_dma_driver_provider_ops *provider_ops,
 +		 void *provider_ctx);
-+void virtio_msg_bus_dma_cleanup(struct virtio_msg_transport_device *vmdev);
-+bool virtio_msg_bus_dma_is_installed(const struct virtio_msg_transport_device *vmdev);
-+struct device *virtio_msg_bus_dma_delegate_dev(const struct virtio_msg_transport_device *vmdev);
++void virtio_msg_bus_dma_driver_helper_cleanup
++		(struct virtio_msg_transport_device *vmdev);
++bool virtio_msg_bus_dma_driver_helper_is_installed
++		(const struct virtio_msg_transport_device *vmdev);
++struct device *virtio_msg_bus_dma_driver_helper_delegate_dev
++		(const struct virtio_msg_transport_device *vmdev);
++int virtio_msg_bus_dma_export_released
++		(const struct virtio_msg_bus_dma_driver_export *export,
++		 struct virtio_msg_bus_dma_driver_release *release);
 +
-+#endif /* _VIRTIO_MSG_BUS_DMA_H */
++#endif /* _VIRTIO_MSG_BUS_DMA_DRIVER_HELPER_H */
+diff --git a/drivers/virtio/virtio_msg_bus_dma_record.h b/drivers/virtio/virtio_msg_bus_dma_record.h
+new file mode 100644
+index 000000000000..d094c7e384b7
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_dma_record.h
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Virtio message bus DMA helper private xarray utilities.
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#ifndef _VIRTIO_MSG_BUS_DMA_RECORD_H
++#define _VIRTIO_MSG_BUS_DMA_RECORD_H
++
++#include <linux/errno.h>
++#include <linux/gfp.h>
++#include <linux/types.h>
++#include <linux/xarray.h>
++
++static inline int
++virtio_msg_bus_dma_xa_index_from_u64(u64 value, unsigned long *index)
++{
++	unsigned long candidate;
++
++	if (!index)
++		return -EINVAL;
++
++	candidate = (unsigned long)value;
++	if ((u64)candidate != value)
++		return -EOVERFLOW;
++
++	*index = candidate;
++	return 0;
++}
++
++static inline int
++virtio_msg_bus_dma_xa_insert_unique(struct xarray *xa, unsigned long index,
++				    void *entry, gfp_t gfp)
++{
++	int ret;
++
++	ret = xa_insert(xa, index, entry, gfp);
++	if (ret == -EBUSY)
++		return -EEXIST;
++
++	return ret;
++}
++
++static inline int
++virtio_msg_bus_dma_xa_insert_unique_locked(struct xarray *xa,
++					   unsigned long index, void *entry,
++					   gfp_t gfp)
++{
++	int ret;
++
++	ret = __xa_insert(xa, index, entry, gfp);
++	if (ret == -EBUSY)
++		return -EEXIST;
++
++	return ret;
++}
++
++static inline bool
++virtio_msg_bus_dma_xa_erase_if_match(struct xarray *xa, unsigned long index,
++				     const void *entry)
++{
++	if (xa_load(xa, index) != entry)
++		return false;
++
++	return xa_erase(xa, index) == entry;
++}
++
++static inline bool
++virtio_msg_bus_dma_xa_erase_if_match_locked(struct xarray *xa,
++					    unsigned long index,
++					    const void *entry)
++{
++	if (xa_load(xa, index) != entry)
++		return false;
++
++	return __xa_erase(xa, index) == entry;
++}
++
++#endif /* _VIRTIO_MSG_BUS_DMA_RECORD_H */
 -- 
 2.53.0
 

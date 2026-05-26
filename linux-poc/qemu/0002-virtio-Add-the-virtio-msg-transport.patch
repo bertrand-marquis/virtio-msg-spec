@@ -1,10 +1,10 @@
 From c3bc335a8622e780bdc6e30ab4b7813f3c53163d Mon Sep 17 00:00:00 2001
-Message-ID: <c3bc335a8622e780bdc6e30ab4b7813f3c53163d.1776946505.git.bertrand.marquis@arm.com>
-In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
-References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+Message-ID: <c3bc335a8622e780bdc6e30ab4b7813f3c53163d.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
 From: "Edgar E. Iglesias" <edgar.iglesias@amd.com>
 Date: Tue, 26 Aug 2025 20:06:37 +0200
-Subject: [RFC PATCH 02/28] virtio: Add the virtio-msg transport
+Subject: [PATCH 02/30] virtio: Add the virtio-msg transport
 
 Add the new virtio-msg transport together with a framework
 for virtio-msg buses.

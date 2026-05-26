@@ -1,59 +1,60 @@
-From ad92933321d02afa9b7c48875b7fb6b8b8bf5a91 Mon Sep 17 00:00:00 2001
-Message-ID: <ad92933321d02afa9b7c48875b7fb6b8b8bf5a91.1776951067.git.bertrand.marquis@arm.com>
-In-Reply-To: <a4391e0c6a881b60d45c5922dbd9d8fb8675d9f8.1776951067.git.bertrand.marquis@arm.com>
-References: <a4391e0c6a881b60d45c5922dbd9d8fb8675d9f8.1776951067.git.bertrand.marquis@arm.com>
+From 092ff2420d1ba86c6219a0e8ce66a3a5eb63de57 Mon Sep 17 00:00:00 2001
+Message-ID: <092ff2420d1ba86c6219a0e8ce66a3a5eb63de57.1779811422.git.bertrand.marquis@arm.com>
+In-Reply-To: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+References: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
 From: Bertrand Marquis <bertrand.marquis@arm.com>
-Date: Thu, 23 Apr 2026 14:49:19 +0200
-Subject: [RFC PATCH 4/4] virtio_msg: add virtio message loopback
+Date: Mon, 27 Apr 2026 14:10:22 +0200
+Subject: [PATCH 06/12] virtio_msg: add virtio message loopback
 
-Add loopback bridge and transport support on top of the generic
-virtio-msg transport, bridge, and DMA helper layers.
+Add the loopback transport and bridge provider with relay dispatch, deferred event delivery, and map window lifecycle handling.
 
-Land the final loopback-side contract adjustments directly in this patch
-so cleanup, relay ownership, and bridge-facing endpoint behavior match
-the rewritten generic bridge contract without depending on later FF-A
-fixups.
+The loopback provider is useful for exercising the virtio message transport and bridge paths without an external FF-A endpoint.
 
 Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
 ---
- drivers/virtio/Kconfig                        |    9 +
+ drivers/virtio/Kconfig                        |   14 +
  drivers/virtio/Makefile                       |    3 +
- drivers/virtio/virtio_msg_loopback_bridge.c   | 2674 +++++++++++++++++
- drivers/virtio/virtio_msg_loopback_internal.h |  251 ++
- .../virtio/virtio_msg_loopback_transport.c    |  812 +++++
- 5 files changed, 3749 insertions(+)
+ drivers/virtio/virtio_msg_loopback_bridge.c   | 2911 +++++++++++++++++
+ drivers/virtio/virtio_msg_loopback_priv.h     |  245 ++
+ .../virtio/virtio_msg_loopback_transport.c    |  680 ++++
+ 5 files changed, 3853 insertions(+)
  create mode 100644 drivers/virtio/virtio_msg_loopback_bridge.c
- create mode 100644 drivers/virtio/virtio_msg_loopback_internal.h
+ create mode 100644 drivers/virtio/virtio_msg_loopback_priv.h
  create mode 100644 drivers/virtio/virtio_msg_loopback_transport.c
 
 diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
-index 4a269d619976..e14ca2297f42 100644
+index fd4bce22cd6e..b0bf3388be53 100644
 --- a/drivers/virtio/Kconfig
 +++ b/drivers/virtio/Kconfig
-@@ -186,6 +186,15 @@ config VIRTIO_MSG_BRIDGE
- 	  This enables the provisional Linux-to-userspace bridge scaffolding
- 	  for /dev/virtio-msg-bridge.
+@@ -200,6 +200,20 @@ config VIRTIO_MSG_BUS_DMA_DEVICE_HELPER
+ 	tristate
+ 	depends on VIRTIO_MSG_BRIDGE
  
 +config VIRTIO_MSG_LOOPBACK
 +	tristate "Virtio message loopback scaffold"
-+	depends on VIRTIO_MSG_TRANSPORT && VIRTIO_MSG_BRIDGE
++	depends on VIRTIO_MSG_TRANSPORT
++	depends on VIRTIO_MSG_BRIDGE
++	depends on HAS_DMA
++	select VIRTIO_MSG_BUS_QUEUE_HELPER
++	select VIRTIO_MSG_BUS_DMA_DRIVER_HELPER
++	select VIRTIO_MSG_BUS_DMA_DEVICE_HELPER
 +	help
-+	  This enables a minimal in-kernel loopback base scaffold that wires
-+	  virtio-msg transport-provider and bridge-endpoint objects through
-+	  public contracts only. Relay, map/mmap, and event data paths remain
-+	  deferred to later steps.
++	  This enables an in-kernel loopback provider that wires virtio-msg
++	  transport-provider and bridge-endpoint objects through public
++	  contracts only. Relay request/response, map/mmap, map-event, and
++	  transport event paths are implemented for bridge integration testing.
 +
  config VIRTIO_DMA_SHARED_BUFFER
  	tristate
  	depends on DMA_SHARED_BUFFER
 diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
-index cba87c5bdc38..f2af72908675 100644
+index 011b557f04ac..a688d5c657eb 100644
 --- a/drivers/virtio/Makefile
 +++ b/drivers/virtio/Makefile
-@@ -7,6 +7,9 @@ obj-$(CONFIG_VIRTIO_MMIO) += virtio_mmio.o
- obj-$(CONFIG_VIRTIO_MSG_TRANSPORT) += virtio_msg_transport.o
- obj-$(CONFIG_VIRTIO_MSG_TRANSPORT) += virtio_msg_bus_dma.o
+@@ -9,6 +9,9 @@ obj-$(CONFIG_VIRTIO_MSG_BUS_QUEUE_HELPER) += virtio_msg_bus_queue_helper.o
+ obj-$(CONFIG_VIRTIO_MSG_BUS_DMA_DRIVER_HELPER) += virtio_msg_bus_dma_driver_helper.o
  obj-$(CONFIG_VIRTIO_MSG_BRIDGE) += virtio_msg_bus_bridge_device.o
+ obj-$(CONFIG_VIRTIO_MSG_BUS_DMA_DEVICE_HELPER) += virtio_msg_bus_dma_device_helper.o
 +obj-$(CONFIG_VIRTIO_MSG_LOOPBACK) += virtio_msg_loopback.o
 +virtio_msg_loopback-y := virtio_msg_loopback_transport.o \
 +			 virtio_msg_loopback_bridge.o
@@ -62,10 +63,10 @@ index cba87c5bdc38..f2af72908675 100644
  virtio_pci-$(CONFIG_VIRTIO_PCI_LEGACY) += virtio_pci_legacy.o
 diff --git a/drivers/virtio/virtio_msg_loopback_bridge.c b/drivers/virtio/virtio_msg_loopback_bridge.c
 new file mode 100644
-index 000000000000..7ae8f0419522
+index 000000000000..3abebaf8e1db
 --- /dev/null
 +++ b/drivers/virtio/virtio_msg_loopback_bridge.c
-@@ -0,0 +1,2674 @@
+@@ -0,0 +1,2911 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Virtio message loopback bridge base scaffold.
@@ -75,7 +76,6 @@ index 000000000000..7ae8f0419522
 +
 +#define pr_fmt(fmt) "virtio-msg-loopback: " fmt
 +
-+#include <linux/delay.h>
 +#include <linux/kernel.h>
 +#include <linux/jiffies.h>
 +#include <linux/mm.h>
@@ -83,28 +83,7 @@ index 000000000000..7ae8f0419522
 +#include <linux/string.h>
 +#include <linux/vmalloc.h>
 +
-+#include "virtio_msg_loopback_internal.h"
-+#define VM_LOG_COMPONENT VM_LOG_COMPONENT_LOOPBACK
-+#include "virtio_msg_debug.h"
-+
-+enum virtio_msg_loopback_origin {
-+	VIRTIO_MSG_LOOPBACK_ORIGIN_BRIDGE = 0,
-+	VIRTIO_MSG_LOOPBACK_ORIGIN_TRANSPORT_REQUEST,
-+	VIRTIO_MSG_LOOPBACK_ORIGIN_TRANSPORT_EVENT,
-+};
-+
-+static enum virtio_msg_loopback_origin
-+virtio_msg_loopback_origin_classify(const struct virtio_msg_dispatch_ctx *dctx)
-+{
-+	if (!dctx)
-+		return VIRTIO_MSG_LOOPBACK_ORIGIN_BRIDGE;
-+	if (dctx->flags & VIRTIO_MSG_DISPATCH_F_REQUEST_SLEEPABLE)
-+		return VIRTIO_MSG_LOOPBACK_ORIGIN_TRANSPORT_REQUEST;
-+	if (dctx->flags & VIRTIO_MSG_DISPATCH_F_NONBLOCK)
-+		return VIRTIO_MSG_LOOPBACK_ORIGIN_TRANSPORT_EVENT;
-+
-+	return VIRTIO_MSG_LOOPBACK_ORIGIN_BRIDGE;
-+}
++#include "virtio_msg_loopback_priv.h"
 +
 +static int
 +virtio_msg_loopback_validate_slot_dev_num(const struct virtio_msg *msg)
@@ -151,72 +130,12 @@ index 000000000000..7ae8f0419522
 +}
 +
 +static int
-+virtio_msg_loopback_relay_pending_retry_status
-+	(struct virtio_msg_loopback *loopback,
-+	 const struct virtio_msg_dispatch_ctx *dctx)
-+{
-+	struct virtio_msg_loopback_relay_pending *pending;
-+	unsigned long key;
-+	int ret = 0;
-+
-+	if (!loopback || !dctx || !dctx->relay_seq)
-+		return -EINVAL;
-+
-+	key = (unsigned long)dctx->relay_seq;
-+
-+	mutex_lock(&loopback->pending_lock);
-+	pending = xa_load(&loopback->pending_relay_xa, key);
-+	if (!pending)
-+		ret = -ESHUTDOWN;
-+	else if (time_after_eq(jiffies, pending->deadline))
-+		ret = -ETIMEDOUT;
-+	mutex_unlock(&loopback->pending_lock);
-+
-+	return ret;
-+}
-+
-+static int
-+virtio_msg_loopback_pending_complete_timeout
-+	(struct virtio_msg_loopback *loopback,
-+	 const struct virtio_msg_dispatch_ctx *dctx)
-+{
-+	struct virtio_msg_loopback_relay_pending *pending;
-+	unsigned long key;
-+
-+	if (!loopback || !dctx || !dctx->relay_seq)
-+		return -EINVAL;
-+
-+	key = (unsigned long)dctx->relay_seq;
-+
-+	mutex_lock(&loopback->pending_lock);
-+	pending = xa_erase(&loopback->pending_relay_xa, key);
-+	if (!pending) {
-+		mutex_unlock(&loopback->pending_lock);
-+		return -ENOENT;
-+	}
-+
-+	virtio_msg_loopback_pending_get(pending);
-+	pending->status = -ETIMEDOUT;
-+	pending->timed_out = true;
-+	pending->completed = true;
-+	mutex_unlock(&loopback->pending_lock);
-+
-+	complete(&pending->done);
-+	virtio_msg_loopback_pending_put(pending);
-+
-+	return 0;
-+}
-+
-+static int
 +virtio_msg_loopback_relay_to_userspace_sleepable(struct virtio_msg_loopback *loopback,
 +						 const struct virtio_msg *msg,
 +						 u16 msg_size,
 +						 const struct virtio_msg_dispatch_ctx *dctx)
 +{
-+	u16 token;
-+	u16 dev_num;
 +	u32 handle;
-+	int ret;
 +
 +	if (!loopback || !msg || msg_size < sizeof(*msg) || !dctx)
 +		return -EINVAL;
@@ -225,36 +144,7 @@ index 000000000000..7ae8f0419522
 +	if (!handle)
 +		return -ENODEV;
 +
-+	dev_num = le16_to_cpu(msg->dev_num);
-+	token = le16_to_cpu(msg->token);
-+
-+	for (;;) {
-+		ret = virtio_msg_bus_bridge_device_publish_rx(handle, msg);
-+		if (ret != -ENOSPC)
-+			return ret;
-+
-+		ret = virtio_msg_loopback_relay_pending_retry_status(loopback, dctx);
-+		if (ret == -ETIMEDOUT) {
-+			ret = virtio_msg_bus_bridge_device_relay_drop(handle, dev_num,
-+								      token);
-+			if (ret && ret != -ENODEV && ret != -ENOTCONN)
-+				return ret;
-+
-+			ret = virtio_msg_loopback_pending_complete_timeout
-+				(loopback, dctx);
-+			if (ret == -ENOENT)
-+				return -ESHUTDOWN;
-+
-+			return ret;
-+		}
-+		if (ret)
-+			return ret;
-+
-+		msleep(VIRTIO_MSG_LOOPBACK_RELAY_RETRY_DELAY_MS);
-+		handle = READ_ONCE(loopback->bridge.endpoint.handle);
-+		if (!handle)
-+			return -ENODEV;
-+	}
++	return virtio_msg_bus_bridge_device_publish_rx(handle, msg);
 +}
 +
 +static int
@@ -271,31 +161,20 @@ index 000000000000..7ae8f0419522
 +}
 +
 +static int
-+virtio_msg_loopback_map_id_to_index(u64 map_id, unsigned long *index)
++virtio_msg_loopback_relay_event_to_userspace_sleepable
++	(struct virtio_msg_loopback *loopback, const struct virtio_msg *msg,
++	 u16 msg_size)
 +{
-+	if (!map_id || !index)
-+		return -EINVAL;
-+	if (map_id > (u64)ULONG_MAX)
-+		return -EOVERFLOW;
++	u32 handle;
 +
-+	*index = (unsigned long)map_id;
-+	return 0;
-+}
-+
-+static int
-+virtio_msg_loopback_map_offset_to_index(u64 mmap_offset, unsigned long *index)
-+{
-+	u64 shifted;
-+
-+	if (!index || !PAGE_ALIGNED(mmap_offset))
++	if (!loopback || !msg || msg_size < sizeof(*msg))
 +		return -EINVAL;
 +
-+	shifted = mmap_offset >> PAGE_SHIFT;
-+	if (!shifted || shifted > (u64)ULONG_MAX)
-+		return -EOVERFLOW;
++	handle = READ_ONCE(loopback->bridge.endpoint.handle);
++	if (!handle)
++		return -ENODEV;
 +
-+	*index = (unsigned long)shifted;
-+	return 0;
++	return virtio_msg_bus_bridge_device_publish_rx(handle, msg);
 +}
 +
 +static int
@@ -308,34 +187,6 @@ index 000000000000..7ae8f0419522
 +
 +	*index = (unsigned long)dma_addr;
 +	return 0;
-+}
-+
-+static struct virtio_msg_loopback_page_window *
-+virtio_msg_loopback_page_window_lookup_by_id_locked(struct virtio_msg_loopback *loopback,
-+						    u64 map_id)
-+{
-+	unsigned long index;
-+
-+	lockdep_assert_held(&loopback->area_lock);
-+
-+	if (virtio_msg_loopback_map_id_to_index(map_id, &index))
-+		return NULL;
-+
-+	return xa_load(&loopback->map_area_xa_by_id, index);
-+}
-+
-+static struct virtio_msg_loopback_page_window *
-+virtio_msg_loopback_page_window_lookup_by_offset_locked(struct virtio_msg_loopback *loopback,
-+							u64 mmap_offset)
-+{
-+	unsigned long index;
-+
-+	lockdep_assert_held(&loopback->area_lock);
-+
-+	if (virtio_msg_loopback_map_offset_to_index(mmap_offset, &index))
-+		return NULL;
-+
-+	return xa_load(&loopback->map_area_xa_by_offset, index);
 +}
 +
 +static struct virtio_msg_loopback_page_window *
@@ -377,7 +228,6 @@ index 000000000000..7ae8f0419522
 +					     struct virtio_msg_loopback_page_window *window)
 +{
 +	unsigned long bus_index;
-+	unsigned long offset_index;
 +	int ret;
 +
 +	lockdep_assert_held(&loopback->area_lock);
@@ -387,22 +237,8 @@ index 000000000000..7ae8f0419522
 +	if (ret)
 +		return ret;
 +
-+	ret = virtio_msg_loopback_map_offset_to_index(window->mmap_offset,
-+						      &offset_index);
-+	if (ret)
-+		return ret;
-+
-+	ret = xa_err(xa_store(&loopback->map_area_xa_by_dma_addr, bus_index,
-+			      window, GFP_KERNEL));
-+	if (ret)
-+		return ret;
-+
-+	ret = xa_err(xa_store(&loopback->map_area_xa_by_offset, offset_index,
-+			      window, GFP_KERNEL));
-+	if (ret)
-+		xa_erase(&loopback->map_area_xa_by_dma_addr, bus_index);
-+
-+	return ret;
++	return xa_err(xa_store(&loopback->map_area_xa_by_dma_addr, bus_index,
++			       window, GFP_KERNEL));
 +}
 +
 +static void
@@ -411,21 +247,6 @@ index 000000000000..7ae8f0419522
 +{
 +	lockdep_assert_held(&loopback->exact_lock);
 +	list_add_tail(&exact->node, &loopback->exact_exports);
-+}
-+
-+static void
-+virtio_msg_loopback_page_window_index_id_locked(struct virtio_msg_loopback *loopback,
-+						struct virtio_msg_loopback_page_window *window)
-+{
-+	unsigned long id_index;
-+
-+	lockdep_assert_held(&loopback->area_lock);
-+
-+	if (virtio_msg_loopback_map_id_to_index(window->map_id, &id_index))
-+		return;
-+
-+	(void)xa_store(&loopback->map_area_xa_by_id, id_index, window,
-+		       GFP_KERNEL);
 +}
 +
 +/* Forward declaration — defined after page_window_alloc_multi. */
@@ -461,19 +282,11 @@ index 000000000000..7ae8f0419522
 +virtio_msg_loopback_page_window_remove_locked(struct virtio_msg_loopback *loopback,
 +					      struct virtio_msg_loopback_page_window *window)
 +{
-+	unsigned long id_index;
-+	unsigned long offset_index;
-+
 +	lockdep_assert_held(&loopback->area_lock);
 +
 +	if (!window)
 +		return;
 +
-+	if (!virtio_msg_loopback_map_id_to_index(window->map_id, &id_index))
-+		xa_erase(&loopback->map_area_xa_by_id, id_index);
-+	if (!virtio_msg_loopback_map_offset_to_index(window->mmap_offset,
-+						     &offset_index))
-+		xa_erase(&loopback->map_area_xa_by_offset, offset_index);
 +	virtio_msg_loopback_page_window_unindex_bus_addr_locked(loopback, window);
 +}
 +
@@ -508,27 +321,9 @@ index 000000000000..7ae8f0419522
 +}
 +
 +static void
-+virtio_msg_loopback_page_window_clear_id_locked
-+	(struct virtio_msg_loopback *loopback,
-+	 struct virtio_msg_loopback_page_window *window)
-+{
-+	unsigned long id_index;
-+
-+	lockdep_assert_held(&loopback->area_lock);
-+
-+	if (!window || !window->map_id)
-+		return;
-+
-+	if (!virtio_msg_loopback_map_id_to_index(window->map_id, &id_index))
-+		xa_erase(&loopback->map_area_xa_by_id, id_index);
-+
-+	window->map_id = 0;
-+}
-+
-+static void
 +virtio_msg_loopback_page_window_prepare_add_locked
 +	(struct virtio_msg_loopback *loopback,
-+	 struct virtio_msg_loopback_page_window *window, bool async_activate)
++	 struct virtio_msg_loopback_page_window *window)
 +{
 +	lockdep_assert_held(&loopback->area_lock);
 +
@@ -538,7 +333,6 @@ index 000000000000..7ae8f0419522
 +	reinit_completion(&window->map_add_done);
 +	window->map_add_status = 0;
 +	window->map_add_settled = false;
-+	window->map_add_async = async_activate;
 +}
 +
 +static int
@@ -555,67 +349,55 @@ index 000000000000..7ae8f0419522
 +	return window->map_add_status;
 +}
 +
-+static void virtio_msg_loopback_exact_activate_workfn(struct work_struct *work);
++static void virtio_msg_loopback_exact_cleanup_workfn(struct work_struct *work);
 +
 +static void
-+virtio_msg_loopback_exact_queue_activate(struct virtio_msg_loopback *loopback,
-+					 struct virtio_msg_loopback_exact_export *exact)
++virtio_msg_loopback_exact_queue_cleanup(struct virtio_msg_loopback *loopback,
++					struct virtio_msg_loopback_exact_export *exact)
 +{
 +	unsigned long flags;
-+	bool requeue = false;
 +	bool take_ref = false;
 +
-+	if (!loopback || !loopback->exact_wq || !exact)
++	if (!loopback || !loopback->exact_cleanup_wq || !exact)
 +		return;
 +
 +	spin_lock_irqsave(&loopback->exact_lock, flags);
-+	if (!exact->activate_ref_held) {
-+		exact->activate_ref_held = true;
++	if (!exact->cleanup_ref_held) {
++		exact->cleanup_ref_held = true;
 +		take_ref = true;
-+	} else if (exact->activate_running) {
-+		exact->activate_requeue = true;
-+		requeue = true;
 +	}
 +	spin_unlock_irqrestore(&loopback->exact_lock, flags);
-+
-+	if (requeue) {
-+		(void)mod_delayed_work(loopback->exact_wq, &exact->activate_work,
-+				       0);
-+		return;
-+	}
 +
 +	if (!take_ref)
 +		return;
 +
 +	virtio_msg_loopback_exact_get(exact);
-+	if (!queue_delayed_work(loopback->exact_wq, &exact->activate_work, 0)) {
++	if (!queue_delayed_work(loopback->exact_cleanup_wq,
++				&exact->cleanup_work, 0)) {
 +		spin_lock_irqsave(&loopback->exact_lock, flags);
-+		exact->activate_ref_held = false;
-+		exact->activate_requeue = false;
++		exact->cleanup_ref_held = false;
 +		spin_unlock_irqrestore(&loopback->exact_lock, flags);
 +		virtio_msg_loopback_exact_put(exact);
 +	}
 +}
 +
 +static void
-+virtio_msg_loopback_exact_cancel_activate(struct virtio_msg_loopback *loopback,
-+					  struct virtio_msg_loopback_exact_export *exact)
++virtio_msg_loopback_exact_cancel_cleanup(struct virtio_msg_loopback *loopback,
++					 struct virtio_msg_loopback_exact_export *exact)
 +{
 +	unsigned long flags;
 +	bool drop_ref = false;
 +
-+	if (!loopback || !loopback->exact_wq || !exact)
++	if (!loopback || !loopback->exact_cleanup_wq || !exact)
 +		return;
 +
-+	cancel_delayed_work_sync(&exact->activate_work);
++	cancel_delayed_work_sync(&exact->cleanup_work);
 +
 +	spin_lock_irqsave(&loopback->exact_lock, flags);
-+	if (exact->activate_ref_held) {
-+		exact->activate_ref_held = false;
++	if (exact->cleanup_ref_held) {
++		exact->cleanup_ref_held = false;
 +		drop_ref = true;
 +	}
-+	exact->activate_running = false;
-+	exact->activate_requeue = false;
 +	spin_unlock_irqrestore(&loopback->exact_lock, flags);
 +
 +	if (drop_ref)
@@ -624,7 +406,7 @@ index 000000000000..7ae8f0419522
 +
 +static struct virtio_msg_loopback_exact_export *
 +virtio_msg_loopback_exact_export_alloc_validated
-+	(const struct virtio_msg_bus_dma_export *provider_export,
++	(const struct virtio_msg_bus_dma_driver_export *provider_export,
 +	 gfp_t gfp)
 +{
 +	struct virtio_msg_loopback_exact_export *exact;
@@ -644,11 +426,9 @@ index 000000000000..7ae8f0419522
 +	INIT_LIST_HEAD(&exact->node);
 +	refcount_set(&exact->refs, 1);
 +	WRITE_ONCE(exact->dead, false);
-+	exact->activate_ref_held = false;
-+	exact->activate_running = false;
-+	exact->activate_requeue = false;
-+	INIT_DELAYED_WORK(&exact->activate_work,
-+			  virtio_msg_loopback_exact_activate_workfn);
++	exact->cleanup_ref_held = false;
++	INIT_DELAYED_WORK(&exact->cleanup_work,
++			  virtio_msg_loopback_exact_cleanup_workfn);
 +	exact->num_page_windows = provider_export->npages;
 +	exact->page_windows = kcalloc(exact->num_page_windows,
 +				      sizeof(*exact->page_windows), gfp);
@@ -695,7 +475,7 @@ index 000000000000..7ae8f0419522
 +static int
 +virtio_msg_loopback_page_window_init_dma_mmap
 +	(struct virtio_msg_loopback_page_window *window,
-+	 const struct virtio_msg_bus_dma_export *provider_export,
++	 const struct virtio_msg_bus_dma_driver_export *provider_export,
 +	 unsigned int page_index)
 +{
 +	u64 dma_base;
@@ -723,10 +503,28 @@ index 000000000000..7ae8f0419522
 +	return 0;
 +}
 +
++static u32
++virtio_msg_loopback_page_window_map_flags
++	(const struct virtio_msg_bus_dma_driver_export *provider_export)
++{
++	u32 flags = 0;
++
++	if (!provider_export)
++		return 0;
++
++	if (provider_export->bridge_flags &
++	    VIRTIO_MSG_BUS_BRIDGE_MAP_F_RETENTION_REQUESTED)
++		flags |= VIRTIO_MSG_BUS_BRIDGE_MAP_F_RETENTION_REQUESTED;
++	if (provider_export->coherent)
++		flags |= VIRTIO_MSG_BUS_BRIDGE_MAP_F_RETENTION_REQUESTED;
++
++	return flags;
++}
++
 +static struct virtio_msg_loopback_page_window *
 +virtio_msg_loopback_page_window_alloc
 +	(struct page *page, u64 bus_addr,
-+	 const struct virtio_msg_bus_dma_export *provider_export,
++	 const struct virtio_msg_bus_dma_driver_export *provider_export,
 +	 unsigned int page_index)
 +{
 +	struct virtio_msg_loopback_page_window *window;
@@ -745,6 +543,8 @@ index 000000000000..7ae8f0419522
 +	window->bus_addr = bus_addr;
 +	window->length = PAGE_SIZE;
 +	window->npages = 1;
++	window->map_flags =
++		virtio_msg_loopback_page_window_map_flags(provider_export);
 +	window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY;
 +	ret = virtio_msg_loopback_page_window_init_dma_mmap(window,
 +							    provider_export,
@@ -776,7 +576,7 @@ index 000000000000..7ae8f0419522
 +static struct virtio_msg_loopback_page_window *
 +virtio_msg_loopback_page_window_alloc_multi(struct page **pages,
 +					    unsigned int npages, u64 bus_addr,
-+					    const struct virtio_msg_bus_dma_export
++					    const struct virtio_msg_bus_dma_driver_export
 +						    *provider_export)
 +{
 +	struct virtio_msg_loopback_page_window *window;
@@ -795,6 +595,8 @@ index 000000000000..7ae8f0419522
 +	window->bus_addr = bus_addr;
 +	window->length = (u64)npages * PAGE_SIZE;
 +	window->npages = npages;
++	window->map_flags =
++		virtio_msg_loopback_page_window_map_flags(provider_export);
 +	window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY;
 +	ret = virtio_msg_loopback_page_window_init_dma_mmap(window,
 +							    provider_export, 0);
@@ -815,30 +617,18 @@ index 000000000000..7ae8f0419522
 +}
 +
 +/*
-+ * Register a multi-page window in both XArrays: one mmap_offset entry and one
-+ * bus_addr entry per page in the window's range.  On failure, all entries
-+ * already stored are rolled back.
++ * Register one bus_addr entry per page in the window's range.  On failure,
++ * all entries already stored are rolled back.
 + */
 +static int
 +virtio_msg_loopback_page_window_track_multi_locked
 +	(struct virtio_msg_loopback *loopback,
 +	 struct virtio_msg_loopback_page_window *window)
 +{
-+	unsigned long offset_index;
 +	unsigned int i;
 +	int ret;
 +
 +	lockdep_assert_held(&loopback->area_lock);
-+
-+	ret = virtio_msg_loopback_map_offset_to_index(window->mmap_offset,
-+						      &offset_index);
-+	if (ret)
-+		return ret;
-+
-+	ret = xa_err(xa_store(&loopback->map_area_xa_by_offset, offset_index,
-+			      window, GFP_KERNEL));
-+	if (ret)
-+		return ret;
 +
 +	for (i = 0; i < window->npages; i++) {
 +		unsigned long bus_index;
@@ -873,7 +663,6 @@ index 000000000000..7ae8f0419522
 +							       &bus_index))
 +			xa_erase(&loopback->map_area_xa_by_dma_addr, bus_index);
 +	}
-+	xa_erase(&loopback->map_area_xa_by_offset, offset_index);
 +	return ret;
 +}
 +
@@ -921,30 +710,17 @@ index 000000000000..7ae8f0419522
 +virtio_msg_loopback_bridge_exact_unpublish(struct virtio_msg_loopback *loopback,
 +					   struct virtio_msg_loopback_exact_export *exact)
 +{
-+	struct virtio_msg_loopback_slot *slot;
 +	unsigned long flags;
-+	bool release_gate = false;
 +
 +	if (!loopback || !exact)
 +		return;
 +
 +	spin_lock_irqsave(&loopback->exact_lock, flags);
 +	(void)virtio_msg_loopback_exact_export_untrack_locked(loopback, exact);
-+	slot = exact->slot;
-+	if (exact->gate_held) {
-+		exact->gate_held = false;
-+		release_gate = true;
-+	}
 +	spin_unlock_irqrestore(&loopback->exact_lock, flags);
-+	vm_trace(NULL,
-+		 "unpublish export: dma=%#llx len=%#llx async=%u gate_release=%u\n",
-+			(unsigned long long)exact->provider_export.dma_addr,
-+			(unsigned long long)exact->provider_export.length,
-+			exact->async_activate, release_gate);
-+
-+	if (release_gate && slot &&
-+	    atomic_dec_and_test(&slot->pending_async_exports))
-+		(void)mod_delayed_work(system_wq, &slot->deferred_event_work, 0);
++	pr_debug("unpublish export: dma=%#llx len=%#llx\n",
++		 (unsigned long long)exact->provider_export.dma_addr,
++			(unsigned long long)exact->provider_export.length);
 +}
 +
 +static bool
@@ -978,6 +754,31 @@ index 000000000000..7ae8f0419522
 +	       window;
 +}
 +
++static bool
++virtio_msg_loopback_page_window_mmap_allowed_locked
++	(struct virtio_msg_loopback *loopback,
++	 struct virtio_msg_loopback_page_window *window,
++	 const struct virtio_msg_bus_dma_device_map_info *map)
++{
++	lockdep_assert_held(&loopback->area_lock);
++
++	if (!window || !map)
++		return false;
++	if (map->state != VIRTIO_MSG_BUS_DMA_DEVICE_MAP_ADD_QUEUED &&
++	    map->state != VIRTIO_MSG_BUS_DMA_DEVICE_MAP_ACTIVE)
++		return false;
++	if (window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY &&
++	    window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_ACTIVE)
++		return false;
++	if (!virtio_msg_loopback_page_window_is_tracked_locked(loopback,
++							       window))
++		return false;
++	if (!window->dma_mmap && !window->kva)
++		return false;
++
++	return true;
++}
++
 +/*
 + * Fast path for physically-contiguous all-new pages: create one multi-page
 + * window covering the entire export and issue a single MAP_EVENT_ADD instead
@@ -990,7 +791,7 @@ index 000000000000..7ae8f0419522
 +virtio_msg_loopback_attach_multi_page_window_locked
 +	(struct virtio_msg_loopback *loopback,
 +	 struct virtio_msg_loopback_exact_export *exact,
-+	 const struct virtio_msg_bus_dma_export *provider_export)
++	 const struct virtio_msg_bus_dma_driver_export *provider_export)
 +{
 +	struct virtio_msg_loopback_page_window *window;
 +	u64 bus_addr = provider_export->dma_addr - provider_export->page_offset;
@@ -1043,7 +844,7 @@ index 000000000000..7ae8f0419522
 +virtio_msg_loopback_exact_export_attach_page_windows_locked
 +	(struct virtio_msg_loopback *loopback,
 +	 struct virtio_msg_loopback_exact_export *exact,
-+	 const struct virtio_msg_bus_dma_export *provider_export)
++	 const struct virtio_msg_bus_dma_driver_export *provider_export)
 +{
 +	u64 bus_addr = provider_export->dma_addr - provider_export->page_offset;
 +	unsigned int i;
@@ -1091,6 +892,7 @@ index 000000000000..7ae8f0419522
 +		struct virtio_msg_loopback_page_window *window;
 +		u64 *mmap_offset;
 +		u64 window_bus_addr;
++		u32 map_flags;
 +		int ret;
 +
 +		if (!provider_export->pages[i])
@@ -1098,12 +900,18 @@ index 000000000000..7ae8f0419522
 +		if (check_add_overflow(bus_addr, (u64)i * PAGE_SIZE,
 +				       &window_bus_addr))
 +			return -EOVERFLOW;
++		map_flags =
++			virtio_msg_loopback_page_window_map_flags(provider_export);
 +
 +		window = virtio_msg_loopback_page_window_lookup_by_bus_addr_locked
 +			(loopback, window_bus_addr);
 +		if (window) {
-+			if (window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_ACTIVE)
++			if (window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_ACTIVE &&
++			    window->state !=
++				    VIRTIO_MSG_LOOPBACK_MAP_STATE_REMOTE_RELEASED)
 +				return -EBUSY;
++			if (window->map_flags != map_flags)
++				return -EINVAL;
 +			/*
 +			 * For multi-page windows the bus_addr lookup already
 +			 * proves correctness; only check identity for single-page
@@ -1168,9 +976,8 @@ index 000000000000..7ae8f0419522
 +
 +		window->owner_count--;
 +		if (!window->owner_count)
-+			vm_trace(NULL,
-+				 "owner drop: bus=%#llx len=%#llx map_id=%#llx state=%u\n",
-+					(unsigned long long)window->bus_addr,
++			pr_debug("owner drop: bus=%#llx len=%#llx map_id=%#llx state=%u\n",
++				 (unsigned long long)window->bus_addr,
 +					(unsigned long long)window->length,
 +					(unsigned long long)window->map_id,
 +					window->state);
@@ -1213,9 +1020,8 @@ index 000000000000..7ae8f0419522
 +		(window, VIRTIO_MSG_LOOPBACK_RELAY_TIMEOUT_MS);
 +	*ret_sync = ret;
 +	if (!*ret_sync)
-+		vm_trace(NULL,
-+			 "%s: map_id=%#llx bus=%#llx len=%#llx status=%d\n",
-+				label,
++		pr_debug("%s: map_id=%#llx bus=%#llx len=%#llx status=%d\n",
++			 label,
 +				(unsigned long long)map_id,
 +				(unsigned long long)bus_addr,
 +				(unsigned long long)length, ret);
@@ -1233,6 +1039,171 @@ index 000000000000..7ae8f0419522
 +	virtio_msg_loopback_page_window_remove_locked(loopback, window);
 +}
 +
++struct virtio_msg_loopback_page_window_action {
++	u64 map_id;
++	u64 bus_addr;
++	u64 length;
++	enum virtio_msg_loopback_map_state old_state;
++	bool send_del_req;
++	bool drop_window;
++	bool wait_revoke;
++};
++
++static void
++virtio_msg_loopback_page_window_action_init
++	(struct virtio_msg_loopback_page_window_action *action,
++	 struct virtio_msg_loopback_page_window *window)
++{
++	memset(action, 0, sizeof(*action));
++	if (!window)
++		return;
++
++	action->map_id = window->map_id;
++	action->bus_addr = window->bus_addr;
++	action->length = window->length;
++	action->old_state = window->state;
++}
++
++static bool
++virtio_msg_loopback_page_window_begin_add_locked
++	(struct virtio_msg_loopback *loopback,
++	 struct virtio_msg_loopback_page_window *window)
++{
++	lockdep_assert_held(&loopback->area_lock);
++
++	if (!window->owner_count ||
++	    (window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY &&
++	     window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_REMOTE_RELEASED) ||
++	    window->map_id ||
++	    !virtio_msg_loopback_page_window_is_tracked_locked(loopback, window))
++		return false;
++
++	window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY;
++	virtio_msg_loopback_page_window_prepare_add_locked(loopback, window);
++	return true;
++}
++
++static int
++virtio_msg_loopback_page_window_record_map_id_locked
++	(struct virtio_msg_loopback *loopback,
++	 struct virtio_msg_loopback_page_window *window, u64 map_id)
++{
++	lockdep_assert_held(&loopback->area_lock);
++
++	if (!window || !map_id)
++		return -EINVAL;
++	if (window->map_id && window->map_id != map_id)
++		return -ESTALE;
++	if (!virtio_msg_loopback_page_window_is_tracked_locked(loopback, window))
++		return -ESTALE;
++
++	window->map_id = map_id;
++	return 0;
++}
++
++static void
++virtio_msg_loopback_page_window_add_ack_ok_locked
++	(struct virtio_msg_loopback *loopback,
++	 struct virtio_msg_loopback_page_window *window)
++{
++	lockdep_assert_held(&loopback->area_lock);
++
++	if (window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY)
++		return;
++
++	if (window->del_req_queued) {
++		window->del_req_queued = false;
++		window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING;
++		virtio_msg_loopback_page_window_unindex_bus_addr_locked
++			(loopback, window);
++	} else {
++		window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_ACTIVE;
++	}
++	virtio_msg_loopback_page_window_settle_add_locked(loopback, window, 0);
++}
++
++static bool
++virtio_msg_loopback_page_window_begin_revoke_locked
++	(struct virtio_msg_loopback *loopback,
++	 struct virtio_msg_loopback_page_window *window, bool wait,
++	 u32 handle, struct virtio_msg_loopback_page_window_action *action)
++{
++	lockdep_assert_held(&loopback->area_lock);
++
++	virtio_msg_loopback_page_window_action_init(action, window);
++	action->wait_revoke = wait;
++
++	if (window->owner_count)
++		return false;
++
++	if (window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING ||
++	    window->del_req_queued)
++		return true;
++
++	if (!virtio_msg_loopback_page_window_is_tracked_locked(loopback, window))
++		return false;
++
++	if (!handle || !window->map_id) {
++		virtio_msg_loopback_page_window_remove_terminal_locked(loopback,
++								       window, 0);
++		action->drop_window = true;
++		return true;
++	}
++
++	action->send_del_req = true;
++	if (window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY) {
++		window->del_req_queued = true;
++		return true;
++	}
++
++	window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING;
++	virtio_msg_loopback_page_window_unindex_bus_addr_locked(loopback,
++								window);
++	return true;
++}
++
++static bool
++virtio_msg_loopback_page_window_finish_revoke_req_locked
++	(struct virtio_msg_loopback *loopback,
++	 struct virtio_msg_loopback_page_window *window, int status)
++{
++	lockdep_assert_held(&loopback->area_lock);
++
++	if (!status || window->owner_count ||
++	    (window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING &&
++	     !window->del_req_queued))
++		return false;
++
++	window->del_req_queued = false;
++	virtio_msg_loopback_page_window_remove_terminal_locked(loopback, window,
++							       status);
++	return true;
++}
++
++static bool
++virtio_msg_loopback_page_window_rollback_locked
++	(struct virtio_msg_loopback *loopback,
++	 struct virtio_msg_loopback_page_window *window, int status,
++	 struct virtio_msg_loopback_page_window_action *action)
++{
++	lockdep_assert_held(&loopback->area_lock);
++
++	virtio_msg_loopback_page_window_action_init(action, window);
++
++	if (window->owner_count ||
++	    !virtio_msg_loopback_page_window_is_tracked_locked(loopback, window))
++		return false;
++
++	virtio_msg_loopback_page_window_remove_terminal_locked(loopback, window,
++							       status);
++	action->drop_window = true;
++	action->send_del_req = action->map_id &&
++			       action->old_state !=
++				       VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING;
++
++	return true;
++}
++
 +static int
 +virtio_msg_loopback_bridge_exact_cleanup
 +	(struct virtio_msg_loopback *loopback,
@@ -1247,9 +1218,8 @@ index 000000000000..7ae8f0419522
 +		return -EINVAL;
 +
 +	handle = READ_ONCE(loopback->bridge.endpoint.handle);
-+	vm_trace(NULL,
-+		 "cleanup export begin: dma=%#llx len=%#llx sync=%u windows=%u\n",
-+			(unsigned long long)exact->provider_export.dma_addr,
++	pr_debug("cleanup export begin: dma=%#llx len=%#llx sync=%u windows=%u\n",
++		 (unsigned long long)exact->provider_export.dma_addr,
 +			(unsigned long long)exact->provider_export.length,
 +			sync, exact->num_unique_windows);
 +
@@ -1259,184 +1229,114 @@ index 000000000000..7ae8f0419522
 +	mutex_unlock(&loopback->area_lock);
 +
 +	for (i = 0; i < exact->num_unique_windows; i++) {
-+		u64 map_id = 0;
-+		u64 bus_addr = 0;
-+		u64 length = 0;
-+		enum virtio_msg_loopback_map_state old_state = 0;
++		struct virtio_msg_loopback_page_window_action action;
 +		int ret;
-+		bool drop_window = false;
-+		bool wait_revoke = false;
++		bool handled;
 +
 +		window = exact->unique_windows[i];
 +		if (!window)
 +			continue;
 +
 +		mutex_lock(&loopback->area_lock);
-+		if (window->owner_count) {
-+			mutex_unlock(&loopback->area_lock);
-+			continue;
-+		}
-+		if (window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING ||
-+		    window->del_req_queued) {
-+			bus_addr = window->bus_addr;
-+			length = window->length;
-+			map_id = window->map_id;
-+			wait_revoke = sync;
-+			mutex_unlock(&loopback->area_lock);
-+			vm_trace(NULL,
-+				 "cleanup wait revoke: map_id=%#llx bus=%#llx len=%#llx sync=%u\n",
-+					(unsigned long long)map_id,
-+					(unsigned long long)bus_addr,
-+					(unsigned long long)length, sync);
-+			virtio_msg_loopback_bridge_exact_cleanup_wait_revoke
-+				(window, wait_revoke, &ret_sync, map_id,
-+				 bus_addr, length, "cleanup revoke done");
-+			continue;
-+		}
-+		if (!virtio_msg_loopback_page_window_is_tracked_locked(loopback,
-+								       window)) {
-+			mutex_unlock(&loopback->area_lock);
-+			continue;
-+		}
-+
-+		if (!handle || !window->map_id) {
-+			bus_addr = window->bus_addr;
-+			length = window->length;
-+			map_id = window->map_id;
-+			virtio_msg_loopback_page_window_remove_terminal_locked
-+				(loopback, window, 0);
-+			drop_window = true;
-+			wait_revoke = sync;
-+			mutex_unlock(&loopback->area_lock);
-+			vm_trace(NULL,
-+				 "cleanup local remove: map_id=%#llx bus=%#llx len=%#llx handle=%u\n",
-+					(unsigned long long)map_id,
-+					(unsigned long long)bus_addr,
-+					(unsigned long long)length, handle);
-+			virtio_msg_loopback_bridge_exact_cleanup_wait_revoke
-+				(window, wait_revoke, &ret_sync, map_id,
-+				 bus_addr, length, "cleanup local revoke done");
-+			if (drop_window)
-+				virtio_msg_loopback_page_window_put(window);
-+			continue;
-+		}
-+
-+		map_id = window->map_id;
-+		bus_addr = window->bus_addr;
-+		length = window->length;
-+		old_state = window->state;
-+		if (window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY) {
-+			window->del_req_queued = true;
-+			vm_trace(NULL,
-+				 "revoke trigger queued: map_id=%#llx bus=%#llx len=%#llx state=%u\n",
-+					(unsigned long long)map_id,
-+					(unsigned long long)bus_addr,
-+					(unsigned long long)length, old_state);
-+		} else {
-+			window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING;
-+			virtio_msg_loopback_page_window_unindex_bus_addr_locked
-+				(loopback, window);
-+			vm_trace(NULL,
-+				 "revoke trigger: map_id=%#llx bus=%#llx len=%#llx old=%u new=%u\n",
-+					(unsigned long long)map_id,
-+					(unsigned long long)bus_addr,
-+					(unsigned long long)length, old_state,
-+					window->state);
-+		}
-+		wait_revoke = sync;
++		handled = virtio_msg_loopback_page_window_begin_revoke_locked
++			(loopback, window, sync, handle, &action);
 +		mutex_unlock(&loopback->area_lock);
++		if (!handled)
++			continue;
 +
-+		vm_trace(NULL,
-+			 "tx MAP_DEL_REQ: map_id=%#llx bus=%#llx len=%#llx\n",
-+			       (unsigned long long)map_id,
-+			       (unsigned long long)bus_addr,
-+			       (unsigned long long)length);
-+		ret = virtio_msg_bus_bridge_device_map_event_del_req(handle, map_id);
++		if (action.drop_window) {
++			pr_debug("cleanup local remove: map_id=%#llx bus=%#llx len=%#llx handle=%u\n",
++				 (unsigned long long)action.map_id,
++					(unsigned long long)action.bus_addr,
++					(unsigned long long)action.length, handle);
++			virtio_msg_loopback_bridge_exact_cleanup_wait_revoke
++				(window, action.wait_revoke, &ret_sync,
++				 action.map_id, action.bus_addr, action.length,
++				 "cleanup local revoke done");
++			virtio_msg_loopback_page_window_put(window);
++			continue;
++		}
++
++		if (!action.send_del_req) {
++			pr_debug("cleanup wait revoke: map_id=%#llx bus=%#llx len=%#llx sync=%u\n",
++				 (unsigned long long)action.map_id,
++					(unsigned long long)action.bus_addr,
++					(unsigned long long)action.length, sync);
++			virtio_msg_loopback_bridge_exact_cleanup_wait_revoke
++				(window, action.wait_revoke, &ret_sync,
++				 action.map_id, action.bus_addr, action.length,
++				 "cleanup revoke done");
++			continue;
++		}
++
++		if (action.old_state == VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY)
++			pr_debug("revoke trigger queued: map_id=%#llx bus=%#llx len=%#llx state=%u\n",
++				 (unsigned long long)action.map_id,
++					(unsigned long long)action.bus_addr,
++					(unsigned long long)action.length,
++					action.old_state);
++		else
++			pr_debug("revoke trigger: map_id=%#llx bus=%#llx len=%#llx old=%u new=%u\n",
++				 (unsigned long long)action.map_id,
++					(unsigned long long)action.bus_addr,
++					(unsigned long long)action.length,
++					action.old_state,
++					VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING);
++
++		pr_debug("tx MAP_DEL_REQ: map_id=%#llx bus=%#llx len=%#llx\n",
++			 (unsigned long long)action.map_id,
++			       (unsigned long long)action.bus_addr,
++			       (unsigned long long)action.length);
++		ret = virtio_msg_bus_dma_device_helper_map_del_req
++			(&loopback->map_helper, handle, action.map_id);
++		if (ret == -EALREADY)
++			ret = 0;
 +		if (ret)
-+			vm_trace(NULL,
-+				 "tx MAP_DEL_REQ failed: map_id=%#llx bus=%#llx len=%#llx ret=%d\n",
-+				       (unsigned long long)map_id,
-+				       (unsigned long long)bus_addr,
-+				       (unsigned long long)length, ret);
++			pr_debug("tx MAP_DEL_REQ failed: map_id=%#llx bus=%#llx len=%#llx ret=%d\n",
++				 (unsigned long long)action.map_id,
++				       (unsigned long long)action.bus_addr,
++				       (unsigned long long)action.length, ret);
 +
 +		mutex_lock(&loopback->area_lock);
-+		if (!window->owner_count &&
-+		    (window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING ||
-+		     window->del_req_queued)) {
-+			if (ret) {
-+				window->del_req_queued = false;
-+				virtio_msg_loopback_page_window_remove_terminal_locked
-+					(loopback, window, ret);
-+				vm_trace(NULL,
-+					 "cleanup remove after del_req failure: map_id=%#llx bus=%#llx len=%#llx ret=%d\n",
-+						(unsigned long long)map_id,
-+						(unsigned long long)bus_addr,
-+						(unsigned long long)length, ret);
-+				drop_window = true;
-+				if (!ret_sync)
-+					ret_sync = ret;
-+			}
-+		}
++		action.drop_window =
++			virtio_msg_loopback_page_window_finish_revoke_req_locked
++				(loopback, window, ret);
 +		mutex_unlock(&loopback->area_lock);
 +
-+		if (!drop_window)
-+			virtio_msg_loopback_bridge_exact_cleanup_wait_revoke
-+				(window, wait_revoke, &ret_sync, map_id,
-+				 bus_addr, length, "cleanup revoke done");
-+		if (drop_window)
++		if (action.drop_window) {
++			pr_debug("cleanup remove after del_req failure: map_id=%#llx bus=%#llx len=%#llx ret=%d\n",
++				 (unsigned long long)action.map_id,
++					(unsigned long long)action.bus_addr,
++					(unsigned long long)action.length, ret);
++			if (!ret_sync)
++				ret_sync = ret;
 +			virtio_msg_loopback_page_window_put(window);
++			continue;
++		}
++
++		virtio_msg_loopback_bridge_exact_cleanup_wait_revoke
++			(window, action.wait_revoke, &ret_sync, action.map_id,
++			 action.bus_addr, action.length, "cleanup revoke done");
 +	}
 +
-+	vm_trace(NULL,
-+		 "cleanup export done: dma=%#llx len=%#llx ret=%d\n",
-+			(unsigned long long)exact->provider_export.dma_addr,
++	pr_debug("cleanup export done: dma=%#llx len=%#llx ret=%d\n",
++		 (unsigned long long)exact->provider_export.dma_addr,
 +			(unsigned long long)exact->provider_export.length, ret_sync);
 +	return ret_sync;
-+}
-+
-+static void
-+virtio_msg_loopback_exact_release_gate(struct virtio_msg_loopback *loopback,
-+				       struct virtio_msg_loopback_exact_export *exact)
-+{
-+	struct virtio_msg_loopback_slot *slot = NULL;
-+	unsigned long flags;
-+	bool release = false;
-+
-+	if (!loopback || !exact || !exact->async_activate)
-+		return;
-+
-+	spin_lock_irqsave(&loopback->exact_lock, flags);
-+	if (exact->gate_held) {
-+		exact->gate_held = false;
-+		slot = exact->slot;
-+		release = true;
-+	}
-+	spin_unlock_irqrestore(&loopback->exact_lock, flags);
-+	if (release)
-+		vm_trace(NULL,
-+			 "release gate: dma=%#llx len=%#llx async=%u\n",
-+				(unsigned long long)exact->provider_export.dma_addr,
-+				(unsigned long long)exact->provider_export.length,
-+				exact->async_activate);
-+
-+	if (release && slot &&
-+	    atomic_dec_and_test(&slot->pending_async_exports))
-+		(void)mod_delayed_work(system_wq, &slot->deferred_event_work, 0);
 +}
 +
 +static int
 +virtio_msg_loopback_exact_activate_sleepable
 +	(struct virtio_msg_loopback *loopback,
-+	 struct virtio_msg_loopback_exact_export *exact, bool *retryable)
++	 struct virtio_msg_loopback_exact_export *exact)
 +{
-+	const struct virtio_msg_bus_dma_export *provider_export;
-+	bool all_active = true;
++	const struct virtio_msg_bus_dma_driver_export *provider_export;
++	struct virtio_msg_loopback_page_window **queued_windows = NULL;
++	unsigned int queued_count = 0;
 +	u32 handle;
 +	int ret = 0;
 +	unsigned int i;
 +
-+	if (retryable)
-+		*retryable = false;
 +	if (!loopback || !exact)
 +		return -EINVAL;
 +	if (READ_ONCE(exact->dead))
@@ -1459,10 +1359,19 @@ index 000000000000..7ae8f0419522
 +	if (ret)
 +		goto out;
 +
++	if (exact->num_unique_windows) {
++		queued_windows = kcalloc(exact->num_unique_windows,
++					 sizeof(*queued_windows), GFP_KERNEL);
++		if (!queued_windows) {
++			ret = -ENOMEM;
++			goto out;
++		}
++	}
++
 +	for (i = 0; i < exact->num_unique_windows; i++) {
 +		struct virtio_msg_loopback_page_window *window;
++		struct virtio_msg_bus_dma_device_map_desc map_desc;
 +		u64 map_id = 0;
-+		bool keep_window = false;
 +		bool submit = false;
 +
 +		window = exact->unique_windows[i];
@@ -1470,75 +1379,62 @@ index 000000000000..7ae8f0419522
 +			continue;
 +
 +		mutex_lock(&loopback->area_lock);
-+		if (window->owner_count &&
-+		    window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY &&
-+		    !window->map_id &&
-+		    virtio_msg_loopback_page_window_is_tracked_locked(loopback,
-+								      window)) {
-+			virtio_msg_loopback_page_window_prepare_add_locked
-+				(loopback, window, exact->async_activate);
-+			submit = true;
-+		}
++		submit = virtio_msg_loopback_page_window_begin_add_locked
++			(loopback, window);
 +		mutex_unlock(&loopback->area_lock);
 +		if (!submit)
 +			continue;
 +
-+		vm_trace(NULL,
-+			 "tx MAP_ADD: idx=%u bus=%#llx len=%#llx mmap_off=%#llx\n",
-+			       i, (unsigned long long)window->bus_addr,
++		pr_debug("tx MAP_ADD: idx=%u bus=%#llx len=%#llx mmap_off=%#llx\n",
++			 i, (unsigned long long)window->bus_addr,
 +			       (unsigned long long)window->length,
 +			       (unsigned long long)window->mmap_offset);
 +
-+		ret = virtio_msg_bus_bridge_device_map_event_add(handle,
-+								 window->bus_addr,
-+								 window->length,
-+								 window->mmap_offset,
-+								 window->length,
-+								 0, &map_id);
++		memset(&map_desc, 0, sizeof(map_desc));
++		map_desc.bus_addr = window->bus_addr;
++		map_desc.length = window->length;
++		map_desc.mmap_offset = window->mmap_offset;
++		map_desc.mmap_length = window->length;
++		map_desc.flags = window->map_flags;
++		map_desc.cookie = window;
++
++		ret = virtio_msg_bus_dma_device_helper_map_add
++			(&loopback->map_helper, handle, &map_desc, &map_id);
 +		if (ret) {
-+			vm_trace(NULL,
-+				 "tx MAP_ADD failed: idx=%u bus=%#llx len=%#llx ret=%d\n",
-+				       i, (unsigned long long)window->bus_addr,
++			pr_debug("tx MAP_ADD failed: idx=%u bus=%#llx len=%#llx ret=%d\n",
++				 i, (unsigned long long)window->bus_addr,
 +				       (unsigned long long)window->length, ret);
-+			goto out;
++			goto wait_queued;
 +		}
++		queued_windows[queued_count++] = window;
 +
 +		mutex_lock(&loopback->area_lock);
-+		if (window->owner_count &&
-+		    window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY &&
-+		    !window->map_id &&
-+		    virtio_msg_loopback_page_window_is_tracked_locked(loopback,
-+								      window)) {
-+			window->map_id = map_id;
-+			virtio_msg_loopback_page_window_index_id_locked(loopback, window);
-+			keep_window = true;
-+		}
++		ret = virtio_msg_loopback_page_window_record_map_id_locked
++			(loopback, window, map_id);
 +		mutex_unlock(&loopback->area_lock);
-+		if (keep_window) {
-+			vm_trace(NULL,
-+				 "tx MAP_ADD queued: map_id=%#llx bus=%#llx len=%#llx\n",
-+				       (unsigned long long)map_id,
-+				       (unsigned long long)window->bus_addr,
-+				       (unsigned long long)window->length);
-+		} else {
-+			vm_trace(NULL,
-+				 "tx MAP_DEL_REQ rollback: map_id=%#llx bus=%#llx len=%#llx\n",
-+				       (unsigned long long)map_id,
-+				       (unsigned long long)window->bus_addr,
-+				       (unsigned long long)window->length);
-+			(void)virtio_msg_bus_bridge_device_map_event_del_req
-+				(handle, map_id);
++		if (ret) {
++			(void)virtio_msg_bus_dma_device_helper_map_del_req
++				(&loopback->map_helper, handle, map_id);
++			pr_debug("tx MAP_ADD stale: map_id=%#llx bus=%#llx len=%#llx ret=%d\n",
++				 (unsigned long long)map_id,
++					(unsigned long long)window->bus_addr,
++					(unsigned long long)window->length, ret);
++			goto wait_queued;
 +		}
++
++		pr_debug("tx MAP_ADD queued: map_id=%#llx bus=%#llx len=%#llx\n",
++			 (unsigned long long)map_id,
++			       (unsigned long long)window->bus_addr,
++			       (unsigned long long)window->length);
 +	}
 +
-+	for (i = 0; i < exact->num_unique_windows; i++) {
++wait_queued:
++	for (i = 0; i < queued_count; i++) {
 +		struct virtio_msg_loopback_page_window *window;
-+		bool wait_add = false;
 +		int add_status = 0;
++		bool wait_add = false;
 +
-+		window = exact->unique_windows[i];
-+		if (!window)
-+			continue;
++		window = queued_windows[i];
 +
 +		mutex_lock(&loopback->area_lock);
 +		if (!window->owner_count ||
@@ -1549,7 +1445,7 @@ index 000000000000..7ae8f0419522
 +		}
 +		if (window->map_add_settled)
 +			add_status = window->map_add_status;
-+		else if (window->map_id)
++		else
 +			wait_add = true;
 +		mutex_unlock(&loopback->area_lock);
 +
@@ -1558,105 +1454,107 @@ index 000000000000..7ae8f0419522
 +				(window, VIRTIO_MSG_LOOPBACK_RELAY_TIMEOUT_MS);
 +
 +		if (add_status) {
-+			ret = add_status;
-+			goto out;
++			if (!ret)
++				ret = add_status;
 +		}
-+
-+		mutex_lock(&loopback->area_lock);
-+		if (window->owner_count &&
-+		    virtio_msg_loopback_page_window_is_tracked_locked(loopback,
-+								      window) &&
-+		    window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_ACTIVE)
-+			all_active = false;
-+		mutex_unlock(&loopback->area_lock);
 +	}
 +
-+	if (all_active)
-+		virtio_msg_loopback_exact_release_gate(loopback, exact);
-+
 +out:
-+	if (ret && exact->async_activate && retryable)
-+		*retryable = true;
-+
++	kfree(queued_windows);
 +	return ret;
 +}
 +
-+static void virtio_msg_loopback_exact_activate_workfn(struct work_struct *work)
++static void virtio_msg_loopback_exact_cleanup_workfn(struct work_struct *work)
 +{
 +	struct virtio_msg_loopback_exact_export *exact;
 +	struct virtio_msg_loopback_slot *slot;
 +	struct virtio_msg_loopback *loopback;
 +	unsigned long flags;
 +	bool do_cleanup = false;
-+	bool retryable = false;
-+	int ret = 0;
 +
 +	exact = container_of(to_delayed_work(work),
 +			     struct virtio_msg_loopback_exact_export,
-+			     activate_work);
++			     cleanup_work);
 +
 +	slot = READ_ONCE(exact->slot);
 +	loopback = slot ? slot->loopback : NULL;
-+	if (loopback) {
-+		spin_lock_irqsave(&loopback->exact_lock, flags);
-+		exact->activate_running = true;
-+		spin_unlock_irqrestore(&loopback->exact_lock, flags);
-+	}
-+	if (loopback && !READ_ONCE(exact->dead))
-+		ret = virtio_msg_loopback_exact_activate_sleepable(loopback, exact,
-+								   &retryable);
-+	if (loopback && retryable && !READ_ONCE(exact->dead)) {
-+		slot = READ_ONCE(exact->slot);
-+		if (slot)
-+			vm_warn_rl(&slot->vmdev.vdev.dev,
-+				   "async map activation retry: dev=%u ret=%d\n",
-+					     slot->dev_num, ret);
-+
-+		spin_lock_irqsave(&loopback->exact_lock, flags);
-+		exact->activate_requeue = true;
-+		spin_unlock_irqrestore(&loopback->exact_lock, flags);
-+		(void)mod_delayed_work(loopback->exact_wq, &exact->activate_work,
-+				       msecs_to_jiffies
-+					(VIRTIO_MSG_LOOPBACK_RELAY_RETRY_DELAY_MS));
-+	}
-+	if (loopback && READ_ONCE(exact->dead))
++	if (loopback && READ_ONCE(exact->dead)) {
 +		do_cleanup = virtio_msg_loopback_bridge_exact_claim_windows
 +			(loopback, exact);
++	}
 +
 +	if (do_cleanup)
 +		(void)virtio_msg_loopback_bridge_exact_cleanup(loopback, exact,
 +								false);
 +
 +	if (loopback) {
-+		bool keep_ref;
-+
 +		spin_lock_irqsave(&loopback->exact_lock, flags);
-+		exact->activate_running = false;
-+		keep_ref = exact->activate_requeue;
-+		exact->activate_requeue = false;
-+		if (!keep_ref)
-+			exact->activate_ref_held = false;
++		exact->cleanup_ref_held = false;
 +		spin_unlock_irqrestore(&loopback->exact_lock, flags);
-+		if (keep_ref)
-+			return;
 +	}
 +	virtio_msg_loopback_exact_put(exact);
++}
++
++struct virtio_msg_loopback_map_cleanup_ctx {
++	struct virtio_msg_loopback *loopback;
++	u32 handle;
++};
++
++static void
++virtio_msg_loopback_map_cleanup_one
++	(const struct virtio_msg_bus_dma_device_map_info *map, void *data)
++{
++	struct virtio_msg_loopback_map_cleanup_ctx *ctx = data;
++	struct virtio_msg_loopback_page_window *window;
++	struct virtio_msg_loopback *loopback;
++	u64 map_id = 0;
++
++	if (!ctx || !ctx->loopback || !map)
++		return;
++
++	loopback = ctx->loopback;
++	window = map->cookie;
++	if (!window)
++		return;
++
++	mutex_lock(&loopback->area_lock);
++	if (window->map_id != map->map_id ||
++	    window->bus_addr != map->bus_addr ||
++	    window->length != map->length ||
++	    window->mmap_offset != map->mmap_offset ||
++	    window->length != map->mmap_length ||
++	    window->map_flags != map->flags) {
++		mutex_unlock(&loopback->area_lock);
++		return;
++	}
++
++	virtio_msg_loopback_page_window_get(window);
++	if (ctx->handle && window->map_id &&
++	    window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING)
++		map_id = window->map_id;
++	virtio_msg_loopback_page_window_remove_terminal_locked
++		(loopback, window,
++		 window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING ?
++		 -ENODEV : 0);
++	mutex_unlock(&loopback->area_lock);
++
++	if (ctx->handle && map_id)
++		(void)virtio_msg_bus_bridge_device_map_del(ctx->handle, map_id);
++	virtio_msg_loopback_page_window_put(window);
 +}
 +
 +static void
 +virtio_msg_loopback_map_cleanup_all(struct virtio_msg_loopback *loopback)
 +{
++	struct virtio_msg_loopback_map_cleanup_ctx ctx;
 +	struct virtio_msg_loopback_exact_export *exact;
-+	struct virtio_msg_loopback_page_window *window;
 +	unsigned long flags;
-+	unsigned long index;
-+	u32 handle;
-+	u64 map_id;
 +
 +	if (!loopback)
 +		return;
 +
-+	handle = READ_ONCE(loopback->bridge.endpoint.handle);
++	ctx.loopback = loopback;
++	ctx.handle = READ_ONCE(loopback->bridge.endpoint.handle);
 +
 +	for (;;) {
 +		bool do_cleanup;
@@ -1674,7 +1572,7 @@ index 000000000000..7ae8f0419522
 +		spin_unlock_irqrestore(&loopback->exact_lock, flags);
 +
 +		virtio_msg_loopback_bridge_exact_unpublish(loopback, exact);
-+		virtio_msg_loopback_exact_cancel_activate(loopback, exact);
++		virtio_msg_loopback_exact_cancel_cleanup(loopback, exact);
 +		do_cleanup = virtio_msg_loopback_bridge_exact_claim_windows
 +			(loopback, exact);
 +
@@ -1686,37 +1584,14 @@ index 000000000000..7ae8f0419522
 +		virtio_msg_loopback_exact_put(exact);
 +	}
 +
-+	for (;;) {
-+		index = 0;
-+		mutex_lock(&loopback->area_lock);
-+		window = xa_find(&loopback->map_area_xa_by_offset, &index,
-+				 ULONG_MAX, XA_PRESENT);
-+		if (!window) {
-+			mutex_unlock(&loopback->area_lock);
-+			break;
-+		}
-+
-+		virtio_msg_loopback_page_window_get(window);
-+		map_id = 0;
-+		if (handle && window->map_id &&
-+		    window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING)
-+			map_id = window->map_id;
-+		virtio_msg_loopback_page_window_remove_terminal_locked
-+			(loopback, window,
-+			 window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING ?
-+			 -ENODEV : 0);
-+		mutex_unlock(&loopback->area_lock);
-+
-+		if (handle && map_id)
-+			(void)virtio_msg_bus_bridge_device_map_event_del_req
-+				(handle, map_id);
-+		virtio_msg_loopback_page_window_put(window);
-+	}
++	virtio_msg_bus_dma_device_helper_purge(&loopback->map_helper,
++					       virtio_msg_loopback_map_cleanup_one,
++					       &ctx);
 +}
 +
 +static int
 +virtio_msg_loopback_provider_export_validate
-+	(const struct virtio_msg_bus_dma_export *provider_export)
++	(const struct virtio_msg_bus_dma_driver_export *provider_export)
 +{
 +	size_t mapped_span;
 +
@@ -1733,18 +1608,65 @@ index 000000000000..7ae8f0419522
 +		return -EINVAL;
 +	if (provider_export->npages != provider_export->mmap_length >> PAGE_SHIFT)
 +		return -EINVAL;
++	if (provider_export->bridge_flags &
++	    ~VIRTIO_MSG_BUS_BRIDGE_MAP_F_RETENTION_REQUESTED)
++		return -EINVAL;
 +
 +	return 0;
 +}
 +
++void
++virtio_msg_loopback_bridge_dma_install_begin(struct virtio_msg_loopback_slot *slot)
++{
++	if (!slot)
++		return;
++
++	WRITE_ONCE(slot->dma_initial_pool_status, 0);
++	WRITE_ONCE(slot->dma_initial_pool_seen, false);
++	WRITE_ONCE(slot->dma_initial_pool_installing, true);
++}
++
++int
++virtio_msg_loopback_bridge_dma_install_finish(struct virtio_msg_loopback_slot *slot)
++{
++	int ret;
++
++	if (!slot)
++		return -EINVAL;
++
++	WRITE_ONCE(slot->dma_initial_pool_installing, false);
++	if (!READ_ONCE(slot->dma_initial_pool_seen))
++		return 0;
++
++	ret = READ_ONCE(slot->dma_initial_pool_status);
++	return ret ?: 0;
++}
++
++static void
++virtio_msg_loopback_bridge_dma_initial_pool_result
++	(struct virtio_msg_loopback_slot *slot,
++	 const struct virtio_msg_bus_dma_driver_export *provider_export,
++	 int status)
++{
++	if (!slot || !provider_export ||
++	    provider_export->type != VIRTIO_MSG_BUS_DMA_DRIVER_EXPORT_POOL_CHUNK ||
++	    !READ_ONCE(slot->dma_initial_pool_installing))
++		return;
++
++	WRITE_ONCE(slot->dma_initial_pool_seen, true);
++	if (status)
++		WRITE_ONCE(slot->dma_initial_pool_status, status);
++}
++
 +static int
-+virtio_msg_loopback_bridge_dma_provider_add(struct virtio_msg_loopback *loopback,
-+					    struct virtio_msg_bus_dma_export *provider_export,
-+					     void **provider_handle, gfp_t gfp)
++virtio_msg_loopback_bridge_dma_provider_add
++	(struct virtio_msg_loopback *loopback,
++	 struct virtio_msg_bus_dma_driver_export *provider_export,
++	 void **provider_handle, gfp_t gfp)
 +{
 +	struct virtio_msg_loopback_exact_export *exact;
 +	struct virtio_msg_loopback_slot *slot;
-+	struct virtio_msg_bus_dma_export local_export;
++	struct virtio_msg_bus_dma_driver_export local_export;
 +	u32 handle;
 +	unsigned long flags;
 +	int ret;
@@ -1759,19 +1681,27 @@ index 000000000000..7ae8f0419522
 +		return ret;
 +	local_export = *provider_export;
 +
-+	handle = READ_ONCE(loopback->bridge.endpoint.handle);
-+	if (!handle)
-+		return -ENODEV;
-+
 +	slot = virtio_msg_loopback_bridge_slot_from_dma_dev(loopback,
 +							    provider_export->dma_dev);
 +	if (!slot)
 +		return -ENODEV;
 +
++	handle = READ_ONCE(loopback->bridge.endpoint.handle);
++	if (!handle) {
++		ret = -ENODEV;
++		virtio_msg_loopback_bridge_dma_initial_pool_result
++			(slot, provider_export, ret);
++		return ret;
++	}
++
 +	exact = virtio_msg_loopback_exact_export_alloc_validated(&local_export,
 +								 gfp);
-+	if (IS_ERR(exact))
-+		return PTR_ERR(exact);
++	if (IS_ERR(exact)) {
++		ret = PTR_ERR(exact);
++		virtio_msg_loopback_bridge_dma_initial_pool_result
++			(slot, provider_export, ret);
++		return ret;
++	}
 +
 +	exact->provider_export = local_export;
 +	exact->slot = slot;
@@ -1780,17 +1710,17 @@ index 000000000000..7ae8f0419522
 +	virtio_msg_loopback_exact_export_track_locked(loopback, exact);
 +	spin_unlock_irqrestore(&loopback->exact_lock, flags);
 +	tracked = true;
-+	vm_trace(NULL,
-+		 "export create: dma=%#llx len=%#llx npages=%u async=0\n",
-+			(unsigned long long)local_export.dma_addr,
++	pr_debug("export create: dma=%#llx len=%#llx npages=%u\n",
++		 (unsigned long long)local_export.dma_addr,
 +			(unsigned long long)local_export.length,
 +			local_export.npages);
 +
-+	ret = virtio_msg_loopback_exact_activate_sleepable(loopback, exact, NULL);
++	ret = virtio_msg_loopback_exact_activate_sleepable(loopback, exact);
++	virtio_msg_loopback_bridge_dma_initial_pool_result
++		(slot, provider_export, ret);
 +	if (ret) {
-+		vm_trace(NULL,
-+			 "export create failed: dma=%#llx len=%#llx ret=%d\n",
-+				(unsigned long long)local_export.dma_addr,
++		pr_debug("export create failed: dma=%#llx len=%#llx ret=%d\n",
++			 (unsigned long long)local_export.dma_addr,
 +				(unsigned long long)local_export.length, ret);
 +		goto rollback;
 +	}
@@ -1801,9 +1731,8 @@ index 000000000000..7ae8f0419522
 +	return 0;
 +
 +rollback:
-+	vm_trace(NULL,
-+		 "export rollback: dma=%#llx len=%#llx ret=%d\n",
-+			(unsigned long long)local_export.dma_addr,
++	pr_debug("export rollback: dma=%#llx len=%#llx ret=%d\n",
++		 (unsigned long long)local_export.dma_addr,
 +			(unsigned long long)local_export.length, ret);
 +	if (tracked) {
 +		spin_lock_irqsave(&loopback->exact_lock, flags);
@@ -1819,31 +1748,22 @@ index 000000000000..7ae8f0419522
 +
 +	for (i = 0; i < exact->num_unique_windows; i++) {
 +		struct virtio_msg_loopback_page_window *window;
-+		u64 map_id = 0;
-+		u32 state = 0;
-+		bool remove = false;
++		struct virtio_msg_loopback_page_window_action action;
 +
 +		window = exact->unique_windows[i];
 +		if (!window)
 +			continue;
 +
 +		mutex_lock(&loopback->area_lock);
-+		if (!window->owner_count &&
-+		    virtio_msg_loopback_page_window_is_tracked_locked(loopback, window)) {
-+			map_id = window->map_id;
-+			state = window->state;
-+			virtio_msg_loopback_page_window_remove_terminal_locked
-+				(loopback, window, ret);
-+			remove = true;
-+		}
++		(void)virtio_msg_loopback_page_window_rollback_locked
++			(loopback, window, ret, &action);
 +		mutex_unlock(&loopback->area_lock);
-+		if (!remove)
++		if (!action.drop_window)
 +			continue;
 +
-+		if (handle && map_id &&
-+		    state != VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING)
-+			(void)virtio_msg_bus_bridge_device_map_event_del_req
-+				(handle, map_id);
++		if (handle && action.send_del_req)
++			(void)virtio_msg_bus_dma_device_helper_map_del_req
++				(&loopback->map_helper, handle, action.map_id);
 +		virtio_msg_loopback_page_window_put(window);
 +	}
 +
@@ -1859,13 +1779,12 @@ index 000000000000..7ae8f0419522
 +	if (!loopback || !exact)
 +		return;
 +
-+	vm_trace(NULL,
-+		 "export revoke trigger: dma=%#llx len=%#llx sync=0\n",
-+			(unsigned long long)exact->provider_export.dma_addr,
++	pr_debug("export revoke trigger: dma=%#llx len=%#llx sync=0\n",
++		 (unsigned long long)exact->provider_export.dma_addr,
 +			(unsigned long long)exact->provider_export.length);
 +	WRITE_ONCE(exact->dead, true);
 +	virtio_msg_loopback_bridge_exact_unpublish(loopback, exact);
-+	virtio_msg_loopback_exact_queue_activate(loopback, exact);
++	virtio_msg_loopback_exact_queue_cleanup(loopback, exact);
 +}
 +
 +static int
@@ -1877,13 +1796,12 @@ index 000000000000..7ae8f0419522
 +	if (!loopback || !exact)
 +		return -EINVAL;
 +
-+	vm_trace(NULL,
-+		 "export revoke trigger: dma=%#llx len=%#llx sync=1\n",
-+			(unsigned long long)exact->provider_export.dma_addr,
++	pr_debug("export revoke trigger: dma=%#llx len=%#llx sync=1\n",
++		 (unsigned long long)exact->provider_export.dma_addr,
 +			(unsigned long long)exact->provider_export.length);
 +	WRITE_ONCE(exact->dead, true);
 +	virtio_msg_loopback_bridge_exact_unpublish(loopback, exact);
-+	virtio_msg_loopback_exact_cancel_activate(loopback, exact);
++	virtio_msg_loopback_exact_cancel_cleanup(loopback, exact);
 +	(void)virtio_msg_loopback_bridge_exact_claim_windows(loopback, exact);
 +	ret = virtio_msg_loopback_bridge_exact_cleanup(loopback, exact, true);
 +
@@ -1891,67 +1809,8 @@ index 000000000000..7ae8f0419522
 +}
 +
 +static int
-+virtio_msg_loopback_bridge_dma_provider_add_atomic
-+	(struct virtio_msg_loopback *loopback,
-+	 struct virtio_msg_bus_dma_export *provider_export,
-+	 void **provider_handle, gfp_t gfp)
-+{
-+	struct virtio_msg_loopback_exact_export *exact;
-+	struct virtio_msg_loopback_slot *slot;
-+	struct virtio_msg_bus_dma_export local_export;
-+	unsigned long flags;
-+	u32 handle;
-+	int ret;
-+
-+	if (!loopback || !provider_export || !provider_handle)
-+		return -EINVAL;
-+
-+	ret = virtio_msg_loopback_provider_export_validate(provider_export);
-+	if (ret)
-+		return ret;
-+	local_export = *provider_export;
-+
-+	handle = READ_ONCE(loopback->bridge.endpoint.handle);
-+	if (!handle)
-+		return -ENODEV;
-+
-+	slot = virtio_msg_loopback_bridge_slot_from_dma_dev(loopback,
-+							    provider_export->dma_dev);
-+	if (!slot)
-+		return -ENODEV;
-+
-+	exact = virtio_msg_loopback_exact_export_alloc_validated(&local_export,
-+								 gfp);
-+	if (IS_ERR(exact))
-+		return PTR_ERR(exact);
-+
-+	exact->provider_export = local_export;
-+	exact->slot = slot;
-+	exact->async_activate = true;
-+	exact->gate_held = true;
-+
-+	spin_lock_irqsave(&loopback->exact_lock, flags);
-+	virtio_msg_loopback_exact_export_track_locked(loopback, exact);
-+	spin_unlock_irqrestore(&loopback->exact_lock, flags);
-+
-+	atomic_inc(&slot->pending_async_exports);
-+	vm_trace(NULL,
-+		 "export create: dma=%#llx len=%#llx npages=%u async=1\n",
-+			(unsigned long long)local_export.dma_addr,
-+			(unsigned long long)local_export.length,
-+			local_export.npages);
-+
-+	virtio_msg_loopback_exact_queue_activate(loopback, exact);
-+
-+	*provider_export = local_export;
-+	*provider_handle = exact;
-+
-+	return 0;
-+}
-+
-+static int
 +virtio_msg_loopback_dma_provider_export_record
-+	(void *ctx, struct virtio_msg_bus_dma_export *export,
++	(void *ctx, struct virtio_msg_bus_dma_driver_export *export,
 +	 void **provider_handle, gfp_t gfp)
 +{
 +	struct virtio_msg_loopback *loopback = ctx;
@@ -1960,8 +1819,7 @@ index 000000000000..7ae8f0419522
 +		return -ENODEV;
 +
 +	if (!gfpflags_allow_blocking(gfp))
-+		return virtio_msg_loopback_bridge_dma_provider_add_atomic
-+			(loopback, export, provider_handle, gfp);
++		return -EAGAIN;
 +
 +	return virtio_msg_loopback_bridge_dma_provider_add
 +		(loopback, export, provider_handle, gfp);
@@ -1969,7 +1827,7 @@ index 000000000000..7ae8f0419522
 +
 +static int
 +virtio_msg_loopback_dma_provider_export_del_record
-+	(void *ctx, const struct virtio_msg_bus_dma_export *export,
++	(void *ctx, const struct virtio_msg_bus_dma_driver_export *export,
 +	 void *provider_handle, bool sync)
 +{
 +	struct virtio_msg_loopback *loopback = ctx;
@@ -1999,7 +1857,7 @@ index 000000000000..7ae8f0419522
 +
 +static int
 +virtio_msg_loopback_dma_provider_query_caps
-+	(void *ctx, struct virtio_msg_bus_dma_provider_caps *caps)
++	(void *ctx, struct virtio_msg_bus_dma_driver_provider_caps *caps)
 +{
 +	if (!ctx || !caps)
 +		return -EINVAL;
@@ -2009,14 +1867,14 @@ index 000000000000..7ae8f0419522
 +	return 0;
 +}
 +
-+static const struct virtio_msg_bus_dma_provider_ops
++static const struct virtio_msg_bus_dma_driver_provider_ops
 +virtio_msg_loopback_dma_provider_ops = {
 +	.export_add = virtio_msg_loopback_dma_provider_export_record,
 +	.export_del = virtio_msg_loopback_dma_provider_export_del_record,
 +	.query_caps = virtio_msg_loopback_dma_provider_query_caps,
 +};
 +
-+const struct virtio_msg_bus_dma_provider_ops *
++const struct virtio_msg_bus_dma_driver_provider_ops *
 +virtio_msg_loopback_bridge_dma_provider_ops_get(void)
 +{
 +	return &virtio_msg_loopback_dma_provider_ops;
@@ -2046,9 +1904,19 @@ index 000000000000..7ae8f0419522
 +
 +	if (!loopback || !msg)
 +		return -EINVAL;
-+	if (msg->msg_id != VIRTIO_MSG_EVENT_AVAIL)
++	if (msg_size < sizeof(*msg) ||
++	    msg_size > VIRTIO_MSG_LOOPBACK_MAX_MSG_SIZE)
++		return -EMSGSIZE;
++	if (msg_size != le16_to_cpu(msg->msg_size))
++		return -EINVAL;
++	if (!(msg->msg_id & VIRTIO_MSG_ID_EVENT_BIT))
 +		return -EOPNOTSUPP;
-+	if (msg_size != sizeof(*msg) + sizeof(struct virtio_msg_event_avail))
++	if (msg->type & VIRTIO_MSG_TYPE_BUS)
++		return -EOPNOTSUPP;
++	if (msg->type & VIRTIO_MSG_TYPE_RESPONSE)
++		return -EINVAL;
++	if (msg->msg_id == VIRTIO_MSG_EVENT_AVAIL &&
++	    msg_size != sizeof(*msg) + sizeof(struct virtio_msg_event_avail))
 +		return -EMSGSIZE;
 +
 +	ret = virtio_msg_loopback_validate_slot_dev_num(msg);
@@ -2057,6 +1925,39 @@ index 000000000000..7ae8f0419522
 +
 +	return virtio_msg_loopback_relay_to_userspace_nonblock(loopback, msg,
 +								msg_size);
++}
++
++int
++virtio_msg_loopback_bridge_publish_event_sleepable(struct virtio_msg_loopback
++						  *loopback,
++						  const struct virtio_msg *msg)
++{
++	u16 msg_size;
++	int ret;
++
++	if (!loopback || !msg)
++		return -EINVAL;
++
++	msg_size = le16_to_cpu(msg->msg_size);
++	if (msg_size < sizeof(*msg) ||
++	    msg_size > VIRTIO_MSG_LOOPBACK_MAX_MSG_SIZE)
++		return -EMSGSIZE;
++	if (!(msg->msg_id & VIRTIO_MSG_ID_EVENT_BIT))
++		return -EOPNOTSUPP;
++	if (msg->type & VIRTIO_MSG_TYPE_BUS)
++		return -EOPNOTSUPP;
++	if (msg->type & VIRTIO_MSG_TYPE_RESPONSE)
++		return -EINVAL;
++	if (msg->msg_id == VIRTIO_MSG_EVENT_AVAIL &&
++	    msg_size != sizeof(*msg) + sizeof(struct virtio_msg_event_avail))
++		return -EMSGSIZE;
++
++	ret = virtio_msg_loopback_validate_slot_dev_num(msg);
++	if (ret)
++		return ret;
++
++	return virtio_msg_loopback_relay_event_to_userspace_sleepable
++		(loopback, msg, msg_size);
 +}
 +
 +static int
@@ -2112,10 +2013,36 @@ index 000000000000..7ae8f0419522
 +	}
 +}
 +
++static struct virtio_msg_loopback_page_window *
++virtio_msg_loopback_page_window_from_map_locked
++	(struct virtio_msg_loopback *loopback,
++	 const struct virtio_msg_bus_dma_device_map_info *map)
++{
++	struct virtio_msg_loopback_page_window *window;
++
++	lockdep_assert_held(&loopback->area_lock);
++
++	if (!map || !map->cookie)
++		return NULL;
++
++	window = map->cookie;
++	if (window->map_id && window->map_id != map->map_id)
++		return NULL;
++	if (window->bus_addr != map->bus_addr ||
++	    window->length != map->length ||
++	    window->mmap_offset != map->mmap_offset ||
++	    window->length != map->mmap_length ||
++	    window->map_flags != map->flags)
++		return NULL;
++
++	return window;
++}
++
 +static int
 +virtio_msg_loopback_bridge_mmap(struct virtio_msg_bus_bridge_device *endpoint,
 +				u64 mmap_offset, struct vm_area_struct *vma)
 +{
++	struct virtio_msg_bus_dma_device_map_info map;
 +	struct virtio_msg_loopback_page_window *window;
 +	struct virtio_msg_loopback *loopback;
 +	struct vm_struct *area;
@@ -2123,38 +2050,49 @@ index 000000000000..7ae8f0419522
 +	int ret;
 +
 +	if (!endpoint || !vma || !mmap_offset || !PAGE_ALIGNED(mmap_offset)) {
-+		vm_trace(NULL,
-+			 "bridge mmap reject: endpoint=%p vma=%p offset=%#llx\n",
-+		       endpoint, vma, (unsigned long long)mmap_offset);
++		pr_debug("bridge mmap reject: endpoint=%p vma=%p offset=%#llx\n",
++			 endpoint, vma, (unsigned long long)mmap_offset);
 +		return -EINVAL;
 +	}
 +
 +	loopback = endpoint->priv;
 +	if (!loopback) {
-+		vm_trace(NULL, "bridge mmap reject: no loopback offset=%#llx\n",
++		pr_debug("bridge mmap reject: no loopback offset=%#llx\n",
 +			 (unsigned long long)mmap_offset);
 +		return -ENODEV;
 +	}
 +
 +	mmap_len = (u64)(vma->vm_end - vma->vm_start);
 +	if (!mmap_len) {
-+		vm_trace(NULL, "bridge mmap reject: zero length offset=%#llx\n",
++		pr_debug("bridge mmap reject: zero length offset=%#llx\n",
 +			 (unsigned long long)mmap_offset);
 +		return -EINVAL;
 +	}
 +
 +	mutex_lock(&loopback->area_lock);
-+	window = virtio_msg_loopback_page_window_lookup_by_offset_locked(loopback,
-+									 mmap_offset);
-+	if (!window ||
-+	    window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING ||
-+	    (!window->dma_mmap && !window->kva) || mmap_len > window->length) {
-+		vm_trace(NULL,
-+			 "bridge mmap reject: offset=%#llx len=%#llx window=%p map_id=%#llx state=%u kva=%p dma_mmap=%u window_len=%#llx\n",
-+		       (unsigned long long)mmap_offset,
++	ret = virtio_msg_bus_dma_device_helper_lookup_by_mmap_offset
++		(&loopback->map_helper, mmap_offset, mmap_len, &map);
++	if (ret) {
++		pr_debug("bridge mmap reject: offset=%#llx len=%#llx ret=%d\n",
++			 (unsigned long long)mmap_offset,
++			 (unsigned long long)mmap_len, ret);
++		mutex_unlock(&loopback->area_lock);
++		if (ret == -ERANGE)
++			return -ENOENT;
++		return ret;
++	}
++
++	window = virtio_msg_loopback_page_window_from_map_locked(loopback,
++								 &map);
++	if (!virtio_msg_loopback_page_window_mmap_allowed_locked
++			(loopback, window, &map) ||
++	    mmap_len > window->length) {
++		pr_debug("bridge mmap reject: offset=%#llx len=%#llx window=%p map_id=%#llx state=%u helper_state=%u kva=%p dma_mmap=%u window_len=%#llx\n",
++			 (unsigned long long)mmap_offset,
 +		       (unsigned long long)mmap_len, window,
 +		       window ? (unsigned long long)window->map_id : 0,
-+		       window ? window->state : 0, window ? window->kva : NULL,
++		       window ? window->state : 0, map.state,
++		       window ? window->kva : NULL,
 +		       window ? window->dma_mmap : 0,
 +		       window ? (unsigned long long)window->length : 0);
 +		mutex_unlock(&loopback->area_lock);
@@ -2172,9 +2110,8 @@ index 000000000000..7ae8f0419522
 +				     window->dma_attrs);
 +		vma->vm_pgoff = saved_pgoff;
 +		if (ret) {
-+			vm_trace(NULL,
-+				 "bridge mmap dma failed: offset=%#llx len=%#llx cpu=%p dma=%#llx attrs=%#lx ret=%d\n",
-+			       (unsigned long long)mmap_offset,
++			pr_debug("bridge mmap dma failed: offset=%#llx len=%#llx cpu=%p dma=%#llx attrs=%#lx ret=%d\n",
++				 (unsigned long long)mmap_offset,
 +			       (unsigned long long)mmap_len,
 +			       window->dma_cpu_addr,
 +			       (unsigned long long)window->dma_addr,
@@ -2187,9 +2124,8 @@ index 000000000000..7ae8f0419522
 +	area = find_vm_area(window->kva);
 +	ret = remap_vmalloc_range(vma, window->kva, 0);
 +	if (ret) {
-+		vm_trace(NULL,
-+			 "bridge mmap remap failed: offset=%#llx len=%#llx kva=%p area=%p area_flags=%#lx ret=%d\n",
-+		       (unsigned long long)mmap_offset,
++		pr_debug("bridge mmap remap failed: offset=%#llx len=%#llx kva=%p area=%p area_flags=%#lx ret=%d\n",
++			 (unsigned long long)mmap_offset,
 +		       (unsigned long long)mmap_len, window->kva, area,
 +		       area ? area->flags : 0UL, ret);
 +	}
@@ -2197,31 +2133,317 @@ index 000000000000..7ae8f0419522
 +	return ret;
 +}
 +
-+static bool
-+virtio_msg_loopback_bridge_map_event_ack_add_async_retry
++static struct virtio_msg_loopback_exact_export *
++virtio_msg_loopback_exact_export_find_window
 +	(struct virtio_msg_loopback *loopback,
-+	 struct virtio_msg_loopback_page_window *window,
-+	 const struct vmsg_bridge_uapi_map_event *event, u32 ack_status,
-+	 enum virtio_msg_loopback_map_state old_state)
++	 struct virtio_msg_loopback_page_window *window)
 +{
++	struct virtio_msg_loopback_exact_export *exact;
++	unsigned long flags;
++	unsigned int i;
++
++	if (!loopback || !window)
++		return NULL;
++
++	spin_lock_irqsave(&loopback->exact_lock, flags);
++	list_for_each_entry(exact, &loopback->exact_exports, node) {
++		for (i = 0; i < exact->num_unique_windows; i++) {
++			if (exact->unique_windows[i] != window)
++				continue;
++
++			virtio_msg_loopback_exact_get(exact);
++			spin_unlock_irqrestore(&loopback->exact_lock, flags);
++			return exact;
++		}
++	}
++	spin_unlock_irqrestore(&loopback->exact_lock, flags);
++
++	return NULL;
++}
++
++static int
++virtio_msg_loopback_bridge_map_response_prepare
++	(const struct vmsg_bridge_uapi_map_event *event, u32 ack_status,
++	 u16 type, struct vmsg_bridge_uapi_map_event *response)
++{
++	if (!event || !response)
++		return -EINVAL;
++	if (ack_status != VMSG_BRIDGE_UAPI_MAP_ACK_OK &&
++	    ack_status != VMSG_BRIDGE_UAPI_MAP_ACK_REJECT)
++		return -EINVAL;
++	if (event->type != type)
++		return -EINVAL;
++
++	*response = *event;
++	if (ack_status == VMSG_BRIDGE_UAPI_MAP_ACK_REJECT && !response->status)
++		response->status = -EIO;
++
++	return 0;
++}
++
++static void
++virtio_msg_loopback_bridge_map_result_locked
++	(struct virtio_msg_loopback *loopback,
++	 const struct virtio_msg_bus_dma_device_map_result *result, int status)
++{
++	struct virtio_msg_loopback_page_window *window;
++	enum virtio_msg_loopback_map_state old_state;
++
 +	lockdep_assert_held(&loopback->area_lock);
 +
-+	if (event->type != VMSG_BRIDGE_UAPI_MAP_EVENT_ADD ||
-+	    !window->map_add_async ||
-+	    window->state != VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY ||
-+	    !window->owner_count || window->del_req_queued)
-+		return false;
++	if (!result ||
++	    result->action == VIRTIO_MSG_BUS_DMA_DEVICE_MAP_IGNORED)
++		return;
 +
-+	virtio_msg_loopback_page_window_clear_id_locked(loopback, window);
-+	virtio_msg_loopback_page_window_settle_add_locked(loopback, window,
-+							  -EAGAIN);
-+	vm_trace(NULL,
-+		 "rx MAP_ACK: type=%u map_id=%#llx bus=%#llx len=%#llx ack=%u old=%u new=%u del_req_queued=%u\n",
-+		       event->type, (unsigned long long)event->map_id,
-+		       (unsigned long long)window->bus_addr,
-+		       (unsigned long long)window->length, ack_status, old_state,
-+		       window->state, window->del_req_queued);
-+	return true;
++	window = virtio_msg_loopback_page_window_from_map_locked(loopback,
++								 &result->map);
++	if (!window) {
++		pr_debug("rx MAP response ignored: type_action=%u map_id=%#llx mmap_off=%#llx status=%d (no window)\n",
++			 result->action,
++			       (unsigned long long)result->map.map_id,
++			       (unsigned long long)result->map.mmap_offset,
++			       status);
++		return;
++	}
++
++	if (!window->map_id)
++		window->map_id = result->map.map_id;
++	old_state = window->state;
++	if (!status)
++		status = -EIO;
++
++	switch (result->action) {
++	case VIRTIO_MSG_BUS_DMA_DEVICE_MAP_ADD_ACTIVE:
++	case VIRTIO_MSG_BUS_DMA_DEVICE_MAP_ADD_DEL_QUEUED:
++		virtio_msg_loopback_page_window_add_ack_ok_locked(loopback,
++								  window);
++		pr_debug("rx MAP_ADD: map_id=%#llx bus=%#llx len=%#llx old=%u new=%u del_req_queued=%u\n",
++			 (unsigned long long)window->map_id,
++			 (unsigned long long)window->bus_addr,
++			 (unsigned long long)window->length, old_state,
++			 window->state, window->del_req_queued);
++		break;
++	case VIRTIO_MSG_BUS_DMA_DEVICE_MAP_ADD_FAILED:
++	case VIRTIO_MSG_BUS_DMA_DEVICE_MAP_REMOVED:
++		virtio_msg_loopback_page_window_settle_add_locked
++			(loopback, window, status);
++		pr_debug("rx MAP removed: map_id=%#llx bus=%#llx len=%#llx status=%d old=%u helper_old=%u\n",
++			 (unsigned long long)window->map_id,
++			 (unsigned long long)window->bus_addr,
++			 (unsigned long long)window->length, status, old_state,
++			 result->old_state);
++		virtio_msg_loopback_page_window_remove_terminal_locked
++			(loopback, window, status);
++		virtio_msg_loopback_page_window_put(window);
++		break;
++	case VIRTIO_MSG_BUS_DMA_DEVICE_MAP_DEL_DONE:
++	case VIRTIO_MSG_BUS_DMA_DEVICE_MAP_RELEASED_DEL_DONE:
++		pr_debug("rx MAP_DEL: map_id=%#llx bus=%#llx len=%#llx old=%u new=%u\n",
++			 (unsigned long long)window->map_id,
++			 (unsigned long long)window->bus_addr,
++			 (unsigned long long)window->length, old_state, 0U);
++		virtio_msg_loopback_page_window_remove_terminal_locked
++			(loopback, window, 0);
++		virtio_msg_loopback_page_window_put(window);
++		break;
++	default:
++		pr_debug("rx MAP response ignored: map_id=%#llx bus=%#llx len=%#llx action=%u state=%u\n",
++			 (unsigned long long)window->map_id,
++			 (unsigned long long)window->bus_addr,
++			 (unsigned long long)window->length, result->action,
++			 old_state);
++		break;
++	}
++}
++
++static int
++virtio_msg_loopback_bridge_map_add_response
++	(struct virtio_msg_loopback *loopback,
++	 const struct vmsg_bridge_uapi_map_event *event, u32 ack_status)
++{
++	struct virtio_msg_bus_dma_device_map_result result;
++	struct vmsg_bridge_uapi_map_event response;
++	int ret;
++
++	ret = virtio_msg_loopback_bridge_map_response_prepare
++		(event, ack_status, VMSG_BRIDGE_UAPI_MAP_EVENT_ADD_RESP,
++		 &response);
++	if (ret)
++		return ret;
++
++	mutex_lock(&loopback->area_lock);
++	ret = virtio_msg_bus_dma_device_helper_map_add_response
++		(&loopback->map_helper, &response, &result);
++	if (!ret)
++		virtio_msg_loopback_bridge_map_result_locked(loopback, &result,
++							     response.status);
++	mutex_unlock(&loopback->area_lock);
++
++	return ret;
++}
++
++static int
++virtio_msg_loopback_bridge_map_del_response
++	(struct virtio_msg_loopback *loopback,
++	 const struct vmsg_bridge_uapi_map_event *event, u32 ack_status)
++{
++	struct virtio_msg_bus_dma_device_map_result result;
++	struct vmsg_bridge_uapi_map_event response;
++	int ret;
++
++	ret = virtio_msg_loopback_bridge_map_response_prepare
++		(event, ack_status, VMSG_BRIDGE_UAPI_MAP_EVENT_DEL_RESP,
++		 &response);
++	if (ret)
++		return ret;
++
++	mutex_lock(&loopback->area_lock);
++	ret = virtio_msg_bus_dma_device_helper_map_del_response
++		(&loopback->map_helper, &response, &result);
++	if (!ret)
++		virtio_msg_loopback_bridge_map_result_locked(loopback, &result,
++							     response.status);
++	mutex_unlock(&loopback->area_lock);
++
++	return ret;
++}
++
++static void
++virtio_msg_loopback_bridge_set_removed(struct virtio_msg_loopback *loopback)
++{
++	int ret;
++
++	ret = virtio_msg_bus_bridge_endpoint_set_offline
++		(&loopback->bridge.endpoint,
++		 VIRTIO_MSG_BUS_BRIDGE_ENDPOINT_OFFLINE_REASON_REMOVED);
++	if (ret && ret != -ENODEV && ret != -ENOTCONN)
++		pr_warn_ratelimited("endpoint removal escalation failed: ret=%d\n",
++				    ret);
++}
++
++static void
++virtio_msg_loopback_bridge_map_release_forget
++	(struct virtio_msg_loopback *loopback,
++	 const struct vmsg_bridge_uapi_map_event *event)
++{
++	u32 handle;
++	int ret;
++
++	if (!loopback || !event || !event->map_id)
++		return;
++
++	handle = READ_ONCE(loopback->bridge.endpoint.handle);
++	if (!handle)
++		return;
++
++	ret = virtio_msg_bus_bridge_device_map_del(handle, event->map_id);
++	if (ret && ret != -EALREADY && ret != -ENOENT && ret != -ENODEV &&
++	    ret != -ENOTCONN)
++		pr_warn_ratelimited("released map forget failed: map_id=%#llx ret=%d\n",
++				    (unsigned long long)event->map_id, ret);
++}
++
++static int
++virtio_msg_loopback_bridge_map_released
++	(struct virtio_msg_loopback *loopback,
++	 const struct vmsg_bridge_uapi_map_event *event)
++{
++	struct virtio_msg_bus_dma_device_map_result result;
++	struct virtio_msg_bus_dma_driver_release release;
++	struct virtio_msg_loopback_page_window *window;
++	struct virtio_msg_loopback_exact_export *exact;
++	struct virtio_msg_loopback_slot *slot = NULL;
++	enum virtio_msg_loopback_map_state old_state;
++	bool endpoint_remove = false;
++	unsigned int owner_count = 0;
++	int ret;
++
++	if (!event || event->type != VMSG_BRIDGE_UAPI_MAP_EVENT_RELEASED)
++		return -EINVAL;
++
++	mutex_lock(&loopback->area_lock);
++	ret = virtio_msg_bus_dma_device_helper_map_released
++		(&loopback->map_helper, event, &result);
++	if (ret) {
++		mutex_unlock(&loopback->area_lock);
++		return ret;
++	}
++	if (result.action == VIRTIO_MSG_BUS_DMA_DEVICE_MAP_IGNORED) {
++		mutex_unlock(&loopback->area_lock);
++		return 0;
++	}
++	if (result.action == VIRTIO_MSG_BUS_DMA_DEVICE_MAP_RELEASED_DEL_DONE) {
++		virtio_msg_loopback_bridge_map_result_locked(loopback, &result,
++							     0);
++		mutex_unlock(&loopback->area_lock);
++		return 0;
++	}
++	if (result.action != VIRTIO_MSG_BUS_DMA_DEVICE_MAP_RELEASED) {
++		mutex_unlock(&loopback->area_lock);
++		return 0;
++	}
++
++	window = virtio_msg_loopback_page_window_from_map_locked(loopback,
++								 &result.map);
++	if (!window) {
++		mutex_unlock(&loopback->area_lock);
++		pr_debug("rx MAP_RELEASED ignored: map_id=%#llx mmap_off=%#llx (no window)\n",
++			 (unsigned long long)event->map_id,
++			 (unsigned long long)event->mmap_offset);
++		return 0;
++	}
++
++	old_state = window->state;
++	owner_count = window->owner_count;
++	window->map_id = 0;
++	window->del_req_queued = false;
++	window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_REMOTE_RELEASED;
++	virtio_msg_loopback_page_window_get(window);
++	mutex_unlock(&loopback->area_lock);
++
++	virtio_msg_loopback_bridge_map_release_forget(loopback, event);
++
++	exact = virtio_msg_loopback_exact_export_find_window(loopback, window);
++	if (!exact) {
++		endpoint_remove = owner_count;
++	} else {
++		ret = virtio_msg_bus_dma_export_released
++			(&exact->provider_export, &release);
++		if (ret && ret != -EOPNOTSUPP)
++			pr_warn_ratelimited("retained map release handling failed: map_id=%#llx ret=%d\n",
++					    (unsigned long long)event->map_id, ret);
++		if (ret == -EOPNOTSUPP ||
++		    (!ret &&
++		     release.action ==
++			     VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_IGNORED)) {
++			if (owner_count)
++				release.action =
++					VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_RETAINED_ACTIVE;
++		}
++
++		if (release.action ==
++		    VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_RETAINED_ACTIVE)
++			slot = READ_ONCE(exact->slot);
++		virtio_msg_loopback_exact_put(exact);
++		endpoint_remove = !slot &&
++			release.action ==
++				VIRTIO_MSG_BUS_DMA_DRIVER_RELEASE_RETAINED_ACTIVE;
++	}
++
++	pr_debug("rx MAP_RELEASED: map_id=%#llx bus=%#llx len=%#llx old=%u owners=%u slot=%u endpoint_remove=%u\n",
++		 (unsigned long long)event->map_id,
++		 (unsigned long long)window->bus_addr,
++		 (unsigned long long)window->length, old_state,
++		 owner_count, slot ? slot->dev_num : 0,
++		 endpoint_remove);
++
++	if (slot)
++		virtio_msg_loopback_slot_stop(loopback, slot->dev_num);
++	else if (endpoint_remove)
++		virtio_msg_loopback_bridge_set_removed(loopback);
++
++	virtio_msg_loopback_page_window_put(window);
++	return 0;
 +}
 +
 +static int
@@ -2229,10 +2451,7 @@ index 000000000000..7ae8f0419522
 +	(struct virtio_msg_bus_bridge_device *endpoint,
 +	 const struct vmsg_bridge_uapi_map_event *event, u32 ack_status)
 +{
-+	struct virtio_msg_loopback_page_window *window;
 +	struct virtio_msg_loopback *loopback;
-+	enum virtio_msg_loopback_map_state old_state;
-+	bool lookup_by_offset = false;
 +
 +	if (!endpoint || !event)
 +		return -EINVAL;
@@ -2240,121 +2459,23 @@ index 000000000000..7ae8f0419522
 +	loopback = endpoint->priv;
 +	if (!loopback)
 +		return -ENODEV;
-+	if (event->type != VMSG_BRIDGE_UAPI_MAP_EVENT_ADD &&
-+	    event->type != VMSG_BRIDGE_UAPI_MAP_EVENT_DEL_REQ)
-+		return 0;
 +
-+	mutex_lock(&loopback->area_lock);
-+	window = virtio_msg_loopback_page_window_lookup_by_id_locked(loopback,
-+								     event->map_id);
-+	if (!window) {
-+		window = virtio_msg_loopback_page_window_lookup_by_offset_locked
-+			(loopback, event->mmap_offset);
-+		lookup_by_offset = true;
-+	}
-+	if (!window) {
-+		mutex_unlock(&loopback->area_lock);
-+		vm_trace(NULL,
-+			 "rx MAP_ACK ignored: type=%u map_id=%#llx mmap_off=%#llx ack=%u (no window)\n",
-+			       event->type, (unsigned long long)event->map_id,
-+			       (unsigned long long)event->mmap_offset, ack_status);
-+		return 0;
-+	}
-+	if (event->type == VMSG_BRIDGE_UAPI_MAP_EVENT_ADD &&
-+	    lookup_by_offset && window->map_add_async &&
-+	    (!window->map_id || window->map_id != event->map_id)) {
-+		mutex_unlock(&loopback->area_lock);
-+		vm_trace(NULL,
-+			 "rx MAP_ACK ignored: type=%u map_id=%#llx mmap_off=%#llx ack=%u (async mismatch)\n",
-+			       event->type, (unsigned long long)event->map_id,
-+			       (unsigned long long)event->mmap_offset, ack_status);
-+		return 0;
-+	}
-+	old_state = window->state;
-+
-+	switch (ack_status) {
-+	case VMSG_BRIDGE_UAPI_MAP_ACK_OK:
-+		if (event->type == VMSG_BRIDGE_UAPI_MAP_EVENT_ADD) {
-+			if (window->state == VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY) {
-+				if (window->del_req_queued) {
-+					window->del_req_queued = false;
-+					window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING;
-+					virtio_msg_loopback_page_window_unindex_bus_addr_locked
-+						(loopback, window);
-+				} else {
-+					window->state = VIRTIO_MSG_LOOPBACK_MAP_STATE_ACTIVE;
-+				}
-+				virtio_msg_loopback_page_window_settle_add_locked
-+					(loopback, window, 0);
-+				window->map_add_async = false;
-+			}
-+			vm_trace(NULL,
-+				 "rx MAP_ACK: type=%u map_id=%#llx bus=%#llx len=%#llx ack=%u old=%u new=%u del_req_queued=%u\n",
-+				       event->type,
-+				       (unsigned long long)window->map_id,
-+				       (unsigned long long)window->bus_addr,
-+				       (unsigned long long)window->length,
-+				       ack_status, old_state, window->state,
-+				       window->del_req_queued);
-+		} else {
-+			vm_trace(NULL,
-+				 "rx MAP_ACK: type=%u map_id=%#llx bus=%#llx len=%#llx ack=%u old=%u new=%u\n",
-+				       event->type,
-+				       (unsigned long long)window->map_id,
-+				       (unsigned long long)window->bus_addr,
-+				       (unsigned long long)window->length,
-+				       ack_status, old_state, 0U);
-+			virtio_msg_loopback_page_window_remove_terminal_locked
-+				(loopback, window, 0);
-+			virtio_msg_loopback_page_window_put(window);
-+		}
-+		break;
-+	case VMSG_BRIDGE_UAPI_MAP_ACK_RETRY:
-+		if (!virtio_msg_loopback_bridge_map_event_ack_add_async_retry
-+			    (loopback, window, event, ack_status, old_state)) {
-+			vm_trace(NULL,
-+				 "rx MAP_ACK: type=%u map_id=%#llx bus=%#llx len=%#llx ack=%u old=%u new=%u del_req_queued=%u\n",
-+				       event->type,
-+				       (unsigned long long)window->map_id,
-+				       (unsigned long long)window->bus_addr,
-+				       (unsigned long long)window->length,
-+				       ack_status, old_state, window->state,
-+				       window->del_req_queued);
-+		}
-+		break;
-+	case VMSG_BRIDGE_UAPI_MAP_ACK_REJECT:
-+		if (virtio_msg_loopback_bridge_map_event_ack_add_async_retry
-+			    (loopback, window, event, ack_status, old_state))
-+			break;
-+		if (event->type == VMSG_BRIDGE_UAPI_MAP_EVENT_ADD)
-+			virtio_msg_loopback_page_window_settle_add_locked
-+				(loopback, window, -ENOMEM);
-+		vm_trace(NULL,
-+			 "rx MAP_ACK: type=%u map_id=%#llx bus=%#llx len=%#llx ack=%u old=%u new=%u\n",
-+			       event->type,
-+			       (unsigned long long)window->map_id,
-+			       (unsigned long long)window->bus_addr,
-+			       (unsigned long long)window->length,
-+			       ack_status, old_state, 0U);
-+		virtio_msg_loopback_page_window_remove_terminal_locked
-+			(loopback, window,
-+			 event->type == VMSG_BRIDGE_UAPI_MAP_EVENT_DEL_REQ ?
-+			 -EREMOTEIO : -EINVAL);
-+		virtio_msg_loopback_page_window_put(window);
-+		break;
++	switch (event->type) {
++	case VMSG_BRIDGE_UAPI_MAP_EVENT_ADD_RESP:
++		return virtio_msg_loopback_bridge_map_add_response(loopback,
++								   event,
++								   ack_status);
++	case VMSG_BRIDGE_UAPI_MAP_EVENT_DEL_RESP:
++		return virtio_msg_loopback_bridge_map_del_response(loopback,
++								   event,
++								   ack_status);
++	case VMSG_BRIDGE_UAPI_MAP_EVENT_RELEASED:
++		if (ack_status != VMSG_BRIDGE_UAPI_MAP_ACK_OK)
++			return -EINVAL;
++		return virtio_msg_loopback_bridge_map_released(loopback, event);
 +	default:
-+		vm_trace(NULL,
-+			 "rx MAP_ACK ignored: type=%u map_id=%#llx bus=%#llx len=%#llx ack=%u state=%u\n",
-+			       event->type,
-+			       (unsigned long long)window->map_id,
-+			       (unsigned long long)window->bus_addr,
-+			       (unsigned long long)window->length,
-+			       ack_status, old_state);
-+		break;
++		return 0;
 +	}
-+
-+	mutex_unlock(&loopback->area_lock);
-+	return 0;
 +}
 +
 +static int
@@ -2366,11 +2487,12 @@ index 000000000000..7ae8f0419522
 +static int
 +virtio_msg_loopback_bridge_tx_msg(struct virtio_msg_bus_bridge_device *endpoint,
 +				  const struct virtio_msg *msg, u16 msg_size,
-+				   const struct virtio_msg_dispatch_ctx *dctx)
++				  const struct virtio_msg_dispatch_ctx *dctx)
 +{
 +	struct virtio_msg_loopback *loopback;
-+	enum virtio_msg_loopback_origin origin;
 +	u8 type_mask;
++
++	(void)dctx;
 +
 +	if (!endpoint || !msg || msg_size < sizeof(*msg))
 +		return -EINVAL;
@@ -2385,28 +2507,74 @@ index 000000000000..7ae8f0419522
 +	if (type_mask & VIRTIO_MSG_TYPE_BUS)
 +		return -EOPNOTSUPP;
 +	if (type_mask & VIRTIO_MSG_TYPE_RESPONSE)
-+		return virtio_msg_loopback_pending_complete_response(loopback, msg,
-+								     msg_size,
-+								     dctx);
-+
-+	origin = virtio_msg_loopback_origin_classify(dctx);
-+	if (msg->msg_id & VIRTIO_MSG_ID_EVENT_BIT)
-+		vm_trace(NULL,
-+			 "bridge event dispatch: msg_id=0x%02x dev=%u origin=%d\n",
-+			     msg->msg_id, le16_to_cpu(msg->dev_num), origin);
-+	switch (origin) {
-+	case VIRTIO_MSG_LOOPBACK_ORIGIN_TRANSPORT_REQUEST:
-+		return virtio_msg_loopback_bridge_handle_transport_request
-+			(loopback, msg, msg_size, dctx);
-+	case VIRTIO_MSG_LOOPBACK_ORIGIN_TRANSPORT_EVENT:
-+		return virtio_msg_loopback_bridge_handle_transport_event
-+			(loopback, msg, msg_size);
-+	case VIRTIO_MSG_LOOPBACK_ORIGIN_BRIDGE:
-+		return virtio_msg_loopback_bridge_handle_bridge_request
-+			(loopback, msg, msg_size);
-+	default:
 +		return -EINVAL;
-+	}
++
++	return virtio_msg_loopback_bridge_handle_bridge_request(loopback, msg,
++							       msg_size);
++}
++
++static int
++virtio_msg_loopback_bridge_relay_request
++		(struct virtio_msg_bus_bridge_device *endpoint,
++		 const struct virtio_msg *msg, u16 msg_size,
++		 const struct virtio_msg_dispatch_ctx *dctx)
++{
++	struct virtio_msg_loopback *loopback;
++
++	if (!endpoint)
++		return -EINVAL;
++
++	loopback = endpoint->priv;
++	if (!loopback)
++		return -ENODEV;
++
++	return virtio_msg_loopback_bridge_handle_transport_request(loopback, msg,
++								  msg_size,
++								  dctx);
++}
++
++static int
++virtio_msg_loopback_bridge_relay_event
++		(struct virtio_msg_bus_bridge_device *endpoint,
++		 const struct virtio_msg *msg, u16 msg_size,
++		 const struct virtio_msg_dispatch_ctx *dctx)
++{
++	struct virtio_msg_loopback *loopback;
++
++	(void)dctx;
++
++	if (!endpoint)
++		return -EINVAL;
++
++	loopback = endpoint->priv;
++	if (!loopback)
++		return -ENODEV;
++
++	if (msg && (msg->msg_id & VIRTIO_MSG_ID_EVENT_BIT))
++		pr_debug("bridge event dispatch: msg_id=0x%02x dev=%u\n",
++			 msg->msg_id, le16_to_cpu(msg->dev_num));
++
++	return virtio_msg_loopback_bridge_handle_transport_event(loopback, msg,
++								msg_size);
++}
++
++static int
++virtio_msg_loopback_bridge_relay_response
++		(struct virtio_msg_bus_bridge_device *endpoint,
++		 const struct virtio_msg *msg, u16 msg_size,
++		 const struct virtio_msg_dispatch_ctx *dctx)
++{
++	struct virtio_msg_loopback *loopback;
++
++	if (!endpoint)
++		return -EINVAL;
++
++	loopback = endpoint->priv;
++	if (!loopback)
++		return -ENODEV;
++
++	return virtio_msg_loopback_pending_complete_response(loopback, msg,
++							     msg_size, dctx);
 +}
 +
 +static int
@@ -2427,11 +2595,10 @@ index 000000000000..7ae8f0419522
 +		return 0;
 +
 +	switch (dev_state) {
-+	case VIRTIO_MSG_BUS_EVENT_DEV_STATE_READY:
-+		schedule_work(&loopback->slots[dev_num].start_work);
++	case VIRTIO_MSG_BUS_EVENT_DEV_STATE_ADDED:
 +		break;
 +	case VIRTIO_MSG_BUS_EVENT_DEV_STATE_REMOVED:
-+		virtio_msg_loopback_slot_stop(loopback, dev_num);
++		virtio_msg_loopback_slot_stop_async(loopback, dev_num);
 +		break;
 +	default:
 +		break;
@@ -2440,13 +2607,91 @@ index 000000000000..7ae8f0419522
 +	return ret;
 +}
 +
++int virtio_msg_loopback_bridge_slot_can_start(struct virtio_msg_loopback *loopback,
++					      u16 dev_num)
++{
++	struct virtio_msg_bus_bridge_device *endpoint;
++	u8 bitmap = 0;
++	u16 next_offset;
++	u16 out_num;
++	int ret;
++
++	if (!loopback || !virtio_msg_loopback_dev_num_valid(dev_num))
++		return -EINVAL;
++
++	if (!loopback->bridge.endpoint_registered)
++		return -ENOTCONN;
++
++	endpoint = &loopback->bridge.endpoint;
++	if (!READ_ONCE(endpoint->handle) ||
++	    READ_ONCE(endpoint->rx_unregistered))
++		return -ENOTCONN;
++
++	ret = virtio_msg_bus_bridge_topology_get_devices_window
++		(endpoint, dev_num, 1, &bitmap, sizeof(bitmap), &out_num,
++		 &next_offset);
++	if (ret)
++		return ret;
++	if (!out_num || !(bitmap & BIT(0)))
++		return -ENODEV;
++
++	if (!READ_ONCE(endpoint->handle) ||
++	    READ_ONCE(endpoint->rx_unregistered))
++		return -ENOTCONN;
++
++	return 0;
++}
++
++static void
++virtio_msg_loopback_bridge_endpoint_online(struct virtio_msg_bus_bridge_device *endpoint)
++{
++	u8 bitmap[DIV_ROUND_UP(VIRTIO_MSG_LOOPBACK_MAX_DEVS, 8)] = { 0 };
++	struct virtio_msg_loopback *loopback;
++	u16 next_offset;
++	u16 out_num;
++	u16 dev_num;
++	int ret;
++
++	if (!endpoint)
++		return;
++
++	loopback = endpoint->priv;
++	if (!loopback)
++		return;
++
++	ret = virtio_msg_bus_bridge_topology_get_devices_window
++		(endpoint, 0, VIRTIO_MSG_LOOPBACK_MAX_DEVS, bitmap,
++		 sizeof(bitmap), &out_num, &next_offset);
++	if (ret) {
++		pr_warn_ratelimited("loopback topology reconciliation failed: ret=%d\n",
++				    ret);
++		return;
++	}
++
++	for (dev_num = 0; dev_num < VIRTIO_MSG_LOOPBACK_MAX_DEVS; dev_num++) {
++		bool present;
++
++		present = dev_num < out_num &&
++			  (bitmap[dev_num >> 3] & BIT(dev_num & 0x7));
++		if (present)
++			schedule_work(&loopback->slots[dev_num].start_work);
++		else
++			virtio_msg_loopback_slot_stop(loopback, dev_num);
++	}
++}
++
 +static const struct virtio_msg_bus_bridge_device_ops virtio_msg_loopback_ops = {
 +	.get_caps		= virtio_msg_loopback_bridge_get_caps,
 +	.tx_msg			= virtio_msg_loopback_bridge_tx_msg,
++	.tx_userspace_msg	= virtio_msg_loopback_bridge_tx_msg,
++	.relay_request		= virtio_msg_loopback_bridge_relay_request,
++	.relay_event		= virtio_msg_loopback_bridge_relay_event,
++	.relay_response		= virtio_msg_loopback_bridge_relay_response,
 +	.report_error		= virtio_msg_loopback_bridge_report_error,
 +	.mmap			= virtio_msg_loopback_bridge_mmap,
 +	.map_event_ack		= virtio_msg_loopback_bridge_map_event_ack,
 +	.notify_device_event	= virtio_msg_loopback_bridge_notify_device_event,
++	.endpoint_online	= virtio_msg_loopback_bridge_endpoint_online,
 +};
 +
 +static int
@@ -2473,13 +2718,10 @@ index 000000000000..7ae8f0419522
 +		return -ENOENT;
 +	}
 +	if (pending->dev_num != dev_num || pending->token != token) {
-+		virtio_msg_loopback_pending_get(pending);
 +		pending->status = -EPROTO;
-+		pending->completed = true;
 +		xa_erase(&loopback->pending_relay_xa, key);
 +		mutex_unlock(&loopback->pending_lock);
 +		complete(&pending->done);
-+		virtio_msg_loopback_pending_put(pending);
 +		return -EPROTO;
 +	}
 +	relay_seq = pending->relay_seq;
@@ -2488,7 +2730,6 @@ index 000000000000..7ae8f0419522
 +		mutex_unlock(&loopback->pending_lock);
 +		return -ENOENT;
 +	}
-+	virtio_msg_loopback_pending_get(pending);
 +	mutex_unlock(&loopback->pending_lock);
 +	*out_pending = pending;
 +
@@ -2498,11 +2739,7 @@ index 000000000000..7ae8f0419522
 +static void
 +virtio_msg_loopback_pending_complete(struct virtio_msg_loopback_relay_pending *pending)
 +{
-+	if (!pending)
-+		return;
-+
 +	complete(&pending->done);
-+	virtio_msg_loopback_pending_put(pending);
 +}
 +
 +int virtio_msg_loopback_pending_complete_response(struct virtio_msg_loopback
@@ -2524,24 +2761,25 @@ index 000000000000..7ae8f0419522
 +
 +	ret = virtio_msg_loopback_pending_take(loopback, dev_num, token, dctx,
 +					       &pending);
-+	if (ret)
++	if (ret) {
++		if (ret == -ENOENT)
++			return 0;
 +		return ret;
++	}
 +
-+	vm_trace(NULL, "response complete: dev=%u token=%u\n", dev_num, token);
++	pr_debug("response complete: dev=%u token=%u\n", dev_num, token);
 +
 +	mutex_lock(&loopback->pending_lock);
-+	if (READ_ONCE(pending->timed_out)) {
++	if (pending->timed_out) {
 +		pending->status = -ETIMEDOUT;
-+	} else if (msg_size > pending->response_capacity) {
++	} else if (msg_size > VIRTIO_MSG_LOOPBACK_MAX_MSG_SIZE) {
 +		pending->status = -EMSGSIZE;
 +		ret = -EMSGSIZE;
 +	} else {
 +		memcpy(pending->response, msg, msg_size);
-+		pending->response_size = msg_size;
 +		pending->status = 0;
 +		ret = 0;
 +	}
-+	pending->completed = true;
 +	mutex_unlock(&loopback->pending_lock);
 +
 +	virtio_msg_loopback_pending_complete(pending);
@@ -2567,19 +2805,21 @@ index 000000000000..7ae8f0419522
 +	if (!loopback)
 +		return -ENODEV;
 +
-+	vm_trace(NULL, "error report: dev=%u tok=%u id=0x%02x err=%d\n",
++	pr_debug("error report: dev=%u tok=%u id=0x%02x err=%d\n",
 +		 dev_num, token, msg_id, error);
 +	ret = virtio_msg_loopback_pending_take(loopback, dev_num, token, dctx,
 +					       &pending);
-+	if (ret)
++	if (ret) {
++		if (ret == -ENOENT)
++			return 0;
 +		return ret;
++	}
 +
 +	mutex_lock(&loopback->pending_lock);
-+	if (READ_ONCE(pending->timed_out))
++	if (pending->timed_out)
 +		pending->status = -ETIMEDOUT;
 +	else
 +		pending->status = error;
-+	pending->completed = true;
 +	mutex_unlock(&loopback->pending_lock);
 +
 +	virtio_msg_loopback_pending_complete(pending);
@@ -2605,20 +2845,17 @@ index 000000000000..7ae8f0419522
 +		}
 +
 +		xa_erase(&loopback->pending_relay_xa, index);
-+		virtio_msg_loopback_pending_get(pending);
 +		pending->status = status;
 +		pending->timed_out = status == -ETIMEDOUT;
-+		pending->completed = true;
 +		mutex_unlock(&loopback->pending_lock);
 +
 +		complete(&pending->done);
-+		virtio_msg_loopback_pending_put(pending);
 +		index = 0;
 +	}
 +}
 +
 +static int
-+virtio_msg_loopback_validate_addr(const struct vmsg_bus_resolver *resolver,
++virtio_msg_loopback_validate_addr(const struct virtio_msg_bus_bridge_resolver *resolver,
 +				  char *bus_id)
 +{
 +	if (!resolver || !bus_id)
@@ -2636,7 +2873,7 @@ index 000000000000..7ae8f0419522
 +}
 +
 +static struct virtio_msg_bus_bridge_device *
-+virtio_msg_loopback_match_addr(const struct vmsg_bus_resolver *resolver,
++virtio_msg_loopback_match_addr(const struct virtio_msg_bus_bridge_resolver *resolver,
 +			       const char *bus_id)
 +{
 +	struct virtio_msg_loopback_bridge *bridge;
@@ -2665,8 +2902,8 @@ index 000000000000..7ae8f0419522
 +	bridge = &loopback->bridge;
 +	if (bridge->resolver_registered || bridge->endpoint_registered)
 +		return -EBUSY;
-+	vm_info(NULL, "loopback bridge start: bus='%s'\n",
-+		VIRTIO_MSG_LOOPBACK_BUS_NAME);
++	pr_debug("loopback bridge start: bus='%s'\n",
++		 VIRTIO_MSG_LOOPBACK_BUS_NAME);
 +
 +	memset(bridge, 0, sizeof(*bridge));
 +	strscpy(bridge->bus_id, VIRTIO_MSG_LOOPBACK_BUS_ID,
@@ -2676,18 +2913,19 @@ index 000000000000..7ae8f0419522
 +	bridge->resolver.validate = virtio_msg_loopback_validate_addr;
 +	bridge->resolver.match = virtio_msg_loopback_match_addr;
 +
-+	loopback->exact_wq = alloc_ordered_workqueue("virtio_msg_loopback_exact",
-+						     WQ_MEM_RECLAIM);
-+	if (!loopback->exact_wq)
++	loopback->exact_cleanup_wq =
++		alloc_ordered_workqueue("virtio_msg_lb_exact_cleanup",
++					WQ_MEM_RECLAIM);
++	if (!loopback->exact_cleanup_wq)
 +		return -ENOMEM;
 +
 +	virtio_msg_bus_bridge_device_init(&bridge->endpoint,
 +					  &virtio_msg_loopback_ops, loopback);
 +
-+	ret = vmsg_bus_resolver_register(&bridge->resolver);
++	ret = virtio_msg_bus_bridge_resolver_register(&bridge->resolver);
 +	if (ret) {
-+		destroy_workqueue(loopback->exact_wq);
-+		loopback->exact_wq = NULL;
++		destroy_workqueue(loopback->exact_cleanup_wq);
++		loopback->exact_cleanup_wq = NULL;
 +		return ret;
 +	}
 +	bridge->resolver_registered = true;
@@ -2696,15 +2934,15 @@ index 000000000000..7ae8f0419522
 +						    bridge->bus_id,
 +						    &bridge->endpoint);
 +	if (ret) {
-+		vmsg_bus_resolver_unregister(&bridge->resolver);
++		virtio_msg_bus_bridge_resolver_unregister(&bridge->resolver);
 +		bridge->resolver_registered = false;
-+		destroy_workqueue(loopback->exact_wq);
-+		loopback->exact_wq = NULL;
++		destroy_workqueue(loopback->exact_cleanup_wq);
++		loopback->exact_cleanup_wq = NULL;
 +		return ret;
 +	}
 +	bridge->endpoint_registered = true;
-+	vm_info(NULL, "loopback bridge started: bus='%s' endpoint=%u\n",
-+		VIRTIO_MSG_LOOPBACK_BUS_NAME, bridge->endpoint.handle);
++	pr_debug("loopback bridge started: bus='%s' endpoint=%u\n",
++		 VIRTIO_MSG_LOOPBACK_BUS_NAME, bridge->endpoint.handle);
 +
 +	return 0;
 +}
@@ -2717,15 +2955,15 @@ index 000000000000..7ae8f0419522
 +		return;
 +
 +	bridge = &loopback->bridge;
-+	vm_info(NULL, "loopback bridge stop: bus='%s' endpoint=%u\n",
-+		VIRTIO_MSG_LOOPBACK_BUS_NAME, bridge->endpoint.handle);
++	pr_debug("loopback bridge stop: bus='%s' endpoint=%u\n",
++		 VIRTIO_MSG_LOOPBACK_BUS_NAME, bridge->endpoint.handle);
 +	virtio_msg_loopback_pending_abort_all(loopback, -ESHUTDOWN);
-+	if (loopback->exact_wq)
-+		drain_workqueue(loopback->exact_wq);
++	if (loopback->exact_cleanup_wq)
++		drain_workqueue(loopback->exact_cleanup_wq);
 +	virtio_msg_loopback_map_cleanup_all(loopback);
-+	if (loopback->exact_wq) {
-+		destroy_workqueue(loopback->exact_wq);
-+		loopback->exact_wq = NULL;
++	if (loopback->exact_cleanup_wq) {
++		destroy_workqueue(loopback->exact_cleanup_wq);
++		loopback->exact_cleanup_wq = NULL;
 +	}
 +
 +	if (bridge->endpoint_registered) {
@@ -2736,25 +2974,25 @@ index 000000000000..7ae8f0419522
 +	}
 +
 +	if (bridge->resolver_registered) {
-+		vmsg_bus_resolver_unregister(&bridge->resolver);
++		virtio_msg_bus_bridge_resolver_unregister(&bridge->resolver);
 +		bridge->resolver_registered = false;
 +	}
 +}
-diff --git a/drivers/virtio/virtio_msg_loopback_internal.h b/drivers/virtio/virtio_msg_loopback_internal.h
+diff --git a/drivers/virtio/virtio_msg_loopback_priv.h b/drivers/virtio/virtio_msg_loopback_priv.h
 new file mode 100644
-index 000000000000..0e583c87d4a3
+index 000000000000..484ea490e2dc
 --- /dev/null
-+++ b/drivers/virtio/virtio_msg_loopback_internal.h
-@@ -0,0 +1,251 @@
++++ b/drivers/virtio/virtio_msg_loopback_priv.h
+@@ -0,0 +1,245 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/*
-+ * Virtio message loopback base scaffold internal interfaces.
++ * Virtio message loopback base scaffold private interfaces.
 + *
 + * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
 + */
 +
-+#ifndef _VIRTIO_MSG_LOOPBACK_INTERNAL_H
-+#define _VIRTIO_MSG_LOOPBACK_INTERNAL_H
++#ifndef _VIRTIO_MSG_LOOPBACK_PRIV_H
++#define _VIRTIO_MSG_LOOPBACK_PRIV_H
 +
 +#include <linux/atomic.h>
 +#include <linux/completion.h>
@@ -2766,12 +3004,15 @@ index 000000000000..0e583c87d4a3
 +#include <linux/slab.h>
 +#include <linux/spinlock.h>
 +#include <linux/vmalloc.h>
++#include <linux/virtio_msg_bus_provider.h>
 +#include <linux/virtio_msg_bus_bridge_device.h>
 +#include <linux/virtio_msg_transport.h>
 +#include <linux/workqueue.h>
 +#include <linux/xarray.h>
 +
-+#include "virtio_msg_bus_dma.h"
++#include "virtio_msg_bus_dma_device_helper.h"
++#include "virtio_msg_bus_dma_driver_helper.h"
++#include "virtio_msg_bus_queue_helper.h"
 +
 +#define VIRTIO_MSG_LOOPBACK_BUS_NAME		"loopback"
 +#define VIRTIO_MSG_LOOPBACK_BUS_ID		"default"
@@ -2779,21 +3020,15 @@ index 000000000000..0e583c87d4a3
 +#define VIRTIO_MSG_LOOPBACK_MAX_DEVS		32
 +#define VIRTIO_MSG_LOOPBACK_MAX_MSG_SIZE	128U
 +#define VIRTIO_MSG_LOOPBACK_RELAY_TIMEOUT_MS	5000U
-+#define VIRTIO_MSG_LOOPBACK_RELAY_RETRY_DELAY_MS	10U
 +
 +enum virtio_msg_loopback_map_state {
 +	VIRTIO_MSG_LOOPBACK_MAP_STATE_MMAP_READY = 1,
 +	VIRTIO_MSG_LOOPBACK_MAP_STATE_ACTIVE = 2,
 +	VIRTIO_MSG_LOOPBACK_MAP_STATE_DEL_PENDING = 3,
++	VIRTIO_MSG_LOOPBACK_MAP_STATE_REMOTE_RELEASED = 4,
 +};
 +
 +struct device;
-+
-+struct virtio_msg_loopback_deferred_event {
-+	struct list_head node;
-+	u32 vq_index;
-+	u32 next_offset;
-+};
 +
 +struct virtio_msg_loopback_relay_pending {
 +	struct completion done;
@@ -2801,13 +3036,8 @@ index 000000000000..0e583c87d4a3
 +	u16 dev_num;
 +	u16 token;
 +	int status;
-+	u16 response_capacity;
-+	u16 response_size;
-+	bool completed;
 +	bool timed_out;
-+	unsigned long deadline;
 +	struct virtio_msg *response;
-+	refcount_t refs;
 +};
 +
 +struct virtio_msg_loopback_page_window {
@@ -2815,16 +3045,21 @@ index 000000000000..0e583c87d4a3
 +	u64 mmap_offset;
 +	u64 bus_addr;
 +	u64 length;
++	u32 map_flags;
 +	unsigned int owner_count;
 +	enum virtio_msg_loopback_map_state state;
 +	bool del_req_queued;
 +	struct completion revoke_done;
 +	int revoke_status;
 +	bool revoke_settled;
-+	struct completion map_add_done; /* signalled when ADD ACK_OK or REJECT */
-+	int map_add_status;             /* 0 on ACK_OK, -ENOMEM on REJECT */
-+	bool map_add_settled;           /* true once map_add_done is signalled */
-+	bool map_add_async;             /* true when async activation owns retries */
++	/*
++	 * The bridge reports MAP_ADD completion to the loopback provider through
++	 * split response/release helpers. Rejected map adds invalidate the
++	 * bridge session and fail the pending add completion.
++	 */
++	struct completion map_add_done; /* signalled after MAP_ACK_OK */
++	int map_add_status;             /* 0 for accepted map adds */
++	bool map_add_settled;           /* true once accepted add is reported */
 +	refcount_t refs;
 +	void *kva;
 +	struct device *dma_dev;
@@ -2842,15 +3077,11 @@ index 000000000000..0e583c87d4a3
 +	struct list_head node;
 +	refcount_t refs;
 +	bool dead;
-+	bool activate_ref_held;
-+	bool activate_running;
-+	bool activate_requeue;
++	bool cleanup_ref_held;
 +
-+	struct virtio_msg_bus_dma_export provider_export;
++	struct virtio_msg_bus_dma_driver_export provider_export;
 +	struct virtio_msg_loopback_slot *slot;
-+	struct delayed_work activate_work;
-+	bool async_activate;
-+	bool gate_held;
++	struct delayed_work cleanup_work;
 +	bool windows_ready;
 +
 +	unsigned int num_page_windows;
@@ -2863,7 +3094,7 @@ index 000000000000..0e583c87d4a3
 +
 +struct virtio_msg_loopback_bridge {
 +	struct virtio_msg_bus_bridge_device endpoint;
-+	struct vmsg_bus_resolver resolver;
++	struct virtio_msg_bus_bridge_resolver resolver;
 +	char bus_id[VMSG_BRIDGE_UAPI_BUS_ID_LEN];
 +	bool resolver_registered;
 +	bool endpoint_registered;
@@ -2875,10 +3106,12 @@ index 000000000000..0e583c87d4a3
 +	struct device *dma_dev;
 +	u16 dev_num;
 +	struct work_struct start_work;
-+	atomic_t pending_async_exports;
-+	spinlock_t deferred_event_lock; /* Protects deferred_events updates. */
-+	struct list_head deferred_events;
-+	struct delayed_work deferred_event_work;
++	struct work_struct stop_work;
++	struct virtio_msg_bus_queue_helper ordered_queue;
++	atomic_t stopping;
++	bool dma_initial_pool_installing;
++	bool dma_initial_pool_seen;
++	int dma_initial_pool_status;
 +	bool provider_attached;
 +	bool transport_prepared;
 +	bool device_registered;
@@ -2887,18 +3120,18 @@ index 000000000000..0e583c87d4a3
 +struct virtio_msg_loopback {
 +	struct virtio_msg_loopback_bridge bridge;
 +	struct virtio_msg_loopback_slot slots[VIRTIO_MSG_LOOPBACK_MAX_DEVS];
-+	/* Protects pending_relay_xa (keyed by relay_seq) and pending_next_seq updates. */
++	/* Protects pending_relay_xa and relay/token sequence allocation. */
 +	struct mutex pending_lock;
 +	struct xarray pending_relay_xa;
-+	u64 pending_next_seq;
-+	/* Protects exact-export/page-window state and map_area_xa_* tables. */
++	u64 next_relay_seq;
++	u16 next_token;
++	/* Protects exact-export/page-window state and bus-address lookup. */
 +	struct mutex area_lock;
-+	struct xarray map_area_xa_by_id;
-+	struct xarray map_area_xa_by_offset;
 +	struct xarray map_area_xa_by_dma_addr;
++	struct virtio_msg_bus_dma_device_helper map_helper;
 +	spinlock_t exact_lock; /* Protects exact_exports list and atomic transitions. */
 +	struct list_head exact_exports;
-+	struct workqueue_struct *exact_wq;
++	struct workqueue_struct *exact_cleanup_wq;
 +	u64 map_next_offset;
 +};
 +
@@ -2908,14 +3141,26 @@ index 000000000000..0e583c87d4a3
 +				   u16 dev_num);
 +void virtio_msg_loopback_slot_stop(struct virtio_msg_loopback *loopback,
 +				   u16 dev_num);
++void virtio_msg_loopback_slot_stop_async(struct virtio_msg_loopback *loopback,
++					 u16 dev_num);
 +void virtio_msg_loopback_slot_stop_all(struct virtio_msg_loopback *loopback);
 +int virtio_msg_loopback_pending_complete_response
 +	(struct virtio_msg_loopback *loopback, const struct virtio_msg *msg,
 +	 u16 msg_size, const struct virtio_msg_dispatch_ctx *dctx);
 +void virtio_msg_loopback_pending_abort_all(struct virtio_msg_loopback *loopback,
 +					   int status);
-+const struct virtio_msg_bus_dma_provider_ops *
++const struct virtio_msg_bus_dma_driver_provider_ops *
 +virtio_msg_loopback_bridge_dma_provider_ops_get(void);
++int virtio_msg_loopback_bridge_slot_can_start(struct virtio_msg_loopback *loopback,
++					      u16 dev_num);
++void
++virtio_msg_loopback_bridge_dma_install_begin(struct virtio_msg_loopback_slot *slot);
++int
++virtio_msg_loopback_bridge_dma_install_finish(struct virtio_msg_loopback_slot *slot);
++int
++virtio_msg_loopback_bridge_publish_event_sleepable(struct virtio_msg_loopback
++						  *loopback,
++						  const struct virtio_msg *msg);
 +
 +static inline bool virtio_msg_loopback_dev_num_valid(u16 dev_num)
 +{
@@ -2929,19 +3174,6 @@ index 000000000000..0e583c87d4a3
 +		return NULL;
 +
 +	return &loopback->slots[dev_num];
-+}
-+
-+static inline void
-+virtio_msg_loopback_pending_get(struct virtio_msg_loopback_relay_pending *pending)
-+{
-+	refcount_inc(&pending->refs);
-+}
-+
-+static inline void
-+virtio_msg_loopback_pending_put(struct virtio_msg_loopback_relay_pending *pending)
-+{
-+	if (refcount_dec_and_test(&pending->refs))
-+		kfree(pending);
 +}
 +
 +static inline void
@@ -2996,13 +3228,13 @@ index 000000000000..0e583c87d4a3
 +		virtio_msg_loopback_exact_export_free(exact);
 +}
 +
-+#endif /* _VIRTIO_MSG_LOOPBACK_INTERNAL_H */
++#endif /* _VIRTIO_MSG_LOOPBACK_PRIV_H */
 diff --git a/drivers/virtio/virtio_msg_loopback_transport.c b/drivers/virtio/virtio_msg_loopback_transport.c
 new file mode 100644
-index 000000000000..1e9e92b2153c
+index 000000000000..f60718204b29
 --- /dev/null
 +++ b/drivers/virtio/virtio_msg_loopback_transport.c
-@@ -0,0 +1,812 @@
+@@ -0,0 +1,680 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Virtio message loopback slot base scaffold.
@@ -3023,208 +3255,28 @@ index 000000000000..1e9e92b2153c
 +#include <linux/slab.h>
 +#include <linux/string.h>
 +
-+#include "virtio_msg_bus_dma.h"
-+#include "virtio_msg_loopback_internal.h"
-+#define VM_LOG_COMPONENT VM_LOG_COMPONENT_LOOPBACK
-+#include "virtio_msg_debug.h"
++#include "virtio_msg_bus_dma_driver_helper.h"
++#include "virtio_msg_bus_queue_helper.h"
++#include "virtio_msg_loopback_priv.h"
 +
-+static void
-+virtio_msg_loopback_deferred_event_list_free(struct list_head *events)
-+{
-+	struct virtio_msg_loopback_deferred_event *entry, *tmp;
-+
-+	if (!events)
-+		return;
-+
-+	list_for_each_entry_safe(entry, tmp, events, node) {
-+		list_del(&entry->node);
-+		kfree(entry);
-+	}
-+}
-+
-+static void
-+virtio_msg_loopback_slot_purge_deferred_events
-+	(struct virtio_msg_loopback_slot *slot)
-+{
-+	LIST_HEAD(events);
-+	unsigned long flags;
-+
-+	if (!slot)
-+		return;
-+
-+	spin_lock_irqsave(&slot->deferred_event_lock, flags);
-+	list_splice_init(&slot->deferred_events, &events);
-+	spin_unlock_irqrestore(&slot->deferred_event_lock, flags);
-+
-+	virtio_msg_loopback_deferred_event_list_free(&events);
-+}
-+
-+static struct virtio_msg_loopback_deferred_event *
-+virtio_msg_loopback_deferred_event_find_locked
-+	(struct virtio_msg_loopback_slot *slot, u32 vq_index)
-+{
-+	struct virtio_msg_loopback_deferred_event *entry;
-+
-+	lockdep_assert_held(&slot->deferred_event_lock);
-+
-+	list_for_each_entry(entry, &slot->deferred_events, node) {
-+		if (entry->vq_index == vq_index)
-+			return entry;
-+	}
-+
-+	return NULL;
-+}
-+
-+static void
-+virtio_msg_loopback_deferred_event_queue_locked
-+	(struct virtio_msg_loopback_slot *slot,
-+	 struct virtio_msg_loopback_deferred_event *entry)
-+{
-+	struct virtio_msg_loopback_deferred_event *existing;
-+
-+	lockdep_assert_held(&slot->deferred_event_lock);
-+
-+	if (!entry)
-+		return;
-+
-+	existing = virtio_msg_loopback_deferred_event_find_locked(slot,
-+								  entry->vq_index);
-+	if (existing) {
-+		existing->next_offset = entry->next_offset;
-+		kfree(entry);
-+		return;
-+	}
-+
-+	list_add_tail(&entry->node, &slot->deferred_events);
-+}
++#define VIRTIO_MSG_LOOPBACK_ORDERED_QUEUE_DEPTH	32U
 +
 +static int
-+virtio_msg_loopback_defer_event(struct virtio_msg_loopback_slot *slot,
-+				u32 vq_index, u32 next_offset)
++virtio_msg_loopback_ordered_queue_submit
++		(void *context,
++		 const struct virtio_msg_bus_queue_helper_item *item)
 +{
-+	struct virtio_msg_loopback_deferred_event *entry;
-+	unsigned long flags;
++	struct virtio_msg_loopback_slot *slot = context;
 +
-+	if (!slot)
++	if (!slot || !item)
 +		return -EINVAL;
 +
-+	spin_lock_irqsave(&slot->deferred_event_lock, flags);
-+	entry = virtio_msg_loopback_deferred_event_find_locked(slot, vq_index);
-+	if (entry) {
-+		entry->next_offset = next_offset;
-+		spin_unlock_irqrestore(&slot->deferred_event_lock, flags);
-+		return 0;
-+	}
-+	spin_unlock_irqrestore(&slot->deferred_event_lock, flags);
-+
-+	entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
-+	if (!entry)
-+		return -ENOSPC;
-+
-+	entry->vq_index = vq_index;
-+	entry->next_offset = next_offset;
-+
-+	spin_lock_irqsave(&slot->deferred_event_lock, flags);
-+	virtio_msg_loopback_deferred_event_queue_locked(slot, entry);
-+	spin_unlock_irqrestore(&slot->deferred_event_lock, flags);
-+
-+	return 0;
-+}
-+
-+static void virtio_msg_loopback_deferred_event_workfn(struct work_struct *work)
-+{
-+	struct virtio_msg_loopback_slot *slot;
-+	struct virtio_msg_loopback *loopback;
-+	struct virtio_msg_dispatch_ctx dctx = {
-+		.flags = VIRTIO_MSG_DISPATCH_F_NONBLOCK,
-+	};
-+	struct virtio_msg *request;
-+	struct virtio_msg_event_avail *event;
-+	struct virtio_msg_loopback_deferred_event *entry;
-+	unsigned long flags;
-+	u8 request_buf[sizeof(*request) + sizeof(*event)];
-+	u32 handle;
-+	int ret;
-+
-+	slot = container_of(to_delayed_work(work),
-+			    struct virtio_msg_loopback_slot, deferred_event_work);
-+	loopback = slot->loopback;
-+	if (!loopback)
-+		return;
-+
-+	if (atomic_read(&slot->pending_async_exports) > 0)
-+		return;
-+
-+	for (;;) {
-+		if (atomic_read(&slot->pending_async_exports) > 0)
-+			return;
-+
-+		spin_lock_irqsave(&slot->deferred_event_lock, flags);
-+		if (list_empty(&slot->deferred_events)) {
-+			spin_unlock_irqrestore(&slot->deferred_event_lock, flags);
-+			return;
-+		}
-+		entry = list_first_entry(&slot->deferred_events,
-+					 struct virtio_msg_loopback_deferred_event,
-+					 node);
-+		list_del_init(&entry->node);
-+		spin_unlock_irqrestore(&slot->deferred_event_lock, flags);
-+
-+		/*
-+		 * Gate may have reopened after we popped one deferred event.
-+		 * Put it back without publishing until pending shares clear.
-+		 */
-+		if (atomic_read(&slot->pending_async_exports) > 0) {
-+			spin_lock_irqsave(&slot->deferred_event_lock, flags);
-+			virtio_msg_loopback_deferred_event_queue_locked(slot,
-+									entry);
-+			spin_unlock_irqrestore(&slot->deferred_event_lock,
-+					       flags);
-+			return;
-+		}
-+
-+		memset(request_buf, 0, sizeof(request_buf));
-+		request = (struct virtio_msg *)request_buf;
-+		virtio_msg_prepare(request, VIRTIO_MSG_EVENT_AVAIL,
-+				   VIRTIO_MSG_TOKEN_EVENT, sizeof(*event));
-+		request->dev_num = cpu_to_le16(slot->dev_num);
-+		event = virtio_msg_payload(request);
-+		event->vq_index = cpu_to_le32(entry->vq_index);
-+		event->next_offset = cpu_to_le32(entry->next_offset);
-+
-+		handle = READ_ONCE(loopback->bridge.endpoint.handle);
-+		if (!handle)
-+			ret = -ENODEV;
-+		else
-+			ret = virtio_msg_bus_bridge_device_rx(handle, request, &dctx);
-+
-+		if (!ret) {
-+			kfree(entry);
-+			continue;
-+		}
-+
-+		if (ret == -EAGAIN || ret == -ENOSPC) {
-+			spin_lock_irqsave(&slot->deferred_event_lock, flags);
-+			virtio_msg_loopback_deferred_event_queue_locked(slot,
-+									entry);
-+			spin_unlock_irqrestore(&slot->deferred_event_lock, flags);
-+			(void)mod_delayed_work(system_wq, &slot->deferred_event_work,
-+					       msecs_to_jiffies
-+						(VIRTIO_MSG_LOOPBACK_RELAY_RETRY_DELAY_MS));
-+			return;
-+		}
-+
-+		kfree(entry);
-+		if (ret == -ENODEV || ret == -ENOTCONN) {
-+			LIST_HEAD(drop_events);
-+
-+			spin_lock_irqsave(&slot->deferred_event_lock, flags);
-+			list_splice_init(&slot->deferred_events, &drop_events);
-+			spin_unlock_irqrestore(&slot->deferred_event_lock, flags);
-+
-+			virtio_msg_loopback_deferred_event_list_free(&drop_events);
-+			return;
-+		}
++	switch (item->type) {
++	case VIRTIO_MSG_BUS_QUEUE_HELPER_ITEM_MSG:
++		return virtio_msg_loopback_bridge_publish_event_sleepable
++			(slot->loopback, item->vmsg);
++	default:
++		return -EINVAL;
 +	}
 +}
 +
@@ -3243,19 +3295,6 @@ index 000000000000..1e9e92b2153c
 +	return 0;
 +}
 +
-+static unsigned long
-+virtio_msg_loopback_pending_timeout_jiffies
-+	(const struct virtio_msg_loopback_relay_pending *pending)
-+{
-+	if (!pending)
-+		return 0;
-+
-+	if (time_after(pending->deadline, jiffies))
-+		return pending->deadline - jiffies;
-+
-+	return 0;
-+}
-+
 +static u16
 +virtio_msg_loopback_next_request_token_locked(struct virtio_msg_loopback *loopback)
 +{
@@ -3263,16 +3302,33 @@ index 000000000000..1e9e92b2153c
 +
 +	lockdep_assert_held(&loopback->pending_lock);
 +
-+	if (!loopback->pending_next_seq)
-+		loopback->pending_next_seq = 1;
++	if (loopback->next_token <= VIRTIO_MSG_TOKEN_FIXED)
++		loopback->next_token = VIRTIO_MSG_TOKEN_FIXED + 1;
 +
 +	for (;;) {
-+		token = (u16)loopback->pending_next_seq++;
-+		if (!loopback->pending_next_seq)
-+			loopback->pending_next_seq = 1;
++		token = loopback->next_token++;
++		if (loopback->next_token <= VIRTIO_MSG_TOKEN_FIXED)
++			loopback->next_token = VIRTIO_MSG_TOKEN_FIXED + 1;
 +		if (token > VIRTIO_MSG_TOKEN_FIXED)
 +			return token;
 +	}
++}
++
++static u64
++virtio_msg_loopback_next_relay_seq_locked(struct virtio_msg_loopback *loopback)
++{
++	u64 relay_seq;
++
++	lockdep_assert_held(&loopback->pending_lock);
++
++	if (!loopback->next_relay_seq)
++		loopback->next_relay_seq = 1;
++
++	relay_seq = loopback->next_relay_seq++;
++	if (!loopback->next_relay_seq)
++		loopback->next_relay_seq = 1;
++
++	return relay_seq;
 +}
 +
 +static int
@@ -3281,14 +3337,17 @@ index 000000000000..1e9e92b2153c
 +			    struct virtio_msg *response)
 +{
 +	struct virtio_msg_dispatch_ctx dctx = { 0 };
-+	struct virtio_msg_loopback_relay_pending *pending;
++	struct virtio_msg_loopback_relay_pending pending = { 0 };
 +	struct virtio_msg *request_local;
 +	struct virtio_msg_loopback *loopback;
 +	u8 request_buf[VIRTIO_MSG_LOOPBACK_MAX_MSG_SIZE];
++	unsigned long deadline;
++	unsigned long now;
 +	unsigned long timeout;
 +	u16 request_size;
 +	u16 expected_dev_num;
 +	u16 dev_num;
++	bool pending_erased;
 +	int ret;
 +	u32 handle;
 +
@@ -3316,36 +3375,24 @@ index 000000000000..1e9e92b2153c
 +	request_local = (struct virtio_msg *)request_buf;
 +	memcpy(request_local, request, request_size);
 +
-+	pending = kzalloc(sizeof(*pending), GFP_KERNEL);
-+	if (!pending)
-+		return -ENOMEM;
-+
-+	init_completion(&pending->done);
-+	pending->dev_num = dev_num;
-+	pending->status = -ETIMEDOUT;
-+	pending->deadline = jiffies +
-+		msecs_to_jiffies(VIRTIO_MSG_LOOPBACK_RELAY_TIMEOUT_MS);
-+	pending->response = response;
-+	pending->response_capacity = VIRTIO_MSG_LOOPBACK_MAX_MSG_SIZE;
-+	refcount_set(&pending->refs, 1);
++	init_completion(&pending.done);
++	pending.dev_num = dev_num;
++	pending.status = -ETIMEDOUT;
++	pending.response = response;
 +
 +	mutex_lock(&loopback->pending_lock);
-+	if (!loopback->pending_next_seq)
-+		loopback->pending_next_seq = 1;
-+	pending->relay_seq = loopback->pending_next_seq++;
-+	if (!loopback->pending_next_seq)
-+		loopback->pending_next_seq = 1;
-+	pending->token = virtio_msg_loopback_next_request_token_locked(loopback);
-+	request_local->token = cpu_to_le16(pending->token);
-+	vm_trace(&vmdev->vdev.dev, "relay req msg_id=0x%02x dev=%u tok=%u\n",
-+		 request->msg_id, dev_num, pending->token);
++	pending.relay_seq = virtio_msg_loopback_next_relay_seq_locked(loopback);
++	pending.token = virtio_msg_loopback_next_request_token_locked(loopback);
++	request_local->token = cpu_to_le16(pending.token);
++	dev_dbg(&vmdev->vdev.dev, "relay req msg_id=0x%02x dev=%u tok=%u\n",
++		request->msg_id, dev_num, pending.token);
 +
-+	ret = xa_err(xa_store(&loopback->pending_relay_xa, pending->relay_seq,
-+			      pending,
++	ret = xa_err(xa_store(&loopback->pending_relay_xa, pending.relay_seq,
++			      &pending,
 +			      GFP_KERNEL));
 +	mutex_unlock(&loopback->pending_lock);
 +	if (ret)
-+		goto out_put_pending;
++		return ret;
 +
 +	handle = READ_ONCE(loopback->bridge.endpoint.handle);
 +	if (!handle) {
@@ -3354,52 +3401,61 @@ index 000000000000..1e9e92b2153c
 +	}
 +
 +	dctx.flags = VIRTIO_MSG_DISPATCH_F_REQUEST_SLEEPABLE;
-+	dctx.relay_seq = pending->relay_seq;
++	dctx.relay_seq = pending.relay_seq;
++	deadline = jiffies +
++		msecs_to_jiffies(VIRTIO_MSG_LOOPBACK_RELAY_TIMEOUT_MS);
 +	ret = virtio_msg_bus_bridge_device_rx(handle, request_local, &dctx);
 +	if (ret) {
-+		vm_warn_rl(&vmdev->vdev.dev,
-+			   "relay bridge_rx err msg_id=0x%02x ret=%d\n",
++		dev_warn_ratelimited(&vmdev->vdev.dev,
++				     "relay bridge_rx err msg_id=0x%02x ret=%d\n",
 +			   request->msg_id, ret);
 +		goto out_remove_pending;
 +	}
 +
-+	timeout = virtio_msg_loopback_pending_timeout_jiffies(pending);
-+	if (timeout)
-+		timeout = wait_for_completion_timeout(&pending->done, timeout);
-+	else if (completion_done(&pending->done))
++	now = jiffies;
++	if (time_after(deadline, now)) {
++		timeout = wait_for_completion_timeout(&pending.done,
++						      deadline - now);
++	} else if (completion_done(&pending.done)) {
 +		timeout = 1;
++	} else {
++		timeout = 0;
++	}
 +	if (!timeout) {
-+		vm_warn_rl(&vmdev->vdev.dev,
-+			   "relay timeout msg_id=0x%02x dev=%u tok=%u\n",
-+			   request->msg_id, dev_num, pending->token);
-+		WRITE_ONCE(pending->timed_out, true);
++		dev_warn_ratelimited(&vmdev->vdev.dev,
++				     "relay timeout msg_id=0x%02x dev=%u tok=%u\n",
++			   request->msg_id, dev_num, pending.token);
 +		mutex_lock(&loopback->pending_lock);
-+		if (xa_erase(&loopback->pending_relay_xa, pending->relay_seq) ==
-+		    pending) {
-+			pending->completed = true;
-+			pending->status = -ETIMEDOUT;
-+		}
++		pending.timed_out = true;
++		pending_erased =
++			xa_erase(&loopback->pending_relay_xa,
++				 pending.relay_seq) == &pending;
++		if (pending_erased)
++			pending.status = -ETIMEDOUT;
 +		mutex_unlock(&loopback->pending_lock);
-+		virtio_msg_bus_bridge_device_relay_drop(handle,
-+							pending->dev_num,
-+							pending->token);
++		if (pending_erased) {
++			virtio_msg_bus_bridge_device_relay_drop(handle,
++								pending.dev_num,
++								pending.token);
++		} else {
++			wait_for_completion(&pending.done);
++		}
 +		ret = -ETIMEDOUT;
-+		goto out_put_pending;
++		return ret;
 +	}
 +
-+	ret = pending->status;
-+	goto out_put_pending;
++	return pending.status;
 +
 +out_remove_pending:
 +	mutex_lock(&loopback->pending_lock);
-+	if (xa_erase(&loopback->pending_relay_xa, pending->relay_seq) ==
-+	    pending) {
-+		pending->completed = true;
-+		pending->status = ret;
-+	}
++	pending_erased =
++		xa_erase(&loopback->pending_relay_xa,
++			 pending.relay_seq) == &pending;
++	if (pending_erased)
++		pending.status = ret;
 +	mutex_unlock(&loopback->pending_lock);
-+out_put_pending:
-+	virtio_msg_loopback_pending_put(pending);
++	if (!pending_erased)
++		wait_for_completion(&pending.done);
 +	return ret;
 +}
 +
@@ -3407,9 +3463,6 @@ index 000000000000..1e9e92b2153c
 +virtio_msg_loopback_send_event(struct virtio_msg_transport_device *vmdev,
 +			       const struct virtio_msg *request)
 +{
-+	struct virtio_msg_dispatch_ctx dctx = {
-+		.flags = VIRTIO_MSG_DISPATCH_F_NONBLOCK,
-+	};
 +	const struct virtio_msg_event_avail *event;
 +	struct virtio_msg_loopback_slot *slot;
 +	struct virtio_msg_loopback *loopback;
@@ -3418,7 +3471,6 @@ index 000000000000..1e9e92b2153c
 +	u32 vq_index = 0;
 +	u32 next_offset = 0;
 +	int ret;
-+	u32 handle;
 +	bool avail_event = false;
 +
 +	if (!vmdev || !request)
@@ -3453,51 +3505,27 @@ index 000000000000..1e9e92b2153c
 +		event = (const struct virtio_msg_event_avail *)request->payload;
 +		vq_index = le32_to_cpu(event->vq_index);
 +		next_offset = le32_to_cpu(event->next_offset);
-+
-+		if (atomic_read(&slot->pending_async_exports) > 0) {
-+			vm_trace(&vmdev->vdev.dev,
-+				 "defer EVENT_AVAIL: dev=%u vq=%u next=%u pending_exports=%d\n",
-+				 dev_num, vq_index, next_offset,
-+				 atomic_read(&slot->pending_async_exports));
-+			ret = virtio_msg_loopback_defer_event(slot, vq_index,
-+							      next_offset);
-+			if (!ret &&
-+			    atomic_read(&slot->pending_async_exports) == 0)
-+				(void)mod_delayed_work
-+					(system_wq, &slot->deferred_event_work, 0);
-+			return ret;
-+		}
 +	}
-+
-+	handle = READ_ONCE(loopback->bridge.endpoint.handle);
-+	if (!handle)
-+		return -ENODEV;
 +
 +	if (avail_event)
-+		vm_trace(&vmdev->vdev.dev,
-+			 "send EVENT_AVAIL: dev=%u vq=%u next=%u handle=%u\n",
-+			 dev_num, vq_index, next_offset, handle);
++		dev_dbg(&vmdev->vdev.dev,
++			"queue EVENT_AVAIL: dev=%u vq=%u next=%u\n",
++			 dev_num, vq_index, next_offset);
 +	else
-+		vm_trace(&vmdev->vdev.dev,
-+			 "send event: msg_id=0x%02x dev=%u handle=%u\n",
-+			 request->msg_id, dev_num, handle);
++		dev_dbg(&vmdev->vdev.dev,
++			"queue event: msg_id=0x%02x dev=%u\n",
++			 request->msg_id, dev_num);
 +
-+	ret = virtio_msg_bus_bridge_device_rx(handle, request, &dctx);
-+	if (avail_event && (ret == -EAGAIN || ret == -ENOSPC)) {
-+		ret = virtio_msg_loopback_defer_event(slot, vq_index, next_offset);
-+		if (!ret)
-+			(void)mod_delayed_work(system_wq,
-+					       &slot->deferred_event_work, 0);
-+		return ret;
-+	}
++	ret = virtio_msg_bus_queue_helper_enqueue(&slot->ordered_queue, request,
++						  GFP_ATOMIC);
 +	if (ret) {
 +		if (avail_event)
-+			vm_warn_rl(&vmdev->vdev.dev,
-+				   "send EVENT_AVAIL failed: dev=%u vq=%u next=%u ret=%d\n",
++			dev_warn_ratelimited(&vmdev->vdev.dev,
++					     "queue EVENT_AVAIL failed: dev=%u vq=%u next=%u ret=%d\n",
 +				   dev_num, vq_index, next_offset, ret);
 +		else
-+			vm_warn_rl(&vmdev->vdev.dev,
-+				   "send event failed: msg_id=0x%02x dev=%u ret=%d\n",
++			dev_warn_ratelimited(&vmdev->vdev.dev,
++					     "queue event failed: msg_id=0x%02x dev=%u ret=%d\n",
 +				   request->msg_id, dev_num, ret);
 +	}
 +
@@ -3506,15 +3534,11 @@ index 000000000000..1e9e92b2153c
 +
 +static int virtio_msg_loopback_send(struct virtio_msg_transport_device *vmdev,
 +				    const struct virtio_msg *request,
-+				    struct virtio_msg *response, u32 flags)
++				    struct virtio_msg *response)
 +{
 +	if (!vmdev || !request)
 +		return -EINVAL;
-+	if (flags & ~VIRTIO_MSG_BUS_SEND_F_NONBLOCK)
-+		return -EINVAL;
-+	if (WARN_ON_ONCE((flags & VIRTIO_MSG_BUS_SEND_F_NONBLOCK) && response))
-+		return -EINVAL;
-+	if (flags & VIRTIO_MSG_BUS_SEND_F_NONBLOCK)
++	if (!response)
 +		return virtio_msg_loopback_send_event(vmdev, request);
 +
 +	return virtio_msg_loopback_request(vmdev, request, response);
@@ -3539,6 +3563,10 @@ index 000000000000..1e9e92b2153c
 +	.synchronize_cbs	= virtio_msg_loopback_synchronize_cbs,
 +};
 +
++static void
++virtio_msg_loopback_slot_stop_sync(struct virtio_msg_loopback *loopback,
++				   u16 dev_num, bool cancel_stop_work);
++
 +static void virtio_msg_loopback_slot_start_workfn(struct work_struct *work)
 +{
 +	struct virtio_msg_loopback_slot *slot;
@@ -3546,9 +3574,24 @@ index 000000000000..1e9e92b2153c
 +
 +	slot = container_of(work, struct virtio_msg_loopback_slot, start_work);
 +	ret = virtio_msg_loopback_slot_start(slot->loopback, slot->dev_num);
-+	if (ret && ret != -EBUSY)
-+		vm_warn_rl(NULL, "slot start failed: dev=%u ret=%d\n",
-+			   slot->dev_num, ret);
++	if (ret && ret != -EBUSY && ret != -EAGAIN && ret != -ENODEV &&
++	    ret != -ENOTCONN)
++		pr_warn_ratelimited("slot start failed: dev=%u ret=%d\n",
++				    slot->dev_num, ret);
++}
++
++static void virtio_msg_loopback_slot_stop_workfn(struct work_struct *work)
++{
++	struct virtio_msg_loopback_slot *slot;
++	int ret;
++
++	slot = container_of(work, struct virtio_msg_loopback_slot, stop_work);
++	virtio_msg_loopback_slot_stop_sync(slot->loopback, slot->dev_num, false);
++
++	ret = virtio_msg_loopback_bridge_slot_can_start(slot->loopback,
++							slot->dev_num);
++	if (!ret)
++		schedule_work(&slot->start_work);
 +}
 +
 +static void
@@ -3568,12 +3611,12 @@ index 000000000000..1e9e92b2153c
 +
 +	mutex_init(&loopback->pending_lock);
 +	xa_init(&loopback->pending_relay_xa);
-+	loopback->pending_next_seq = 1;
++	loopback->next_relay_seq = 1;
++	loopback->next_token = VIRTIO_MSG_TOKEN_FIXED + 1;
 +
 +	mutex_init(&loopback->area_lock);
-+	xa_init(&loopback->map_area_xa_by_id);
-+	xa_init(&loopback->map_area_xa_by_offset);
 +	xa_init(&loopback->map_area_xa_by_dma_addr);
++	virtio_msg_bus_dma_device_helper_init(&loopback->map_helper);
 +	spin_lock_init(&loopback->exact_lock);
 +	INIT_LIST_HEAD(&loopback->exact_exports);
 +	loopback->map_next_offset = PAGE_SIZE;
@@ -3586,11 +3629,8 @@ index 000000000000..1e9e92b2153c
 +		slot->loopback = loopback;
 +		INIT_WORK(&slot->start_work,
 +			  virtio_msg_loopback_slot_start_workfn);
-+		atomic_set(&slot->pending_async_exports, 0);
-+		spin_lock_init(&slot->deferred_event_lock);
-+		INIT_LIST_HEAD(&slot->deferred_events);
-+		INIT_DELAYED_WORK(&slot->deferred_event_work,
-+				  virtio_msg_loopback_deferred_event_workfn);
++		INIT_WORK(&slot->stop_work,
++			  virtio_msg_loopback_slot_stop_workfn);
 +		slot->dev_num = dev_num;
 +		virtio_msg_loopback_slot_reset_vmdev(slot);
 +	}
@@ -3601,16 +3641,16 @@ index 000000000000..1e9e92b2153c
 +	unsigned int dev_num;
 +
 +	for (dev_num = 0; dev_num < VIRTIO_MSG_LOOPBACK_MAX_DEVS; dev_num++) {
++		cancel_work_sync(&loopback->slots[dev_num].stop_work);
 +		cancel_work_sync(&loopback->slots[dev_num].start_work);
-+		cancel_delayed_work_sync(&loopback->slots[dev_num].deferred_event_work);
-+		virtio_msg_loopback_slot_purge_deferred_events
-+			(&loopback->slots[dev_num]);
-+		virtio_msg_bus_dma_cleanup(&loopback->slots[dev_num].vmdev);
++		virtio_msg_bus_queue_helper_stop
++			(&loopback->slots[dev_num].ordered_queue);
++		virtio_msg_bus_dma_driver_helper_cleanup
++			(&loopback->slots[dev_num].vmdev);
 +	}
 +
 +	xa_destroy(&loopback->pending_relay_xa);
-+	xa_destroy(&loopback->map_area_xa_by_id);
-+	xa_destroy(&loopback->map_area_xa_by_offset);
++	virtio_msg_bus_dma_device_helper_destroy(&loopback->map_helper);
 +	xa_destroy(&loopback->map_area_xa_by_dma_addr);
 +}
 +
@@ -3639,13 +3679,20 @@ index 000000000000..1e9e92b2153c
 +	slot = virtio_msg_loopback_slot_get(loopback, dev_num);
 +	if (!slot)
 +		return -EINVAL;
++	if (atomic_read(&slot->stopping))
++		return -EBUSY;
 +	if (slot->provider_attached && slot->transport_prepared &&
 +	    slot->device_registered)
 +		return 0;
 +	if (slot->provider_attached || slot->transport_prepared ||
 +	    slot->device_registered)
 +		return -EBUSY;
-+	vm_info(NULL, "loopback slot start: dev=%u\n", dev_num);
++
++	ret = virtio_msg_loopback_bridge_slot_can_start(loopback, dev_num);
++	if (ret)
++		return ret;
++
++	pr_debug("loopback slot start: dev=%u\n", dev_num);
 +
 +	dma_dev = virtio_msg_loopback_slot_register_dma_dev(slot->dev_num);
 +	if (IS_ERR(dma_dev))
@@ -3658,6 +3705,15 @@ index 000000000000..1e9e92b2153c
 +	}
 +
 +	slot->dma_dev = dma_dev;
++
++	ret = virtio_msg_bus_queue_helper_init
++		(&slot->ordered_queue, dma_dev, VIRTIO_MSG_LOOPBACK_MAX_MSG_SIZE,
++		 VIRTIO_MSG_LOOPBACK_ORDERED_QUEUE_DEPTH,
++		 VIRTIO_MSG_LOOPBACK_RELAY_TIMEOUT_MS,
++		 virtio_msg_loopback_ordered_queue_submit,
++		 NULL, slot);
++	if (ret)
++		goto out_unregister_dma_dev;
 +
 +	ret = virtio_msg_transport_attach_provider(&slot->vmdev,
 +						   &virtio_msg_loopback_bus_ops,
@@ -3682,15 +3738,33 @@ index 000000000000..1e9e92b2153c
 +
 +	slot->vmdev.vdev.vmap.dma_dev = dma_dev;
 +	slot->vmdev.vdev.dev.parent = dma_dev;
-+	ret = virtio_msg_bus_dma_install(&slot->vmdev,
-+					 virtio_msg_loopback_bridge_dma_provider_ops_get(),
-+					 loopback);
++
++	ret = virtio_msg_loopback_bridge_slot_can_start(loopback, dev_num);
 +	if (ret)
 +		goto out_unprepare;
 +
++	virtio_msg_loopback_bridge_dma_install_begin(slot);
++	ret = virtio_msg_bus_dma_driver_helper_install
++		(&slot->vmdev,
++		 virtio_msg_loopback_bridge_dma_provider_ops_get(), loopback);
++	if (!ret)
++		ret = virtio_msg_loopback_bridge_dma_install_finish(slot);
++	else
++		(void)virtio_msg_loopback_bridge_dma_install_finish(slot);
++	if (ret) {
++		virtio_msg_bus_dma_driver_helper_cleanup(&slot->vmdev);
++		goto out_unprepare;
++	}
++
++	ret = virtio_msg_loopback_bridge_slot_can_start(loopback, dev_num);
++	if (ret) {
++		virtio_msg_bus_dma_driver_helper_cleanup(&slot->vmdev);
++		goto out_unprepare;
++	}
++
 +	ret = virtio_msg_transport_register_prepared_device(&slot->vmdev);
 +	if (ret) {
-+		virtio_msg_bus_dma_cleanup(&slot->vmdev);
++		virtio_msg_bus_dma_driver_helper_cleanup(&slot->vmdev);
 +		goto out_unprepare;
 +	}
 +	slot->device_registered = true;
@@ -3707,6 +3781,7 @@ index 000000000000..1e9e92b2153c
 +		slot->provider_attached = false;
 +	}
 +out_unregister_dma_dev:
++	virtio_msg_bus_queue_helper_stop(&slot->ordered_queue);
 +	slot->vmdev.vdev.vmap.dma_dev = NULL;
 +	slot->vmdev.vdev.dev.parent = NULL;
 +	root_device_unregister(slot->dma_dev);
@@ -3715,8 +3790,9 @@ index 000000000000..1e9e92b2153c
 +	return ret;
 +}
 +
-+void virtio_msg_loopback_slot_stop(struct virtio_msg_loopback *loopback,
-+				   u16 dev_num)
++static void
++virtio_msg_loopback_slot_stop_sync(struct virtio_msg_loopback *loopback,
++				   u16 dev_num, bool cancel_stop_work)
 +{
 +	struct virtio_msg_loopback_slot *slot;
 +
@@ -3726,18 +3802,20 @@ index 000000000000..1e9e92b2153c
 +	slot = virtio_msg_loopback_slot_get(loopback, dev_num);
 +	if (!slot)
 +		return;
-+	vm_info(NULL, "loopback slot stop: dev=%u\n", dev_num);
++	pr_debug("loopback slot stop: dev=%u\n", dev_num);
 +
++	atomic_inc(&slot->stopping);
++	if (cancel_stop_work)
++		cancel_work_sync(&slot->stop_work);
 +	cancel_work_sync(&slot->start_work);
-+	cancel_delayed_work_sync(&slot->deferred_event_work);
-+	virtio_msg_loopback_slot_purge_deferred_events(slot);
++	virtio_msg_bus_queue_helper_stop(&slot->ordered_queue);
 +	if (slot->device_registered) {
 +		virtio_msg_transport_unregister_device(&slot->vmdev);
 +		slot->device_registered = false;
 +		slot->transport_prepared = false;
 +	}
-+	if (virtio_msg_bus_dma_is_installed(&slot->vmdev))
-+		virtio_msg_bus_dma_cleanup(&slot->vmdev);
++	if (virtio_msg_bus_dma_driver_helper_is_installed(&slot->vmdev))
++		virtio_msg_bus_dma_driver_helper_cleanup(&slot->vmdev);
 +
 +	if (slot->transport_prepared) {
 +		virtio_msg_transport_unprepare_device(&slot->vmdev);
@@ -3757,6 +3835,28 @@ index 000000000000..1e9e92b2153c
 +	}
 +
 +	virtio_msg_loopback_slot_reset_vmdev(slot);
++	atomic_dec(&slot->stopping);
++}
++
++void virtio_msg_loopback_slot_stop(struct virtio_msg_loopback *loopback,
++				   u16 dev_num)
++{
++	virtio_msg_loopback_slot_stop_sync(loopback, dev_num, true);
++}
++
++void virtio_msg_loopback_slot_stop_async(struct virtio_msg_loopback *loopback,
++					 u16 dev_num)
++{
++	struct virtio_msg_loopback_slot *slot;
++
++	if (!loopback)
++		return;
++
++	slot = virtio_msg_loopback_slot_get(loopback, dev_num);
++	if (!slot)
++		return;
++
++	schedule_work(&slot->stop_work);
 +}
 +
 +void virtio_msg_loopback_slot_stop_all(struct virtio_msg_loopback *loopback)
@@ -3780,7 +3880,7 @@ index 000000000000..1e9e92b2153c
 +	loopback = kzalloc(sizeof(*loopback), GFP_KERNEL);
 +	if (!loopback)
 +		return -ENOMEM;
-+	vm_info(NULL, "loopback init\n");
++	pr_debug("loopback init\n");
 +
 +	virtio_msg_loopback_root_state_init(loopback);
 +
@@ -3801,7 +3901,7 @@ index 000000000000..1e9e92b2153c
 +
 +	if (!loopback)
 +		return;
-+	vm_info(NULL, "loopback exit\n");
++	pr_debug("loopback exit\n");
 +
 +	virtio_msg_loopback = NULL;
 +	virtio_msg_loopback_slot_stop_all(loopback);

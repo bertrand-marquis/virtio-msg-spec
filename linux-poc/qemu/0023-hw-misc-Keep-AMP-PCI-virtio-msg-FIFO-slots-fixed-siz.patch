@@ -1,0 +1,94 @@
+From 0505fee454cec187f7d03e0e3716aa12796cddda Mon Sep 17 00:00:00 2001
+Message-ID: <0505fee454cec187f7d03e0e3716aa12796cddda.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 12:29:16 +0200
+Subject: [PATCH 23/30] hw/misc: Keep AMP PCI virtio-msg FIFO slots fixed-size
+
+The generic virtio-msg message storage can hold larger messages than
+AMP PCI slots, but AMP PCI bus framing still uses fixed-size SPSC
+queue slots.
+
+Receive and transmit VMSG_BUS_AMP_PCI_MAX_MSG_SIZE bytes for each FIFO
+slot while preserving the protocol message length in msg_size. Reject
+malformed embedded sizes before handing received frames to virtio-msg,
+and zero-pad short outbound messages so unused slot bytes do not leak
+stale data.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/misc/virtio-msg-amp-pci.c | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/hw/misc/virtio-msg-amp-pci.c b/hw/misc/virtio-msg-amp-pci.c
+index 0d2d3f3e22c6..c29c64bfeb1a 100644
+--- a/hw/misc/virtio-msg-amp-pci.c
++++ b/hw/misc/virtio-msg-amp-pci.c
+@@ -247,7 +247,7 @@ static void vmsg_amp_pci_class_init(ObjectClass *klass, const void *data)
+     pc->exit = vmsg_amp_pci_exit;
+     pc->vendor_id = PCI_VENDOR_ID_XILINX;
+     pc->device_id = 0x9039;
+-    pc->revision = 1;
++    pc->revision = VIRTIO_MSG_TRANSPORT_REVISION;
+     pc->class_id = PCI_CLASS_SYSTEM_OTHER;
+     dc->vmsd = &vmstate_vmsg_pci;
+ 
+@@ -404,7 +404,6 @@ static void vmsg_bus_amp_pci_process(VirtIOMSGBusDevice *bd)
+ {
+     VmsgBusAmpPciState *s = VMSG_BUS_AMP_PCI(bd);
+     spsc_queue *q;
+-    VirtIOMSG msg;
+     bool r;
+ 
+     if (!vmsg_bus_amp_pci_map_fifo(s)) {
+@@ -417,8 +416,18 @@ static void vmsg_bus_amp_pci_process(VirtIOMSGBusDevice *bd)
+      */
+     q = bd->peer->is_driver ? &s->shm.device : &s->shm.driver;
+     do {
+-        r = spsc_recv(q, &msg, sizeof msg);
++        VirtIOMSG msg = { 0 };
++        uint16_t msg_size;
++
++        r = spsc_recv(q, &msg, VMSG_BUS_AMP_PCI_MAX_MSG_SIZE);
+         if (r) {
++            msg_size = le16_to_cpu(msg.msg_size);
++            if (!vmsg_bus_amp_pci_valid_msg_size(msg_size)) {
++                qemu_log_mask(LOG_GUEST_ERROR,
++                              "%s: dropping malformed message size %u\n",
++                              __func__, msg_size);
++                continue;
++            }
+             virtio_msg_bus_receive(bd, &msg);
+         }
+     } while (r);
+@@ -430,13 +439,25 @@ static int vmsg_bus_amp_pci_send(VirtIOMSGBusDevice *bd, VirtIOMSG *msg_req)
+ {
+     VmsgAmpPciState *pci_s = VMSG_AMP_PCI(OBJECT(bd)->parent);
+     VmsgBusAmpPciState *s = VMSG_BUS_AMP_PCI(bd);
++    uint16_t msg_size = le16_to_cpu(msg_req->msg_size);
++    VirtIOMSG msg = { 0 };
+     bool sent;
+ 
++    if (!vmsg_bus_amp_pci_valid_msg_size(msg_size)) {
++        return VIRTIO_MSG_ERROR_BAD_MESSAGE;
++    }
++
++    /*
++     * Queue slots are fixed-size, but msg_size can be shorter than the slot.
++     * Zero-pad to avoid leaking stale bytes from stack or previous packets.
++     */
++    memcpy(&msg, msg_req, msg_size);
++
+     if (!vmsg_bus_amp_pci_map_fifo(s)) {
+         return VIRTIO_MSG_ERROR_MEMORY;
+     }
+ 
+-    sent = spsc_send(&s->shm.device, msg_req, sizeof *msg_req);
++    sent = spsc_send(&s->shm.device, &msg, VMSG_BUS_AMP_PCI_MAX_MSG_SIZE);
+     if (!sent) {
+         vmsg_bus_amp_pci_unmap_fifo(s);
+         return VIRTIO_MSG_ERROR_RETRY;
+-- 
+2.53.0
+

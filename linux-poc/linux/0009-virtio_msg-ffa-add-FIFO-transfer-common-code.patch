@@ -1,0 +1,867 @@
+From 754f29f083e56c6adad668baf897b330f19d22db Mon Sep 17 00:00:00 2001
+Message-ID: <754f29f083e56c6adad668baf897b330f19d22db.1779811422.git.bertrand.marquis@arm.com>
+In-Reply-To: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+References: <c754a13f81b5c8d7c27544ed31f5e983f8786f74.1779811421.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Mon, 27 Apr 2026 14:10:53 +0200
+Subject: [PATCH 09/12] virtio_msg: ffa: add FIFO transfer common code
+
+Add shared FF-A FIFO transfer helpers for the virtio message FF-A binding.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ drivers/virtio/Kconfig                        |  11 +
+ drivers/virtio/Makefile                       |   2 +
+ drivers/virtio/virtio_msg_bus_ffa.h           |   6 -
+ drivers/virtio/virtio_msg_bus_ffa_common.c    |  38 --
+ drivers/virtio/virtio_msg_bus_ffa_xfer.h      |   6 +
+ drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.c | 427 ++++++++++++++++++
+ drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.h | 273 +++++++++++
+ 7 files changed, 719 insertions(+), 44 deletions(-)
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.c
+ create mode 100644 drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.h
+
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index 8aa80c557c30..ec6620d61661 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -234,6 +234,17 @@ config VIRTIO_MSG_FFA_XFER_INDIRECT
+ 
+ 	  Indirect transfer is the shared bootstrap path.
+ 
++config VIRTIO_MSG_FFA_XFER_FIFO
++	bool "Virtio message bus FF-A FIFO transfer support"
++	depends on VIRTIO_MSG_FFA_XFER_INDIRECT
++	default y
++	help
++	  Enable FIFO transfer support for the virtio message bus FF-A
++	  bindings.
++
++	  FIFO is a runtime upgrade path and always requires a non-FIFO
++	  bootstrap method.
++
+ endif
+ 
+ config VIRTIO_DMA_SHARED_BUFFER
+diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+index 60e3aeac3473..a1e6821e79c1 100644
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -15,6 +15,8 @@ virtio_msg_loopback-y := virtio_msg_loopback_transport.o \
+ virtio_msg_bus_ffa_common-y := virtio_msg_bus_ffa_common.o
+ virtio_msg_bus_ffa_common-$(CONFIG_VIRTIO_MSG_FFA_XFER_INDIRECT) += \
+ 			 virtio_msg_bus_ffa_xfer_indirect.o
++virtio_msg_bus_ffa_common-$(CONFIG_VIRTIO_MSG_FFA_XFER_FIFO) += \
++			 virtio_msg_bus_ffa_xfer_fifo.o
+ obj-$(CONFIG_VIRTIO_MSG_FFA_COMMON) += virtio_msg_bus_ffa_common_module.o
+ virtio_msg_bus_ffa_common_module-y := $(virtio_msg_bus_ffa_common-y)
+ 
+diff --git a/drivers/virtio/virtio_msg_bus_ffa.h b/drivers/virtio/virtio_msg_bus_ffa.h
+index d1dfb7d7d59a..f33f5a97ce5a 100644
+--- a/drivers/virtio/virtio_msg_bus_ffa.h
++++ b/drivers/virtio/virtio_msg_bus_ffa.h
+@@ -29,8 +29,6 @@ struct device;
+ 
+ #define VIRTIO_MSG_FFA_BUS_NAME			"virtio-msg-ffa"
+ #define VIRTIO_MSG_FFA_TX_BUSY_RETRY_MAX		10
+-#define VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_BASE_MS	1
+-#define VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_MAX_MS		32
+ 
+ enum virtio_msg_ffa_transfer_method {
+ 	VIRTIO_MSG_FFA_XFER_NONE = 0,
+@@ -300,10 +298,6 @@ int virtio_msg_ffa_memory_retrieve(struct ffa_device *fdev,
+ 				   struct ffa_mem_retrieve_args *args,
+ 				   void *resp, size_t *resp_len);
+ bool virtio_msg_ffa_tx_busy_retry_sleepable(unsigned int *remaining);
+-void virtio_msg_ffa_fifo_notify_backoff_reset(u32 *delay_ms);
+-u32 virtio_msg_ffa_fifo_notify_backoff_delay(u32 *delay_ms);
+-bool virtio_msg_ffa_fifo_notify_backoff_next(u32 *delay_ms,
+-					     u32 *next_delay_ms);
+ void virtio_msg_ffa_trace_msg(struct device *dev, u16 peer_vm,
+ 			      const char *dir, const char *path,
+ 			      const struct virtio_msg *msg, size_t len);
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_common.c b/drivers/virtio/virtio_msg_bus_ffa_common.c
+index 2b18b8d5260f..4ef3a3068d0f 100644
+--- a/drivers/virtio/virtio_msg_bus_ffa_common.c
++++ b/drivers/virtio/virtio_msg_bus_ffa_common.c
+@@ -67,44 +67,6 @@ bool virtio_msg_ffa_tx_busy_retry_sleepable(unsigned int *remaining)
+ }
+ EXPORT_SYMBOL_GPL(virtio_msg_ffa_tx_busy_retry_sleepable);
+ 
+-void virtio_msg_ffa_fifo_notify_backoff_reset(u32 *delay_ms)
+-{
+-	if (delay_ms)
+-		*delay_ms = VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_BASE_MS;
+-}
+-EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_notify_backoff_reset);
+-
+-u32 virtio_msg_ffa_fifo_notify_backoff_delay(u32 *delay_ms)
+-{
+-	if (!delay_ms)
+-		return VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_BASE_MS;
+-	if (!*delay_ms)
+-		virtio_msg_ffa_fifo_notify_backoff_reset(delay_ms);
+-
+-	return *delay_ms;
+-}
+-EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_notify_backoff_delay);
+-
+-bool virtio_msg_ffa_fifo_notify_backoff_next(u32 *delay_ms,
+-					     u32 *next_delay_ms)
+-{
+-	u32 next_delay;
+-
+-	if (!delay_ms || !next_delay_ms)
+-		return false;
+-	if (virtio_msg_ffa_fifo_notify_backoff_delay(delay_ms) >=
+-	    VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_MAX_MS)
+-		return false;
+-
+-	next_delay = min_t(u32, *delay_ms << 1,
+-			   VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_MAX_MS);
+-	*delay_ms = next_delay;
+-	*next_delay_ms = next_delay;
+-
+-	return true;
+-}
+-EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_notify_backoff_next);
+-
+ struct virtio_msg_ffa_memory_share_ctx {
+ 	struct ffa_device *fdev;
+ 	struct ffa_mem_ops_args *args;
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_xfer.h b/drivers/virtio/virtio_msg_bus_ffa_xfer.h
+index d4b9dfc82167..eda9db62f52b 100644
+--- a/drivers/virtio/virtio_msg_bus_ffa_xfer.h
++++ b/drivers/virtio/virtio_msg_bus_ffa_xfer.h
+@@ -15,10 +15,16 @@
+ #include <linux/bits.h>
+ #include <linux/errno.h>
+ #include <linux/kconfig.h>
++#include <linux/limits.h>
++#include <linux/string.h>
+ #include <linux/types.h>
+ 
+ #include "virtio_msg_bus_ffa.h"
+ 
++#define VIRTIO_MSG_FFA_NOTIF_ID_MIN			0
++#define VIRTIO_MSG_FFA_NOTIF_ID_MAX			63
++#define VIRTIO_MSG_FFA_NOTIF_ID_INVALID		U16_MAX
++
+ enum virtio_msg_ffa_xfer_role_mask {
+ 	VIRTIO_MSG_FFA_XFER_ROLE_DRIVER = BIT(0),
+ 	VIRTIO_MSG_FFA_XFER_ROLE_DEVICE = BIT(1),
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.c b/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.c
+new file mode 100644
+index 000000000000..0506fa8babc7
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.c
+@@ -0,0 +1,427 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Virtio message bus over FF-A FIFO-method helpers.
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#include <linux/byteorder/little_endian.h>
++#include <linux/compiler.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/overflow.h>
++#include <linux/string.h>
++
++#include "virtio_msg_bus_ffa_xfer_fifo.h"
++
++static bool virtio_msg_ffa_notif_id_is_valid(u16 notif_id)
++{
++	return notif_id >= VIRTIO_MSG_FFA_NOTIF_ID_MIN &&
++	       notif_id <= VIRTIO_MSG_FFA_NOTIF_ID_MAX;
++}
++
++static bool virtio_msg_ffa_notif_id_from_api_is_valid(int notif_id)
++{
++	if (notif_id < VIRTIO_MSG_FFA_NOTIF_ID_MIN || notif_id > U16_MAX)
++		return false;
++
++	return virtio_msg_ffa_notif_id_is_valid((u16)notif_id);
++}
++
++static u16 virtio_msg_ffa_fifo_read_index(const struct virtio_msg_ffa_fifo_ring *ring)
++{
++	/* Pair with writer store-release after entry consumption. */
++	return le16_to_cpu(smp_load_acquire(&ring->hdr->read_index));
++}
++
++static u16 virtio_msg_ffa_fifo_write_index(const struct virtio_msg_ffa_fifo_ring *ring)
++{
++	/* Pair with writer store-release after entry publish. */
++	return le16_to_cpu(smp_load_acquire(&ring->hdr->write_index));
++}
++
++static void virtio_msg_ffa_fifo_set_read_index(struct virtio_msg_ffa_fifo_ring *ring,
++					       u16 read)
++{
++	/* Ensure entry reads complete before advancing read index. */
++	smp_store_release(&ring->hdr->read_index, cpu_to_le16(read));
++}
++
++static void virtio_msg_ffa_fifo_set_write_index(struct virtio_msg_ffa_fifo_ring *ring,
++						u16 write)
++{
++	/* Ensure entry writes are visible before publishing write index. */
++	smp_store_release(&ring->hdr->write_index, cpu_to_le16(write));
++}
++
++static int virtio_msg_ffa_fifo_indices_get(const struct virtio_msg_ffa_fifo_ring *ring,
++					   u16 *read, u16 *write)
++{
++	u16 rd, wr;
++
++	if (!ring->depth)
++		return -EPROTO;
++
++	rd = virtio_msg_ffa_fifo_read_index(ring);
++	wr = virtio_msg_ffa_fifo_write_index(ring);
++	if (rd >= ring->depth || wr >= ring->depth)
++		return -EPROTO;
++
++	*read = rd;
++	*write = wr;
++
++	return 0;
++}
++
++static int virtio_msg_ffa_fifo_validate_ring(struct virtio_msg_ffa_fifo_ring *ring,
++					     void *base, size_t available)
++{
++	struct virtio_msg_ffa_fifo_hdr *hdr = base;
++	size_t total_bytes;
++	u16 version, message_size, depth;
++
++	if (available < VIRTIO_MSG_FFA_FIFO_HEADER_SIZE)
++		return -EMSGSIZE;
++	if (memcmp(hdr->magic, VIRTIO_MSG_FFA_FIFO_MAGIC, sizeof(hdr->magic)))
++		return -EPROTO;
++
++	version = le16_to_cpu(hdr->version);
++	if (version != VIRTIO_MSG_FFA_FIFO_VERSION)
++		return -EPROTONOSUPPORT;
++
++	message_size = le16_to_cpu(hdr->message_size);
++	depth = le16_to_cpu(hdr->depth);
++	if (!depth || message_size < FFA_BUS_MAX_MSG_SIZE)
++		return -EPROTO;
++
++	if (check_mul_overflow((size_t)message_size, (size_t)depth, &total_bytes))
++		return -EOVERFLOW;
++	if (check_add_overflow(total_bytes,
++			       (size_t)VIRTIO_MSG_FFA_FIFO_MSG_AREA_OFFSET,
++			       &total_bytes))
++		return -EOVERFLOW;
++	if (total_bytes > available)
++		return -EMSGSIZE;
++
++	ring->hdr = hdr;
++	ring->entries = (u8 *)base + VIRTIO_MSG_FFA_FIFO_MSG_AREA_OFFSET;
++	ring->total_bytes = total_bytes;
++	ring->message_size = message_size;
++	ring->depth = depth;
++
++	return 0;
++}
++
++static const struct ffa_notifier_ops *
++virtio_msg_ffa_notifier_ops_get(struct ffa_device *fdev)
++{
++	if (!fdev || !fdev->ops)
++		return NULL;
++
++	return fdev->ops->notifier_ops;
++}
++
++static void
++virtio_msg_ffa_fifo_clear_layout(struct virtio_msg_ffa_fifo_state *state)
++{
++	state->tx = (struct virtio_msg_ffa_fifo_ring){ };
++	state->rx = (struct virtio_msg_ffa_fifo_ring){ };
++	state->region = NULL;
++	state->region_len = 0;
++	state->mem_handle = 0;
++	state->page_count = 0;
++	state->local_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	state->peer_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	state->rx_notif_bound = false;
++	state->configured = false;
++}
++
++static void
++virtio_msg_ffa_fifo_advance_generation(struct virtio_msg_ffa_fifo_state *state)
++{
++	WRITE_ONCE(state->generation, READ_ONCE(state->generation) + 1);
++	virtio_msg_ffa_fifo_space_wake(state);
++}
++
++int virtio_msg_ffa_fifo_configure_layout(struct virtio_msg_ffa_fifo_state *state,
++					 void *region, size_t region_len,
++					 u64 mem_handle, u16 page_count)
++{
++	struct virtio_msg_ffa_fifo_ring tx = { 0 };
++	struct virtio_msg_ffa_fifo_ring rx = { 0 };
++	u32 next_offset;
++	int ret;
++
++	if (!state || !region || !region_len)
++		return -EINVAL;
++
++	ret = virtio_msg_ffa_fifo_validate_ring(&tx, region, region_len);
++	if (ret)
++		return ret;
++
++	next_offset = le32_to_cpu(tx.hdr->next_offset);
++	if (next_offset < tx.total_bytes || next_offset >= region_len)
++		return -EPROTO;
++
++	ret = virtio_msg_ffa_fifo_validate_ring(&rx, (u8 *)region + next_offset,
++						region_len - next_offset);
++	if (ret)
++		return ret;
++	if (le32_to_cpu(rx.hdr->next_offset))
++		return -EPROTO;
++
++	virtio_msg_ffa_fifo_clear_layout(state);
++	state->tx = tx;
++	state->rx = rx;
++	state->region = region;
++	state->region_len = region_len;
++	state->mem_handle = mem_handle;
++	state->page_count = page_count;
++	state->local_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	state->peer_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	state->configured = true;
++	virtio_msg_ffa_fifo_advance_generation(state);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_configure_layout);
++
++void virtio_msg_ffa_fifo_reset(struct virtio_msg_ffa_fifo_state *state)
++{
++	virtio_msg_ffa_fifo_state_reset(state);
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_reset);
++
++int virtio_msg_ffa_fifo_bind_rx_notification(struct ffa_device *fdev,
++					     struct virtio_msg_ffa_fifo_state *state,
++					     ffa_notifier_cb cb,
++					     void *cb_data)
++{
++	const struct ffa_notifier_ops *notifier_ops;
++	int notif_id;
++	int ret;
++
++	if (!state || !state->configured || !cb)
++		return -EINVAL;
++
++	notifier_ops = virtio_msg_ffa_notifier_ops_get(fdev);
++	if (!notifier_ops || !notifier_ops->notify_alloc)
++		return -EOPNOTSUPP;
++
++	ret = notifier_ops->notify_alloc(fdev, false, cb, cb_data, &notif_id);
++	if (ret)
++		return ret;
++	if (!virtio_msg_ffa_notif_id_from_api_is_valid(notif_id)) {
++		if (notifier_ops->notify_relinquish)
++			notifier_ops->notify_relinquish(fdev, notif_id);
++		return -ERANGE;
++	}
++
++	state->local_notif_id = (u16)notif_id;
++	state->rx_notif_bound = true;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_bind_rx_notification);
++
++int virtio_msg_ffa_fifo_unbind_rx_notification(struct ffa_device *fdev,
++					       struct virtio_msg_ffa_fifo_state *state)
++{
++	const struct ffa_notifier_ops *notifier_ops;
++	int ret;
++
++	if (!state)
++		return -EINVAL;
++	if (!state->rx_notif_bound)
++		return 0;
++
++	if (!virtio_msg_ffa_notif_id_is_valid(state->local_notif_id))
++		return -EINVAL;
++
++	notifier_ops = virtio_msg_ffa_notifier_ops_get(fdev);
++	if (!notifier_ops || !notifier_ops->notify_relinquish)
++		return -EOPNOTSUPP;
++
++	ret = notifier_ops->notify_relinquish(fdev, state->local_notif_id);
++	if (ret)
++		return ret;
++
++	state->rx_notif_bound = false;
++	state->local_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_unbind_rx_notification);
++
++int virtio_msg_ffa_fifo_set_peer_notif_id(struct virtio_msg_ffa_fifo_state *state,
++					  u16 peer_notif_id)
++{
++	if (!state || !state->configured)
++		return -EINVAL;
++	if (!virtio_msg_ffa_notif_id_is_valid(peer_notif_id))
++		return -EINVAL;
++
++	state->peer_notif_id = peer_notif_id;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_set_peer_notif_id);
++
++int virtio_msg_ffa_fifo_notify_peer(struct ffa_device *fdev,
++				    const struct virtio_msg_ffa_fifo_state *state)
++{
++	const struct ffa_notifier_ops *notifier_ops;
++
++	if (!state || !state->configured)
++		return -EINVAL;
++	if (!virtio_msg_ffa_notif_id_is_valid(state->peer_notif_id))
++		return -EINVAL;
++
++	notifier_ops = virtio_msg_ffa_notifier_ops_get(fdev);
++	if (!notifier_ops || !notifier_ops->notify_send)
++		return -EOPNOTSUPP;
++
++	return notifier_ops->notify_send(fdev, state->peer_notif_id, false, 0);
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_notify_peer);
++
++int virtio_msg_ffa_fifo_enqueue(struct virtio_msg_ffa_fifo_state *state,
++				const struct virtio_msg *req,
++				size_t req_len)
++{
++	struct virtio_msg_ffa_fifo_ring *ring;
++	u16 read, write;
++	u8 *entry;
++	int ret;
++
++	if (!state || !state->configured || !req)
++		return -EINVAL;
++
++	ret = virtio_msg_ffa_validate_inbound_msg(req, req_len);
++	if (ret)
++		return ret;
++
++	ring = &state->tx;
++	if (req_len > ring->message_size)
++		return -EMSGSIZE;
++	ret = virtio_msg_ffa_fifo_indices_get(ring, &read, &write);
++	if (ret)
++		return ret;
++	if (((write + 1) % ring->depth) == read)
++		return -ENOSPC;
++
++	entry = ring->entries + ((size_t)write * ring->message_size);
++	memset(entry, 0, ring->message_size);
++	memcpy(entry, req, req_len);
++
++	write = (write + 1) % ring->depth;
++	virtio_msg_ffa_fifo_set_write_index(ring, write);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_enqueue);
++
++int virtio_msg_ffa_fifo_dequeue(struct virtio_msg_ffa_fifo_state *state,
++				struct virtio_msg *resp,
++				size_t resp_buf_len, size_t *resp_len,
++				bool *was_full_before_read)
++{
++	struct virtio_msg_ffa_fifo_ring *ring;
++	struct virtio_msg hdr;
++	size_t entry_off;
++	u16 read, write, msg_size;
++	int ret;
++
++	if (!state || !state->configured || !resp || !resp_len)
++		return -EINVAL;
++
++	ring = &state->rx;
++	ret = virtio_msg_ffa_fifo_indices_get(ring, &read, &write);
++	if (ret)
++		return ret;
++	if (read == write)
++		return -ENOENT;
++	if (was_full_before_read)
++		*was_full_before_read = ((write + 1) % ring->depth) == read;
++
++	entry_off = (size_t)read * ring->message_size;
++	memcpy(&hdr, ring->entries + entry_off, sizeof(hdr));
++	msg_size = le16_to_cpu(hdr.msg_size);
++
++	if (msg_size < sizeof(hdr) || msg_size > ring->message_size ||
++	    msg_size > FFA_BUS_MAX_MSG_SIZE) {
++		read = (read + 1) % ring->depth;
++		virtio_msg_ffa_fifo_set_read_index(ring, read);
++		return -EPROTO;
++	}
++	if (msg_size > resp_buf_len)
++		return -EMSGSIZE;
++
++	memcpy(resp, ring->entries + entry_off, msg_size);
++	ret = virtio_msg_ffa_validate_inbound_msg(resp, msg_size);
++	read = (read + 1) % ring->depth;
++	virtio_msg_ffa_fifo_set_read_index(ring, read);
++	if (ret)
++		return ret;
++
++	*resp_len = msg_size;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_dequeue);
++
++int virtio_msg_ffa_fifo_drain_rx(struct virtio_msg_ffa_xfer_ctx *ctx,
++				 struct virtio_msg_ffa_fifo_state *state,
++				 virtio_msg_ffa_fifo_rx_cb_t cb,
++				 void *cb_data, u32 *drained)
++{
++	u8 msg_buf[FFA_BUS_MAX_MSG_SIZE];
++	struct virtio_msg *msg = (struct virtio_msg *)msg_buf;
++	u32 consumed = 0;
++	bool was_full;
++	size_t msg_len;
++	int notify_ret;
++	int ret;
++
++	if (!ctx || !ctx->ep || !state || !cb)
++		return -EINVAL;
++
++	for (;;) {
++		was_full = false;
++		ret = virtio_msg_ffa_fifo_dequeue(state, msg, sizeof(msg_buf),
++						  &msg_len, &was_full);
++		if (ret == -ENOENT)
++			break;
++		if (ret) {
++			if (was_full) {
++				notify_ret = virtio_msg_ffa_fifo_notify_peer(ctx->fdev,
++									     state);
++				if (notify_ret)
++					return notify_ret;
++			}
++			if (ret == -EPROTO)
++				continue;
++			return ret;
++		}
++
++		ret = cb(ctx->ep, msg, msg_len, cb_data);
++		if (ret) {
++			if (was_full) {
++				notify_ret = virtio_msg_ffa_fifo_notify_peer(ctx->fdev,
++									     state);
++				if (notify_ret)
++					return notify_ret;
++			}
++			return ret;
++		}
++
++		consumed++;
++		if (was_full) {
++			ret = virtio_msg_ffa_fifo_notify_peer(ctx->fdev, state);
++			if (ret)
++				return ret;
++		}
++	}
++
++	if (drained)
++		*drained = consumed;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(virtio_msg_ffa_fifo_drain_rx);
+diff --git a/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.h b/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.h
+new file mode 100644
+index 000000000000..a86c38d63248
+--- /dev/null
++++ b/drivers/virtio/virtio_msg_bus_ffa_xfer_fifo.h
+@@ -0,0 +1,273 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Virtio message bus over FF-A FIFO transfer helper contracts.
++ *
++ * Copyright (C) 2026 Google LLC and Linaro.
++ * Viresh Kumar <viresh.kumar@linaro.org>
++ *
++ * Copyright (c) 2026 Arm Limited or its affiliates. All rights reserved.
++ */
++
++#ifndef _VIRTIO_MSG_BUS_FFA_XFER_FIFO_H
++#define _VIRTIO_MSG_BUS_FFA_XFER_FIFO_H
++
++#include <linux/compiler_attributes.h>
++#include <linux/minmax.h>
++#include <linux/wait.h>
++
++#include "virtio_msg_bus_ffa_xfer.h"
++
++#define VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_BASE_MS	1
++#define VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_MAX_MS		32
++#define VIRTIO_MSG_FFA_FIFO_TX_TIMEOUT_MS		5000U
++
++struct virtio_msg_ffa_fifo_ring {
++	struct virtio_msg_ffa_fifo_hdr *hdr;
++	u8 *entries;
++	size_t total_bytes;
++	u16 message_size;
++	u16 depth;
++};
++
++struct virtio_msg_ffa_fifo_state {
++	struct virtio_msg_ffa_fifo_ring tx;
++	struct virtio_msg_ffa_fifo_ring rx;
++	wait_queue_head_t space_waitq;
++	void *region;
++	size_t region_len;
++	u64 mem_handle;
++	u64 space_seq;
++	u64 generation;
++	u16 page_count;
++	u16 local_notif_id;
++	u16 peer_notif_id;
++	bool rx_notif_bound;
++	bool configured;
++};
++
++typedef int (*virtio_msg_ffa_fifo_rx_cb_t)(struct virtio_msg_ffa_endpoint *ep,
++					   const struct virtio_msg *msg,
++					   size_t msg_len, void *cb_data);
++
++static inline void
++virtio_msg_ffa_fifo_notify_backoff_reset(u32 *delay_ms)
++{
++	if (delay_ms)
++		*delay_ms = VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_BASE_MS;
++}
++
++static inline u32 virtio_msg_ffa_fifo_notify_backoff_delay(u32 *delay_ms)
++{
++	if (!delay_ms)
++		return VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_BASE_MS;
++	if (!*delay_ms)
++		virtio_msg_ffa_fifo_notify_backoff_reset(delay_ms);
++
++	return *delay_ms;
++}
++
++static inline bool
++virtio_msg_ffa_fifo_notify_backoff_next(u32 *delay_ms, u32 *next_delay_ms)
++{
++	u32 next_delay;
++
++	if (!delay_ms || !next_delay_ms)
++		return false;
++	if (virtio_msg_ffa_fifo_notify_backoff_delay(delay_ms) >=
++	    VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_MAX_MS)
++		return false;
++
++	next_delay = min_t(u32, *delay_ms << 1,
++			   VIRTIO_MSG_FFA_FIFO_NOTIFY_RETRY_MAX_MS);
++	*delay_ms = next_delay;
++	*next_delay_ms = next_delay;
++
++	return true;
++}
++
++static inline void
++virtio_msg_ffa_fifo_init(struct virtio_msg_ffa_fifo_state *state)
++{
++	if (state)
++		init_waitqueue_head(&state->space_waitq);
++}
++
++static inline void
++virtio_msg_ffa_fifo_space_wake(struct virtio_msg_ffa_fifo_state *state)
++{
++	if (!state)
++		return;
++
++	WRITE_ONCE(state->space_seq, READ_ONCE(state->space_seq) + 1);
++	wake_up_all(&state->space_waitq);
++}
++
++static inline void
++virtio_msg_ffa_fifo_state_reset(struct virtio_msg_ffa_fifo_state *state)
++{
++	if (!state)
++		return;
++
++	state->tx = (struct virtio_msg_ffa_fifo_ring){ };
++	state->rx = (struct virtio_msg_ffa_fifo_ring){ };
++	state->region = NULL;
++	state->region_len = 0;
++	state->mem_handle = 0;
++	state->page_count = 0;
++	state->local_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	state->peer_notif_id = VIRTIO_MSG_FFA_NOTIF_ID_INVALID;
++	state->rx_notif_bound = false;
++	state->configured = false;
++	WRITE_ONCE(state->generation, READ_ONCE(state->generation) + 1);
++	virtio_msg_ffa_fifo_space_wake(state);
++}
++
++static inline int
++virtio_msg_ffa_fifo_wait_space(struct virtio_msg_ffa_fifo_state *state,
++			       u64 space_seq, u64 generation,
++			       long *remaining)
++{
++	long timeout;
++
++	if (!state || !remaining)
++		return -EINVAL;
++	if (*remaining <= 0)
++		return -ETIMEDOUT;
++
++	timeout = wait_event_timeout
++			(state->space_waitq,
++			 READ_ONCE(state->space_seq) != space_seq ||
++			 READ_ONCE(state->generation) != generation ||
++			 !READ_ONCE(state->configured),
++			 *remaining);
++	if (!timeout) {
++		*remaining = 0;
++		return -ETIMEDOUT;
++	}
++
++	*remaining = timeout;
++	return 0;
++}
++
++#if IS_ENABLED(CONFIG_VIRTIO_MSG_FFA_XFER_FIFO)
++int virtio_msg_ffa_fifo_configure_layout(struct virtio_msg_ffa_fifo_state *state,
++					 void *region, size_t region_len,
++					 u64 mem_handle, u16 page_count);
++void virtio_msg_ffa_fifo_reset(struct virtio_msg_ffa_fifo_state *state);
++int virtio_msg_ffa_fifo_bind_rx_notification(struct ffa_device *fdev,
++					     struct virtio_msg_ffa_fifo_state *state,
++					     ffa_notifier_cb cb,
++					     void *cb_data);
++int virtio_msg_ffa_fifo_unbind_rx_notification(struct ffa_device *fdev,
++					       struct virtio_msg_ffa_fifo_state *state);
++int virtio_msg_ffa_fifo_set_peer_notif_id(struct virtio_msg_ffa_fifo_state *state,
++					  u16 peer_notif_id);
++int virtio_msg_ffa_fifo_enqueue(struct virtio_msg_ffa_fifo_state *state,
++				const struct virtio_msg *req,
++				size_t req_len);
++int virtio_msg_ffa_fifo_dequeue(struct virtio_msg_ffa_fifo_state *state,
++				struct virtio_msg *resp,
++				size_t resp_buf_len, size_t *resp_len,
++				bool *was_full_before_read);
++int virtio_msg_ffa_fifo_drain_rx(struct virtio_msg_ffa_xfer_ctx *ctx,
++				 struct virtio_msg_ffa_fifo_state *state,
++				 virtio_msg_ffa_fifo_rx_cb_t cb,
++				 void *cb_data, u32 *drained);
++int virtio_msg_ffa_fifo_notify_peer(struct ffa_device *fdev,
++				    const struct virtio_msg_ffa_fifo_state *state);
++#else
++#define VIRTIO_MSG_FFA_FIFO_EOPNOTSUPP_STUB()	(-EOPNOTSUPP)
++
++static inline int
++virtio_msg_ffa_fifo_configure_layout
++		(struct virtio_msg_ffa_fifo_state *state __maybe_unused,
++		 void *region __maybe_unused, size_t region_len __maybe_unused,
++		 u64 mem_handle __maybe_unused, u16 page_count __maybe_unused)
++{
++	return VIRTIO_MSG_FFA_FIFO_EOPNOTSUPP_STUB();
++}
++
++static inline void virtio_msg_ffa_fifo_reset(struct virtio_msg_ffa_fifo_state *state)
++{
++	virtio_msg_ffa_fifo_state_reset(state);
++}
++
++static inline int
++virtio_msg_ffa_fifo_bind_rx_notification
++		(struct ffa_device *fdev __maybe_unused,
++		 struct virtio_msg_ffa_fifo_state *state __maybe_unused,
++		 ffa_notifier_cb cb __maybe_unused,
++		 void *cb_data __maybe_unused)
++{
++	return VIRTIO_MSG_FFA_FIFO_EOPNOTSUPP_STUB();
++}
++
++static inline int
++virtio_msg_ffa_fifo_unbind_rx_notification
++		(struct ffa_device *fdev __maybe_unused,
++		 struct virtio_msg_ffa_fifo_state *state __maybe_unused)
++{
++	return VIRTIO_MSG_FFA_FIFO_EOPNOTSUPP_STUB();
++}
++
++static inline int
++virtio_msg_ffa_fifo_set_peer_notif_id
++		(struct virtio_msg_ffa_fifo_state *state __maybe_unused,
++		 u16 peer_notif_id __maybe_unused)
++{
++	return VIRTIO_MSG_FFA_FIFO_EOPNOTSUPP_STUB();
++}
++
++static inline int
++virtio_msg_ffa_fifo_enqueue
++		(struct virtio_msg_ffa_fifo_state *state __maybe_unused,
++		 const struct virtio_msg *req __maybe_unused,
++		 size_t req_len __maybe_unused)
++{
++	return VIRTIO_MSG_FFA_FIFO_EOPNOTSUPP_STUB();
++}
++
++static inline int
++virtio_msg_ffa_fifo_dequeue(struct virtio_msg_ffa_fifo_state *state,
++			    struct virtio_msg *resp, size_t resp_buf_len,
++			    size_t *resp_len, bool *was_full_before_read)
++{
++	(void)state;
++	(void)resp;
++	(void)resp_buf_len;
++	if (resp_len)
++		*resp_len = 0;
++	if (was_full_before_read)
++		*was_full_before_read = false;
++
++	return -EOPNOTSUPP;
++}
++
++static inline int
++virtio_msg_ffa_fifo_drain_rx(struct virtio_msg_ffa_xfer_ctx *ctx,
++			     struct virtio_msg_ffa_fifo_state *state,
++			     virtio_msg_ffa_fifo_rx_cb_t cb,
++			     void *cb_data, u32 *drained)
++{
++	(void)ctx;
++	(void)state;
++	(void)cb;
++	(void)cb_data;
++	if (drained)
++		*drained = 0;
++
++	return -EOPNOTSUPP;
++}
++
++static inline int
++virtio_msg_ffa_fifo_notify_peer
++		(struct ffa_device *fdev __maybe_unused,
++		 const struct virtio_msg_ffa_fifo_state *state __maybe_unused)
++{
++	return VIRTIO_MSG_FFA_FIFO_EOPNOTSUPP_STUB();
++}
++
++#undef VIRTIO_MSG_FFA_FIFO_EOPNOTSUPP_STUB
++#endif
++
++#endif /* _VIRTIO_MSG_BUS_FFA_XFER_FIFO_H */
+-- 
+2.53.0
+

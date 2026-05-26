@@ -1,0 +1,339 @@
+From 11d0a6dfb7f779ecd0fdfcd5fb197aaa8516fe43 Mon Sep 17 00:00:00 2001
+Message-ID: <11d0a6dfb7f779ecd0fdfcd5fb197aaa8516fe43.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 11:38:20 +0200
+Subject: [PATCH 14/30] virtio-msg: Latch transport capabilities
+
+Virtio-msg child devices need stable transport parameters before transport
+messages are exchanged. The transport supplies the revision, maximum
+message size, feature masks, and DMA address space that children will use.
+
+Add transport capability reporting to the bus, latch a validated snapshot in
+the proxy, and use the latched DMA address space when virtio core asks for
+DMA routing. This gives children stable features and a stable address space
+for the lifetime of the latched transport configuration.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/misc/virtio-msg-amp-pci.c        |  14 ++++
+ hw/virtio/virtio-msg-bus.c          |  28 ++++++++
+ hw/virtio/virtio-msg.c              | 108 ++++++++++++++++++++++++++--
+ include/hw/virtio/virtio-msg-bus.h  |  25 +++++--
+ include/hw/virtio/virtio-msg-prot.h |   1 +
+ include/hw/virtio/virtio-msg.h      |   9 +++
+ 6 files changed, 176 insertions(+), 9 deletions(-)
+
+diff --git a/hw/misc/virtio-msg-amp-pci.c b/hw/misc/virtio-msg-amp-pci.c
+index fb6cc3a75ebb..0d2d3f3e22c6 100644
+--- a/hw/misc/virtio-msg-amp-pci.c
++++ b/hw/misc/virtio-msg-amp-pci.c
+@@ -481,6 +481,19 @@ static int vmsg_bus_amp_pci_send_must_deliver(VirtIOMSGBusDevice *bd,
+     return VIRTIO_MSG_NO_ERROR;
+ }
+ 
++static void vmsg_bus_amp_pci_get_transport_caps(VirtIOMSGBusDevice *bd,
++                                                VirtIOMSGTransportCaps *caps)
++{
++    (void)bd;
++
++    caps->dma_as = &address_space_memory;
++    caps->extra_features = 0;
++    caps->transport_features = 0;
++    caps->revision = VIRTIO_MSG_TRANSPORT_REVISION;
++    caps->max_msg_size = VMSG_BUS_AMP_PCI_MAX_MSG_SIZE;
++    caps->ready = true;
++}
++
+ static void vmsg_bus_amp_pci_init(Object *obj)
+ {
+     VmsgBusAmpPciState *s = VMSG_BUS_AMP_PCI(obj);
+@@ -509,6 +522,7 @@ static void vmsg_bus_amp_pci_class_init(ObjectClass *klass,
+     bdc->process = vmsg_bus_amp_pci_process;
+     bdc->send = vmsg_bus_amp_pci_send;
+     bdc->send_must_deliver = vmsg_bus_amp_pci_send_must_deliver;
++    bdc->get_transport_caps = vmsg_bus_amp_pci_get_transport_caps;
+ }
+ 
+ static const TypeInfo vmsg_pci_info[] = {
+diff --git a/hw/virtio/virtio-msg-bus.c b/hw/virtio/virtio-msg-bus.c
+index 4e968eb0323d..dfc1bad36ddb 100644
+--- a/hw/virtio/virtio-msg-bus.c
++++ b/hw/virtio/virtio-msg-bus.c
+@@ -71,6 +71,34 @@ int virtio_msg_bus_send_must_deliver(BusState *bus, VirtIOMSG *msg_req)
+     return virtio_msg_bus_send(bus, msg_req);
+ }
+ 
++void virtio_msg_bus_get_transport_caps(BusState *bus,
++                                       VirtIOMSGTransportCaps *caps)
++{
++    VirtIOMSGBusDevice *bd = virtio_msg_bus_get_device(bus);
++    VirtIOMSGBusDeviceClass *bdc;
++
++    caps->dma_as = &address_space_memory;
++    caps->extra_features = 0;
++    caps->transport_features = 0;
++    caps->revision = VIRTIO_MSG_TRANSPORT_REVISION;
++    caps->max_msg_size = VIRTIO_MSG_MAX_SIZE;
++    caps->ready = false;
++
++    if (!bd) {
++        return;
++    }
++
++    bdc = VIRTIO_MSG_BUS_DEVICE_CLASS(object_get_class(OBJECT(bd)));
++    if (bdc->get_transport_caps) {
++        bdc->get_transport_caps(bd, caps);
++        if (!caps->revision) {
++            caps->revision = VIRTIO_MSG_TRANSPORT_REVISION;
++        }
++        return;
++    }
++    caps->ready = true;
++}
++
+ static void virtio_msg_bus_class_init(ObjectClass *klass, const void *data)
+ {
+     BusClass *bc = BUS_CLASS(klass);
+diff --git a/hw/virtio/virtio-msg.c b/hw/virtio/virtio-msg.c
+index 5c21780364f1..7b0a68cef133 100644
+--- a/hw/virtio/virtio-msg.c
++++ b/hw/virtio/virtio-msg.c
+@@ -21,6 +21,8 @@
+ #include "trace.h"
+ 
+ #define VIRTIO_MSG_VENDOR_ID 0x554D4551 /* 'QEMU' */
++#define VIRTIO_MSG_SUPPORTED_EXTRA_FEATURES BIT_ULL(VIRTIO_F_IOMMU_PLATFORM)
++#define VIRTIO_MSG_SUPPORTED_TRANSPORT_FEATURES 0ULL
+ 
+ static void virtio_msg_send_must_deliver(VirtIOMSGProxy *s, VirtIOMSG *msg)
+ {
+@@ -858,26 +860,121 @@ assign_error:
+     return r;
+ }
+ 
++void virtio_msg_reset_transport_caps(VirtIOMSGProxy *s)
++{
++    s->latched_caps.dma_as = &address_space_memory;
++    s->latched_caps.extra_features = 0;
++    s->latched_caps.transport_features = 0;
++    s->latched_caps.revision = VIRTIO_MSG_TRANSPORT_REVISION;
++    s->latched_caps.max_msg_size = VIRTIO_MSG_MAX_SIZE;
++    s->latched_caps.ready = false;
++    s->latched_caps_valid = false;
++}
++
++bool virtio_msg_refresh_transport_caps(VirtIOMSGProxy *s, Error **errp)
++{
++    VirtIOMSGTransportCaps caps;
++    size_t min_msg_size;
++
++    virtio_msg_bus_get_transport_caps(&s->msg_bus, &caps);
++    if (!caps.ready) {
++        error_setg(errp, "virtio-msg transport is not ready");
++        return false;
++    }
++    if (caps.revision != VIRTIO_MSG_TRANSPORT_REVISION) {
++        error_setg(errp,
++                   "virtio-msg transport reported unsupported revision %u",
++                   caps.revision);
++        return false;
++    }
++    min_msg_size = virtio_msg_header_size();
++    if (caps.max_msg_size < min_msg_size ||
++        caps.max_msg_size > sizeof(VirtIOMSG)) {
++        error_setg(errp,
++                   "virtio-msg transport reported max_msg_size %u outside "
++                   "supported range %zu..%zu",
++                   caps.max_msg_size, min_msg_size, sizeof(VirtIOMSG));
++        return false;
++    }
++    if (caps.extra_features & ~VIRTIO_MSG_SUPPORTED_EXTRA_FEATURES) {
++        error_setg(errp,
++                   "virtio-msg transport reported unsupported extra "
++                   "features 0x%" PRIx64,
++                   (uint64_t)(caps.extra_features &
++                              ~VIRTIO_MSG_SUPPORTED_EXTRA_FEATURES));
++        return false;
++    }
++    if (!caps.dma_as) {
++        error_setg(errp, "virtio-msg transport reported no DMA address space");
++        return false;
++    }
++
++    caps.transport_features &=
++        ~BIT_ULL(VIRTIO_MSG_F_STRICT_CONFIG_GENERATION);
++    caps.transport_features &= VIRTIO_MSG_SUPPORTED_TRANSPORT_FEATURES;
++    s->latched_caps = caps;
++    s->latched_caps_valid = true;
++    return true;
++}
++
++static bool virtio_msg_latch_transport_caps(VirtIOMSGProxy *s, Error **errp)
++{
++    if (s->latched_caps_valid) {
++        return true;
++    }
++
++    return virtio_msg_refresh_transport_caps(s, errp);
++}
++
+ static void virtio_msg_pre_plugged(DeviceState *d, Error **errp)
+ {
+     VirtIOMSGDev *mdev = VIRTIO_MSG_DEV(d);
+     VirtIOMSGProxy *s = VIRTIO_MSG(mdev->proxy);
+-    VirtIODevice *vdev = virtio_msg_lookup_vdev(s, mdev->dev_num, __func__);
++    VirtIODevice *vdev = virtio_msg_vdev(s, mdev->dev_num);
++    uint64_t extra_features;
+ 
+     if (!vdev) {
+         return;
+     }
+ 
++    if (!virtio_msg_latch_transport_caps(s, errp)) {
++        return;
++    }
++
++    extra_features = s->latched_caps.extra_features;
++
+     virtio_add_feature(&vdev->host_features, VIRTIO_F_VERSION_1);
++    vdev->host_features |= extra_features;
++}
++
++static VirtIOMSGProxy *virtio_msg_resolve_proxy(DeviceState *d)
++{
++    VirtIOMSGProxy *s = NULL;
++
++    if (object_dynamic_cast(OBJECT(d), TYPE_VIRTIO_MSG)) {
++        s = VIRTIO_MSG(d);
++    } else if (object_dynamic_cast(OBJECT(d), TYPE_VIRTIO_MSG_DEV)) {
++        VirtIOMSGDev *mdev = VIRTIO_MSG_DEV(d);
++        s = mdev->proxy;
++    }
++
++    return s;
+ }
+ 
+ static AddressSpace *virtio_msg_get_dma_as(DeviceState *d)
+ {
+-    VirtIOMSGProxy *s = VIRTIO_MSG(d);
+-    AddressSpace *as;
++    VirtIOMSGProxy *s = virtio_msg_resolve_proxy(d);
++
++    if (!s) {
++        return &address_space_memory;
++    }
++
++    if (!s->latched_caps_valid || !s->latched_caps.ready ||
++        !s->latched_caps.dma_as) {
++        return &address_space_memory;
++    }
+ 
+-    as = virtio_msg_bus_get_remote_as(&s->msg_bus);
+-    return as;
++    return s->latched_caps.dma_as;
+ }
+ 
+ static int virtio_msg_query_nvectors(DeviceState *d)
+@@ -890,6 +987,7 @@ static void virtio_msg_realize(DeviceState *d, Error **errp)
+     VirtIOMSGProxy *s = VIRTIO_MSG(d);
+     Object *o = OBJECT(d);
+     int i;
++    virtio_msg_reset_transport_caps(s);
+ 
+     for (i = 0; i < ARRAY_SIZE(s->devs); i++) {
+         g_autofree char *outer_bus_name = g_strdup_printf("bus%d", i);
+diff --git a/include/hw/virtio/virtio-msg-bus.h b/include/hw/virtio/virtio-msg-bus.h
+index d85062d36c9f..31e251e4ea59 100644
+--- a/include/hw/virtio/virtio-msg-bus.h
++++ b/include/hw/virtio/virtio-msg-bus.h
+@@ -29,6 +29,17 @@ typedef struct VirtIOMSGBusPort {
+     bool is_driver;
+ } VirtIOMSGBusPort;
+ 
++typedef struct VirtIOMSGTransportCaps {
++    AddressSpace *dma_as;
++    uint64_t extra_features;
++    uint64_t transport_features;
++    uint32_t revision;
++    uint16_t max_msg_size;
++    bool ready;
++} VirtIOMSGTransportCaps;
++
++#define VIRTIO_MSG_F_STRICT_CONFIG_GENERATION 0
++
+ struct VirtIOMSGBusDeviceClass {
+     /*< private >*/
+     DeviceClass parent_class;
+@@ -55,6 +66,14 @@ struct VirtIOMSGBusDeviceClass {
+      * delivered eventually.
+      */
+     int (*send_must_deliver)(VirtIOMSGBusDevice *bd, VirtIOMSG *msg_req);
++
++    /*
++     * Return a coherent transport capability snapshot for child pre-plug.
++     * If unset, dma_as remains address_space_memory.
++     */
++    void (*get_transport_caps)(VirtIOMSGBusDevice *bd,
++                               VirtIOMSGTransportCaps *caps);
++
+ };
+ 
+ typedef struct VirtIOMSGBusDevice {
+@@ -104,8 +123,6 @@ virtio_msg_bus_receive(VirtIOMSGBusDevice *bd, VirtIOMSG *msg)
+ int virtio_msg_bus_send(BusState *bus, VirtIOMSG *msg_req);
+ int virtio_msg_bus_send_must_deliver(BusState *bus, VirtIOMSG *msg_req);
+ 
+-static inline AddressSpace *virtio_msg_bus_get_remote_as(BusState *bus)
+-{
+-    return &address_space_memory;
+-}
++void virtio_msg_bus_get_transport_caps(BusState *bus,
++                                       VirtIOMSGTransportCaps *caps);
+ #endif
+diff --git a/include/hw/virtio/virtio-msg-prot.h b/include/hw/virtio/virtio-msg-prot.h
+index a501564082e7..89d1d17b9cd5 100644
+--- a/include/hw/virtio/virtio-msg-prot.h
++++ b/include/hw/virtio/virtio-msg-prot.h
+@@ -46,6 +46,7 @@ enum {
+     VIRTIO_MSG_MAX = VIRTIO_MSG_EVENT_USED,
+ };
+ 
++#define VIRTIO_MSG_TRANSPORT_REVISION 1
+ #define VIRTIO_MSG_MAX_SIZE 48
+ 
+ #define VIRTIO_MSG_TYPE_RESPONSE  (1 << 0)
+diff --git a/include/hw/virtio/virtio-msg.h b/include/hw/virtio/virtio-msg.h
+index c25195b1bc55..83adc49bc12a 100644
+--- a/include/hw/virtio/virtio-msg.h
++++ b/include/hw/virtio/virtio-msg.h
+@@ -10,8 +10,11 @@
+ #ifndef HW_VIRTIO_MSG_H
+ #define HW_VIRTIO_MSG_H
+ 
++#include "qapi/error.h"
++#include "qemu/log.h"
+ #include "hw/core/sysbus.h"
+ #include "hw/virtio/virtio-bus.h"
++#include "hw/virtio/virtio-msg-bus.h"
+ 
+ #define TYPE_VIRTIO_MSG_PROXY_BUS "virtio-msg-proxy-bus"
+ /* This is reusing the VirtioBusState typedef from TYPE_VIRTIO_BUS */
+@@ -50,7 +53,13 @@ struct VirtIOMSGProxy {
+     BusState devs_bus[VIRTIO_MSG_MAX_DEVS];
+     VirtIOMSGDev devs[VIRTIO_MSG_MAX_DEVS];
+ 
++    VirtIOMSGTransportCaps latched_caps;
++    bool latched_caps_valid;
++
+     /* virtio-msg-bus.  */
+     BusState msg_bus;
+ };
++
++void virtio_msg_reset_transport_caps(VirtIOMSGProxy *s);
++bool virtio_msg_refresh_transport_caps(VirtIOMSGProxy *s, Error **errp);
+ #endif
+-- 
+2.53.0
+

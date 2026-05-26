@@ -1,17 +1,17 @@
-From b0a173070dc31bf962ca04a6cce50a1705ad6208 Mon Sep 17 00:00:00 2001
-Message-ID: <b0a173070dc31bf962ca04a6cce50a1705ad6208.1776946505.git.bertrand.marquis@arm.com>
-In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
-References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From eadadc2c847ee55dcd5fa7f5c636874c8a63abd9 Mon Sep 17 00:00:00 2001
+Message-ID: <eadadc2c847ee55dcd5fa7f5c636874c8a63abd9.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
 From: Bertrand Marquis <bertrand.marquis@arm.com>
-Date: Thu, 16 Apr 2026 19:30:46 +0200
-Subject: [RFC PATCH 16/28] virtio-msg-bus: fail cleanly when the bus peer is
- not connected
+Date: Fri, 22 May 2026 11:21:33 +0200
+Subject: [PATCH 11/30] virtio-msg-bus: Report disconnected peers as retryable
 
-Return VIRTIO_MSG_ERROR_RETRY when the peer transport is not connected
-and gate receive paths on peer readiness.
+A disconnected virtio-msg bus peer is a transport readiness condition, not
+a successfully delivered message.
 
-This turns disconnected-peer handling into an explicit retryable
-condition instead of a silent failure.
+Return VIRTIO_MSG_ERROR_RETRY when send or receive paths are used before
+the peer is connected so callers can preserve required traffic or retry
+after the transport becomes ready.
 
 Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
 ---

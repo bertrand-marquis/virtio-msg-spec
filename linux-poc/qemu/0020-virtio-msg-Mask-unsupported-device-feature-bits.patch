@@ -1,0 +1,209 @@
+From fe38f10191f0c1721d16bb8b712f995323a1da70 Mon Sep 17 00:00:00 2001
+Message-ID: <fe38f10191f0c1721d16bb8b712f995323a1da70.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 12:08:32 +0200
+Subject: [PATCH 20/30] virtio-msg: Mask unsupported device feature bits
+
+Report feature blocks from non-legacy host features after masking the
+notification-data bits that the current transport encoding cannot carry.
+
+Apply the same mask to stored and accepted driver features so the device
+never sees unsupported notification-data semantics through virtio-msg.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/virtio-msg.c | 111 +++++++++++++++++++++++++++++++++--------
+ 1 file changed, 91 insertions(+), 20 deletions(-)
+
+diff --git a/hw/virtio/virtio-msg.c b/hw/virtio/virtio-msg.c
+index c0e068b809bb..9205694f782a 100644
+--- a/hw/virtio/virtio-msg.c
++++ b/hw/virtio/virtio-msg.c
+@@ -23,6 +23,7 @@
+ #define VIRTIO_MSG_VENDOR_ID 0x554D4551 /* 'QEMU' */
+ #define VIRTIO_MSG_SUPPORTED_EXTRA_FEATURES BIT_ULL(VIRTIO_F_IOMMU_PLATFORM)
+ #define VIRTIO_MSG_SUPPORTED_TRANSPORT_FEATURES 0ULL
++#define VIRTIO_MSG_FEATURE_BLOCKS 2
+ 
+ static uint16_t virtio_msg_active_max_msg_size(VirtIOMSGProxy *s)
+ {
+@@ -73,6 +74,69 @@ static uint16_t virtio_msg_bus_get_devices_max_count(VirtIOMSGProxy *s)
+     return MIN((size_t)UINT16_MAX, max_bitmap_size * 8);
+ }
+ 
++static uint32_t virtio_msg_feature_block(const uint64_t *features,
++                                         uint32_t block_index)
++{
++    uint64_t word;
++
++    if (block_index >= VIRTIO_MSG_FEATURE_BLOCKS) {
++        return 0;
++    }
++
++    word = features[block_index / 2];
++    if (block_index & 1) {
++        word >>= 32;
++    }
++
++    return word;
++}
++
++static uint64_t virtio_msg_masked_features(void)
++{
++    /*
++     * The current EVENT_AVAIL encoding has no split-queue notification-data
++     * field, so supporting these features needs a future transport encoding.
++     */
++    return BIT_ULL(VIRTIO_F_NOTIF_CONFIG_DATA) |
++           BIT_ULL(VIRTIO_F_NOTIFICATION_DATA);
++}
++
++static uint32_t virtio_msg_masked_feature_block(uint32_t block_index)
++{
++    uint64_t features = virtio_msg_masked_features();
++
++    return virtio_msg_feature_block(&features, block_index);
++}
++
++static uint32_t virtio_msg_offered_feature_block(VirtIODevice *vdev,
++                                                 uint32_t block_index)
++{
++    uint32_t feature_block;
++
++    feature_block = virtio_msg_feature_block(vdev->host_features_ex,
++                                             block_index);
++    if (block_index < 2) {
++        feature_block &= ~(VIRTIO_DEVICE_GET_CLASS(vdev)->legacy_features >>
++                           (block_index * 32));
++    }
++    feature_block &= ~virtio_msg_masked_feature_block(block_index);
++
++    return feature_block;
++}
++
++static uint32_t virtio_msg_num_feature_blocks(VirtIODevice *vdev)
++{
++    uint32_t i;
++
++    for (i = VIRTIO_MSG_FEATURE_BLOCKS; i > 0; i--) {
++        if (virtio_msg_offered_feature_block(vdev, i - 1)) {
++            return i;
++        }
++    }
++
++    return 0;
++}
++
+ static int virtio_msg_send_event_config(VirtIOMSGProxy *s, uint16_t dev_num,
+                                         uint32_t status,
+                                         uint32_t generation,
+@@ -302,6 +366,7 @@ static int virtio_msg_device_info(VirtIOMSGProxy *s,
+     uint32_t config_len = 0;
+     uint32_t device_id = 0;
+     uint32_t max_virtqueues = 0;
++    uint32_t num_feature_blocks;
+     uint8_t nil_uuid[16] = { 0 };
+     VirtIOMSG msg_resp;
+     int ret;
+@@ -314,12 +379,13 @@ static int virtio_msg_device_info(VirtIOMSGProxy *s,
+     device_id = vdev->device_id;
+     config_len = vdev->config_len;
+     max_virtqueues = virtio_get_num_queues(vdev);
++    num_feature_blocks = virtio_msg_num_feature_blocks(vdev);
+ 
+     virtio_msg_pack_get_device_info_resp(&msg_resp, msg->dev_num, msg->token,
+                                          device_id,
+                                          VIRTIO_MSG_VENDOR_ID,
+                                          nil_uuid,
+-                                         2,
++                                         num_feature_blocks,
+                                          config_len,
+                                          max_virtqueues,
+                                          0, 0);
+@@ -331,11 +397,10 @@ static int virtio_msg_get_features(VirtIOMSGProxy *s,
+ {
+     VirtIODevice *vdev;
+     VirtIOMSG msg_resp;
+-    uint32_t index = msg->get_features.block_index;
++    uint32_t block_index = msg->get_features.block_index;
+     uint32_t f[VIRTIO_MSG_MAX_FEATURE_NUM] = { 0 };
+-    uint32_t num = MIN(msg->get_features.num_blocks,
+-                       VIRTIO_MSG_MAX_FEATURE_NUM);
+-    uint64_t features = 0;
++    uint32_t num_blocks = msg->get_features.num_blocks;
++    uint32_t i;
+     int ret;
+ 
+     ret = virtio_msg_lookup_vdev(s, msg->dev_num, NULL, &vdev);
+@@ -343,19 +408,14 @@ static int virtio_msg_get_features(VirtIOMSGProxy *s,
+         return ret;
+     }
+ 
+-    features = vdev->host_features &
+-               ~VIRTIO_DEVICE_GET_CLASS(vdev)->legacy_features;
+-
+-    /* We only have 64 feature bits. If driver asks for more, return zeros  */
+-    if (index < 2) {
+-        features >>= index * 32;
+-        f[0] = features;
+-        f[1] = features >> 32;
++    for (i = 0; i < num_blocks; i++) {
++        if (block_index <= UINT32_MAX - i) {
++            f[i] = virtio_msg_offered_feature_block(vdev, block_index + i);
++        }
+     }
+ 
+-    /* If index is out of bounds, we respond with num=0, f=0.  */
+     virtio_msg_pack_get_features_resp(&msg_resp, msg->dev_num, msg->token,
+-                                      index, num, f);
++                                      block_index, num_blocks, f);
+     return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
+@@ -376,17 +436,25 @@ static int virtio_msg_set_features(VirtIOMSGProxy *s,
+     f = s->devs[slot].guest_features;
+ 
+     for (i = 0; i < msg->set_features.num_blocks; i++) {
+-        unsigned int feature_index = i + msg->set_features.block_index;
++        uint32_t feature_index;
++        uint32_t features;
++
++        if (msg->set_features.block_index > UINT32_MAX - i) {
++            break;
++        }
++        feature_index = i + msg->set_features.block_index;
+ 
+-        /* We only support up to 64bits  */
+         if (feature_index >= 2) {
+             break;
+         }
+ 
+-        f = deposit64(f, feature_index * 32, 32,
+-                      msg->set_features.features[i]);
++        features = msg->set_features.features[i];
++        features &= ~virtio_msg_masked_feature_block(feature_index);
++
++        f = deposit64(f, feature_index * 32, 32, features);
+     }
+ 
++    f &= ~virtio_msg_masked_features();
+     s->devs[slot].guest_features = f;
+ 
+     virtio_msg_pack_set_features_resp(&msg_resp, msg->dev_num, msg->token);
+@@ -425,7 +493,10 @@ static int virtio_msg_set_device_status(VirtIOMSGProxy *s,
+     }
+ 
+     if (status & VIRTIO_CONFIG_S_FEATURES_OK) {
+-        virtio_set_features(vdev, s->devs[slot].guest_features);
++        uint64_t features = s->devs[slot].guest_features;
++
++        features &= ~virtio_msg_masked_features();
++        virtio_set_features(vdev, features);
+     }
+ 
+     virtio_set_status(vdev, status);
+-- 
+2.53.0
+

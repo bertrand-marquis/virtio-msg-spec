@@ -1,0 +1,68 @@
+From 6c175dede76400a9d5e251e4577f961af1a4b57a Mon Sep 17 00:00:00 2001
+Message-ID: <6c175dede76400a9d5e251e4577f961af1a4b57a.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 12:16:54 +0200
+Subject: [PATCH 22/30] virtio-msg: Reply to GET_SHM with an empty region
+
+GET_SHM is mandatory in the current transport revision, but QEMU does
+not currently expose device-owned shared-memory regions through
+virtio-msg.
+
+Validate the target device and reply with the requested shmid, zero
+length, zero address, and reserved zero until shared-memory regions are
+exposed through this transport.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/virtio-msg.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/hw/virtio/virtio-msg.c b/hw/virtio/virtio-msg.c
+index 98e89d7febcb..ff36379372f3 100644
+--- a/hw/virtio/virtio-msg.c
++++ b/hw/virtio/virtio-msg.c
+@@ -264,6 +264,9 @@ static bool virtio_msg_bad(VirtIOMSGProxy *s, VirtIOMSG *msg)
+     case VIRTIO_MSG_RESET_VQUEUE:
+         min_size += sizeof msg->reset_vqueue;
+         break;
++    case VIRTIO_MSG_GET_SHM:
++        min_size += sizeof msg->get_shm;
++        break;
+     case VIRTIO_MSG_EVENT_AVAIL:
+         min_size += sizeof msg->event_avail;
+         break;
+@@ -791,6 +794,21 @@ static int virtio_msg_reset_vqueue(VirtIOMSGProxy *s, VirtIOMSG *msg)
+     return virtio_msg_send_must_deliver_checked(s, &msg_resp);
+ }
+ 
++static int virtio_msg_get_shm(VirtIOMSGProxy *s, VirtIOMSG *msg)
++{
++    VirtIOMSG msg_resp;
++    int ret;
++
++    ret = virtio_msg_lookup_vdev(s, msg->dev_num, NULL, NULL);
++    if (ret != VIRTIO_MSG_NO_ERROR) {
++        return ret;
++    }
++
++    virtio_msg_pack_get_shm_resp(&msg_resp, msg->dev_num, msg->token,
++                                 msg->get_shm.shmid, 0, 0);
++    return virtio_msg_send_must_deliver_checked(s, &msg_resp);
++}
++
+ static int virtio_msg_event_avail(VirtIOMSGProxy *s,
+                                   VirtIOMSG *msg)
+ {
+@@ -865,6 +883,7 @@ static const VirtIOMSGHandler msg_handlers[] = {
+     [VIRTIO_MSG_GET_VQUEUE] = virtio_msg_get_vqueue,
+     [VIRTIO_MSG_SET_VQUEUE] = virtio_msg_set_vqueue,
+     [VIRTIO_MSG_RESET_VQUEUE] = virtio_msg_reset_vqueue,
++    [VIRTIO_MSG_GET_SHM] = virtio_msg_get_shm,
+     [VIRTIO_MSG_EVENT_AVAIL] = virtio_msg_event_avail,
+ };
+ 
+-- 
+2.53.0
+

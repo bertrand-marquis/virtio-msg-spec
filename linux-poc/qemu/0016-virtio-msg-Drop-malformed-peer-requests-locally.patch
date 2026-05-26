@@ -1,0 +1,168 @@
+From c85698c07cd3987426d6a12ec6415dd8844574fd Mon Sep 17 00:00:00 2001
+Message-ID: <c85698c07cd3987426d6a12ec6415dd8844574fd.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 12:00:18 +0200
+Subject: [PATCH 16/30] virtio-msg: Drop malformed peer requests locally
+
+The virtio-msg transport has no protocol response for malformed peer
+messages. Invalid request headers, unsupported message IDs, and oversized
+messages should therefore be handled locally instead of producing protocol
+error messages.
+
+Validate message sizes against the active transport maximum, ignore
+reserved header type bits while dispatching, and drop malformed peer input
+without sending a response.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ hw/virtio/virtio-msg.c | 78 +++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 66 insertions(+), 12 deletions(-)
+
+diff --git a/hw/virtio/virtio-msg.c b/hw/virtio/virtio-msg.c
+index bd7a333bc791..7ccec966b826 100644
+--- a/hw/virtio/virtio-msg.c
++++ b/hw/virtio/virtio-msg.c
+@@ -35,11 +35,34 @@ static void virtio_msg_send_must_deliver(VirtIOMSGProxy *s, VirtIOMSG *msg)
+     }
+ }
+ 
++static uint16_t virtio_msg_active_max_msg_size(VirtIOMSGProxy *s)
++{
++    if (!s->latched_caps_valid || !s->latched_caps.ready ||
++        !s->latched_caps.max_msg_size) {
++        return VIRTIO_MSG_MAX_SIZE;
++    }
++
++    return s->latched_caps.max_msg_size;
++}
++
++static bool virtio_msg_dev_num_to_slot(VirtIOMSGProxy *s, uint16_t dev_num,
++                                       uint16_t *slot)
++{
++    if (dev_num >= ARRAY_SIZE(s->devs)) {
++        return false;
++    }
++
++    *slot = dev_num;
++    return true;
++}
++
+ static bool virtio_msg_bad(VirtIOMSGProxy *s, VirtIOMSG *msg)
+ {
+     bool drop = false;
+     size_t min_size;
+-    unsigned int n;
++    uint16_t max_msg_size = virtio_msg_active_max_msg_size(s);
++    uint32_t n;
++    uint16_t slot;
+ 
+     min_size = virtio_msg_header_size();
+     switch (msg->msg_id) {
+@@ -47,13 +70,19 @@ static bool virtio_msg_bad(VirtIOMSGProxy *s, VirtIOMSG *msg)
+     case VIRTIO_MSG_DEVICE_INFO:
+         break;
+     case VIRTIO_MSG_GET_FEATURES:
++        n = msg->get_features.num_blocks;
++        if (n == 0 ||
++            n > virtio_msg_max_feature_num_for_size(max_msg_size)) {
++            drop = true;
++            break;
++        }
+         min_size += sizeof msg->get_features;
+         break;
+     case VIRTIO_MSG_SET_FEATURES:
+         n = msg->set_features.num_blocks;
+ 
+-        /* We expect at least one feature block.  */
+-        if (n == 0 || n > VIRTIO_MSG_MAX_FEATURE_NUM) {
++        if (n == 0 ||
++            n > virtio_msg_max_feature_num_for_size(max_msg_size)) {
+             drop = true;
+             break;
+         }
+@@ -93,18 +122,41 @@ static bool virtio_msg_bad(VirtIOMSGProxy *s, VirtIOMSG *msg)
+     }
+ 
+     /* Accept large messages allowing future backwards compatible extensions. */
+-    if (drop ||
+-        msg->msg_size < min_size || msg->msg_size > VIRTIO_MSG_MAX_SIZE) {
++    if (drop || msg->msg_size < min_size || msg->msg_size > max_msg_size) {
+         return true;
+     }
+ 
+-    if (msg->dev_num >= ARRAY_SIZE(s->devs)) {
++    if (!virtio_msg_dev_num_to_slot(s, msg->dev_num, &slot)) {
+         return true;
+     }
+ 
+     return false;
+ }
+ 
++static bool virtio_msg_bus_bad(VirtIOMSGProxy *s, VirtIOMSG *msg)
++{
++    size_t min_size = virtio_msg_header_size();
++
++    if (msg->dev_num != 0 ||
++        (msg->type & VIRTIO_MSG_TYPE_RESPONSE) ||
++        msg->msg_size > virtio_msg_active_max_msg_size(s)) {
++        return true;
++    }
++
++    switch (msg->msg_id) {
++    case VIRTIO_MSG_BUS_GET_DEVICES:
++        min_size += sizeof msg->bus_get_devices;
++        break;
++    case VIRTIO_MSG_BUS_PING:
++        min_size += sizeof msg->bus_ping;
++        break;
++    default:
++        return true;
++    }
++
++    return msg->msg_size < min_size;
++}
++
+ static VirtIODevice *virtio_msg_vdev(VirtIOMSGProxy *s, uint16_t dev_num)
+ {
+     VirtIODevice *vdev;
+@@ -499,11 +551,13 @@ static int virtio_msg_receive_msg(VirtIOMSGBusDevice *bd, VirtIOMSG *msg)
+ {
+     VirtIOMSGProxy *s = VIRTIO_MSG(bd->opaque);
+     VirtIOMSGHandler handler;
+-
+-    /* virtio_msg_print(msg); */
++    uint8_t msg_type = msg->type & VIRTIO_MSG_TYPE_MASK;
+ 
+     /* We handle some generic bus messages. */
+-    if (msg->type & VIRTIO_MSG_TYPE_BUS) {
++    if (msg_type & VIRTIO_MSG_TYPE_BUS) {
++        if (virtio_msg_bus_bad(s, msg)) {
++            return VIRTIO_MSG_NO_ERROR;
++        }
+         if (msg->msg_id == VIRTIO_MSG_BUS_GET_DEVICES) {
+             virtio_msg_bus_get_devices(s, msg);
+         }
+@@ -514,15 +568,15 @@ static int virtio_msg_receive_msg(VirtIOMSGBusDevice *bd, VirtIOMSG *msg)
+     }
+ 
+     if (msg->msg_id >= ARRAY_SIZE(msg_handlers)) {
+-        return VIRTIO_MSG_ERROR_UNSUPPORTED_MESSAGE_ID;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     handler = msg_handlers[msg->msg_id];
+ 
+     /* We don't expect responses.  */
+-    if ((msg->type & VIRTIO_MSG_TYPE_RESPONSE) || virtio_msg_bad(s, msg)) {
++    if ((msg_type & VIRTIO_MSG_TYPE_RESPONSE) || virtio_msg_bad(s, msg)) {
+         /* Drop bad messages.  */
+-        return VIRTIO_MSG_ERROR_BAD_MESSAGE;
++        return VIRTIO_MSG_NO_ERROR;
+     }
+ 
+     if (handler) {
+-- 
+2.53.0
+

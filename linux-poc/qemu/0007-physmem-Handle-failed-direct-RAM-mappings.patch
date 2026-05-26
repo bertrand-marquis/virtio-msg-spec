@@ -1,0 +1,89 @@
+From 73f01bcbf87dee5d5748def1e4408db85c0cfacf Mon Sep 17 00:00:00 2001
+Message-ID: <73f01bcbf87dee5d5748def1e4408db85c0cfacf.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+From: Bertrand Marquis <bertrand.marquis@arm.com>
+Date: Fri, 22 May 2026 10:31:43 +0200
+Subject: [PATCH 07/30] physmem: Handle failed direct RAM mappings
+
+Direct mapping helpers can fail even after address-space translation has
+found a direct memory region.
+
+Keep the address_space_map() RCU critical section explicit so every return
+path can drop the read lock, and handle qemu_ram_ptr_length() failure by
+releasing the memory region reference, zeroing the returned length, and
+returning NULL. This prevents callers from observing an invalid mapping.
+
+Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
+---
+ system/physmem.c | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/system/physmem.c b/system/physmem.c
+index 132c662f6b42..41da613a201f 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -3718,6 +3718,7 @@ void *address_space_map(AddressSpace *as,
+     hwaddr l, xlat;
+     MemoryRegion *mr;
+     FlatView *fv;
++    void *ptr;
+ 
+     trace_address_space_map(as, addr, len, is_write, *(uint32_t *) &attrs);
+ 
+@@ -3726,12 +3727,18 @@ void *address_space_map(AddressSpace *as,
+     }
+ 
+     l = len;
+-    RCU_READ_LOCK_GUARD();
++    /*
++     * Keep explicit lock/unlock instead of RCU_READ_LOCK_GUARD(): the
++     * bounce-buffer paths below have multiple early returns that must drop
++     * the RCU read lock first.
++     */
++    rcu_read_lock();
+     fv = address_space_to_flatview(as);
+     mr = flatview_translate(fv, addr, &xlat, &l, is_write, attrs);
+ 
+     if (!memory_access_is_direct(mr, is_write, attrs)) {
+         if (as->direct_map_only) {
++            rcu_read_unlock();
+             *plen = 0;
+             return NULL;
+         }
+@@ -3750,6 +3757,7 @@ void *address_space_map(AddressSpace *as,
+         }
+ 
+         if (l == 0) {
++            rcu_read_unlock();
+             *plen = 0;
+             return NULL;
+         }
+@@ -3765,6 +3773,7 @@ void *address_space_map(AddressSpace *as,
+             flatview_read(fv, addr, attrs,
+                           bounce->buffer, l);
+         }
++        rcu_read_unlock();
+ 
+         *plen = l;
+         return bounce->buffer;
+@@ -3774,7 +3783,15 @@ void *address_space_map(AddressSpace *as,
+     *plen = flatview_extend_translation(fv, addr, len, mr, xlat,
+                                         l, is_write, attrs);
+     fuzz_dma_read_cb(addr, *plen, mr);
+-    return qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
++    ptr = qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
++    rcu_read_unlock();
++    if (!ptr || *plen == 0) {
++        memory_region_unref(mr);
++        *plen = 0;
++        return NULL;
++    }
++
++    return ptr;
+ }
+ 
+ /* Unmaps a memory region previously mapped by address_space_map().
+-- 
+2.53.0
+

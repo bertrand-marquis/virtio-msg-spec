@@ -1,17 +1,17 @@
-From f7eda950b068886a9fab1e88a8824de276a0f94a Mon Sep 17 00:00:00 2001
-Message-ID: <f7eda950b068886a9fab1e88a8824de276a0f94a.1776946505.git.bertrand.marquis@arm.com>
-In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
-References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+From 695db3e1b125220cf3fbe670c5686675f24b612d Mon Sep 17 00:00:00 2001
+Message-ID: <695db3e1b125220cf3fbe670c5686675f24b612d.1779975966.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779975966.git.bertrand.marquis@arm.com>
 From: Bertrand Marquis <bertrand.marquis@arm.com>
-Date: Thu, 16 Apr 2026 19:30:46 +0200
-Subject: [RFC PATCH 12/28] virtio: re-evaluate VIRTIO_F_IOMMU_PLATFORM after
- pre_plugged()
+Date: Fri, 22 May 2026 10:55:53 +0200
+Subject: [PATCH 09/30] virtio: Recheck transport IOMMU feature after pre-plug
 
-Re-check VIRTIO_F_IOMMU_PLATFORM after the pre_plugged()/feature setup
-path in virtio_bus_device_plugged().
+Transport pre-plug hooks can add host features before the virtio device is
+fully plugged. In particular, transports may add VIRTIO_F_IOMMU_PLATFORM
+before virtio_bus_device_plugged() selects the DMA address space.
 
-This keeps the DMA address-space decision in sync with transport-added
-features.
+Recheck the feature after transport hooks and feature population so
+transport-provided DMA address spaces can be selected when needed.
 
 Signed-off-by: Bertrand Marquis <bertrand.marquis@arm.com>
 ---
