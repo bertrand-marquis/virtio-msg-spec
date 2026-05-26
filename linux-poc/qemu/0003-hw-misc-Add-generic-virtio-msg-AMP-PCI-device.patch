@@ -1,10 +1,10 @@
 From 5a876d6fdbfe5a3a9992122fd3c2d2819923cd00 Mon Sep 17 00:00:00 2001
-Message-ID: <5a876d6fdbfe5a3a9992122fd3c2d2819923cd00.1776946505.git.bertrand.marquis@arm.com>
-In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
-References: <55d56a174a0f04520d4a1558630bb0b739074b13.1776946505.git.bertrand.marquis@arm.com>
+Message-ID: <5a876d6fdbfe5a3a9992122fd3c2d2819923cd00.1779459352.git.bertrand.marquis@arm.com>
+In-Reply-To: <55d56a174a0f04520d4a1558630bb0b739074b13.1779459352.git.bertrand.marquis@arm.com>
+References: <55d56a174a0f04520d4a1558630bb0b739074b13.1779459352.git.bertrand.marquis@arm.com>
 From: "Edgar E. Iglesias" <edgar.iglesias@amd.com>
 Date: Sun, 8 Jun 2025 11:09:48 +0200
-Subject: [RFC PATCH 03/28] hw/misc: Add generic virtio-msg AMP PCI device
+Subject: [PATCH 03/30] hw/misc: Add generic virtio-msg AMP PCI device
 
 Signed-off-by: Edgar E. Iglesias <edgar.iglesias@amd.com>
 ---
